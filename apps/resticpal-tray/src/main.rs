@@ -177,10 +177,15 @@ fn show_context_menu(window: HWND) -> Result<()> {
     // SAFETY: Windows owns the implementation; the returned menu is destroyed below.
     let menu = unsafe { CreatePopupMenu() }?;
     let result = (|| {
+        let backup_running = backup_is_running().unwrap_or(false);
         // SAFETY: labels are static null-terminated strings and menu is valid.
         unsafe {
             AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("Open resticpal"))?;
-            AppendMenuW(menu, MF_STRING, MENU_RUN_BACKUP, w!("Run backup now"))?;
+            if backup_running {
+                AppendMenuW(menu, MF_STRING, MENU_RUN_BACKUP, w!("Cancel backup"))?;
+            } else {
+                AppendMenuW(menu, MF_STRING, MENU_RUN_BACKUP, w!("Run backup now"))?;
+            }
             AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit tray"))?;
         }
 
@@ -206,7 +211,13 @@ fn show_context_menu(window: HWND) -> Result<()> {
 
         match usize::try_from(command.0).unwrap_or_default() {
             MENU_OPEN => launch_ui(window),
-            MENU_RUN_BACKUP => run_backup_now(window),
+            MENU_RUN_BACKUP => {
+                if backup_running {
+                    send_backup_action(window, RequestCommand::CancelBackup);
+                } else {
+                    send_backup_action(window, RequestCommand::RunBackupNow);
+                }
+            }
             MENU_EXIT => {
                 // SAFETY: window is owned by this UI thread.
                 unsafe { DestroyWindow(window) }?;
@@ -235,8 +246,8 @@ fn launch_ui(window: HWND) {
     }
 }
 
-fn run_backup_now(window: HWND) {
-    match send_request(RequestCommand::RunBackupNow) {
+fn send_backup_action(window: HWND, command: RequestCommand) {
+    match send_request(command) {
         Ok(Response {
             payload: ResponsePayload::Accepted { message },
             ..
@@ -266,7 +277,15 @@ fn fetch_status_tooltip() -> std::result::Result<String, NamedPipeError> {
             BackupState::Unconfigured => "resticpal: setup required".to_owned(),
             BackupState::Idle | BackupState::Succeeded => "resticpal: protected".to_owned(),
             BackupState::Waiting { .. } => "resticpal: backup waiting".to_owned(),
-            BackupState::Running { .. } => "resticpal: backup running".to_owned(),
+            BackupState::Running { .. } => status
+                .progress
+                .as_ref()
+                .and_then(|progress| {
+                    progress
+                        .percent_done
+                        .map(|percent| format!("resticpal: backup running ({percent}%)"))
+                })
+                .unwrap_or_else(|| "resticpal: backup running".to_owned()),
             BackupState::SucceededWithWarnings => {
                 "resticpal: backup completed with warnings".to_owned()
             }
@@ -277,6 +296,19 @@ fn fetch_status_tooltip() -> std::result::Result<String, NamedPipeError> {
         ResponsePayload::Rejected { message, .. } => format!("resticpal: {message}"),
         ResponsePayload::Accepted { .. } => "resticpal: connected".to_owned(),
     })
+}
+
+fn backup_is_running() -> std::result::Result<bool, NamedPipeError> {
+    let response = send_request(RequestCommand::GetStatus)?;
+    Ok(matches!(
+        response.payload,
+        ResponsePayload::Status {
+            status: resticpal_core::status::ServiceStatus {
+                state: BackupState::Running { .. },
+                ..
+            }
+        }
+    ))
 }
 
 fn refresh_tray_status(window: HWND) -> std::result::Result<(), NamedPipeError> {

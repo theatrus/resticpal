@@ -12,13 +12,18 @@ chrono.workspace = true
 resticpal-core.workspace = true
 resticpal-protocol.workspace = true
 resticpal-windows.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
     "Win32_System_Power",
     "Win32_System_Threading",
 ] }
 windows-service.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

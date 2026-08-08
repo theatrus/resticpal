@@ -38,6 +38,26 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async void CancelBackupButton_Click(object sender, RoutedEventArgs e)
+    {
+        CancelBackupButton.IsEnabled = false;
+        try
+        {
+            CommandResult result = await _service.CancelBackupAsync();
+            MessageBar.Severity = result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning;
+            MessageBar.Message = result.Message;
+            MessageBar.IsOpen = true;
+        }
+        catch (Exception exception)
+        {
+            ShowConnectionError(exception);
+        }
+        finally
+        {
+            await RefreshStatusAsync();
+        }
+    }
+
     private async Task RefreshStatusAsync()
     {
         try
@@ -48,6 +68,7 @@ public sealed partial class MainWindow : Window
             StatusCardTitle.Text = status.Headline;
             StatusCardDescription.Text = status.Description;
             RunBackupButton.IsEnabled = status.CanRunBackup;
+            CancelBackupButton.IsEnabled = status.CanCancelBackup;
         }
         catch (Exception exception)
         {
@@ -56,6 +77,7 @@ public sealed partial class MainWindow : Window
             StatusCardTitle.Text = "Not connected";
             StatusCardDescription.Text = "Start or repair the resticpal service, then reopen this window.";
             RunBackupButton.IsEnabled = false;
+            CancelBackupButton.IsEnabled = false;
             ShowConnectionError(exception);
         }
     }

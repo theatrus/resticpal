@@ -122,7 +122,7 @@ mod tests {
 
     use chrono::Utc;
     use resticpal_core::RepositoryMode;
-    use resticpal_core::status::{BackupState, ServiceStatus};
+    use resticpal_core::status::{BackupProgress, BackupState, ServiceStatus};
 
     use super::*;
 
@@ -152,6 +152,14 @@ mod tests {
                     repository_display_name: Some("S3 backup".to_owned()),
                     repository_mode: RepositoryMode::AppendOnly,
                     managed_revision: Some("policy-12".to_owned()),
+                    progress: Some(BackupProgress {
+                        percent_done: Some(42),
+                        files_done: 5,
+                        total_files: Some(12),
+                        bytes_done: 426,
+                        total_bytes: Some(1_000),
+                        error_count: 0,
+                    }),
                 },
             },
         );

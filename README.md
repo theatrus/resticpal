@@ -30,8 +30,11 @@ The first slice establishes:
 - authenticated local IPC using client token impersonation and a protected DACL;
 - a native tray icon whose status and run-now command come from the service;
 - an on-demand WinUI application that reads service status and sends run-now requests.
+- direct restic process execution in a kill-on-close Windows Job Object;
+- bounded JSON progress parsing, cancellation, and sanitized outcomes;
+- a system-required wake lock that automatically expires at the configured safety timeout.
 
-Persistence, secret resolution, actual restic process execution, source discovery, installation, and enrollment are not wired up yet. IPC currently uses bounded one-request/response connections; a later status-subscription channel will replace UI polling.
+Persistence, production secret resolution, source discovery, installation, scheduled/resume-triggered execution, and enrollment are not wired up yet. The executor fails closed when a configuration references a secret until the Windows credential store lands, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
 
 ## Build and test
 

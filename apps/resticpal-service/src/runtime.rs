@@ -6,19 +6,23 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::{Duration, Utc};
 use resticpal_core::config::{EffectiveConfig, LocalConfig, LocalConfigError};
 use resticpal_core::policy::{PolicyError, ResolvedConfig, resolve_config};
-use resticpal_core::status::{BackupState, ServiceStatus};
+use resticpal_core::status::{BackupPhase, BackupProgress, BackupState, ServiceStatus};
 use resticpal_protocol::{Request, RequestCommand, Response, ResponsePayload};
 use resticpal_windows::named_pipe::ClientIdentity;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::executor::{BackupOutcome, BackupOutcomeKind};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
     Stop,
     Resume,
     PowerStatusChanged,
     TimeChanged,
+    RunNow,
     Cancel,
     Deferred,
+    BackupFinished(BackupOutcome),
 }
 
 pub struct ServiceRuntime {
@@ -54,6 +58,7 @@ impl ServiceRuntime {
             repository_display_name: resolved.effective.repository.display_name.clone(),
             repository_mode: resolved.effective.repository.mode,
             managed_revision: resolved.managed_revision,
+            progress: None,
         };
 
         Self {
@@ -78,6 +83,7 @@ impl ServiceRuntime {
                 repository_display_name: None,
                 repository_mode: Default::default(),
                 managed_revision: None,
+                progress: None,
             }),
             events,
         }
@@ -85,6 +91,41 @@ impl ServiceRuntime {
 
     pub fn status(&self) -> ServiceStatus {
         self.status_guard().clone()
+    }
+
+    pub fn config(&self) -> EffectiveConfig {
+        self.config.clone()
+    }
+
+    pub fn update_progress(&self, progress: BackupProgress) {
+        let mut status = self.status_guard();
+        if matches!(status.state, BackupState::Running { .. }) {
+            status.state = BackupState::Running {
+                phase: BackupPhase::Uploading,
+            };
+            status.progress = Some(progress);
+        }
+    }
+
+    pub fn finish_backup(&self, outcome: &BackupOutcome) {
+        let now = Utc::now();
+        let mut status = self.status_guard();
+        status.state = match &outcome.kind {
+            BackupOutcomeKind::Succeeded => BackupState::Succeeded,
+            BackupOutcomeKind::SucceededWithWarnings => BackupState::SucceededWithWarnings,
+            BackupOutcomeKind::Failed { code } => BackupState::Failed { code: code.clone() },
+            BackupOutcomeKind::Cancelled => BackupState::Cancelled,
+        };
+        if matches!(
+            outcome.kind,
+            BackupOutcomeKind::Succeeded | BackupOutcomeKind::SucceededWithWarnings
+        ) {
+            status.last_success = Some(now);
+            status.next_deadline =
+                Some(now + Duration::hours(i64::from(self.config.schedule.interval_hours)));
+        }
+        status.state_since = now;
+        status.progress = None;
     }
 
     pub fn handle_request(&self, request: Request, _identity: ClientIdentity) -> Response {
@@ -99,13 +140,30 @@ impl ServiceRuntime {
                         "not_configured",
                         "Configure backup sources and a repository first.",
                     )
-                } else if matches!(self.status_guard().state, BackupState::Running { .. }) {
-                    rejected("already_running", "A backup is already running.")
                 } else {
-                    rejected(
-                        "backup_engine_unavailable",
-                        "Backup execution is not available in this development build yet.",
-                    )
+                    let mut status = self.status_guard();
+                    if matches!(status.state, BackupState::Running { .. }) {
+                        rejected("already_running", "A backup is already running.")
+                    } else {
+                        match self.events.send(RuntimeEvent::RunNow) {
+                            Ok(()) => {
+                                let now = Utc::now();
+                                status.state = BackupState::Running {
+                                    phase: BackupPhase::PreparingSnapshot,
+                                };
+                                status.state_since = now;
+                                status.last_attempt = Some(now);
+                                status.progress = None;
+                                ResponsePayload::Accepted {
+                                    message: "Backup request accepted.".to_owned(),
+                                }
+                            }
+                            Err(_) => rejected(
+                                "service_stopping",
+                                "The backup service is stopping. Try again shortly.",
+                            ),
+                        }
+                    }
                 }
             }
             RequestCommand::CancelBackup => {
@@ -182,6 +240,7 @@ mod tests {
     use resticpal_windows::named_pipe::{NamedPipeClient, NamedPipeServer};
 
     use super::*;
+    use crate::executor::BackupSummary;
 
     const USER: ClientIdentity = ClientIdentity {
         is_elevated_administrator: false,
@@ -226,13 +285,17 @@ mod tests {
     }
 
     #[test]
-    fn run_now_is_rejected_until_the_executor_is_available() {
-        let (runtime, _events) = runtime(true);
+    fn run_now_transitions_to_running_and_queues_the_executor() {
+        let (runtime, events) = runtime(true);
         let response = runtime.handle_request(Request::new(2, RequestCommand::RunBackupNow), USER);
 
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(events.recv().expect("runtime event"), RuntimeEvent::RunNow);
         assert!(matches!(
-            response.payload,
-            ResponsePayload::Rejected { ref code, .. } if code == "backup_engine_unavailable"
+            runtime.status().state,
+            BackupState::Running {
+                phase: BackupPhase::PreparingSnapshot
+            }
         ));
     }
 
@@ -266,6 +329,75 @@ mod tests {
             .next_deadline
             .expect("deferral sets a deadline");
         assert!(deadline >= before + Duration::minutes(30));
+    }
+
+    #[test]
+    fn progress_and_success_update_the_canonical_status() {
+        let (runtime, events) = runtime(true);
+        let response = runtime.handle_request(Request::new(7, RequestCommand::RunBackupNow), USER);
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(events.recv().expect("run event"), RuntimeEvent::RunNow);
+
+        runtime.update_progress(BackupProgress {
+            percent_done: Some(50),
+            files_done: 5,
+            total_files: Some(10),
+            bytes_done: 500,
+            total_bytes: Some(1_000),
+            error_count: 0,
+        });
+        assert!(matches!(
+            runtime.status(),
+            ServiceStatus {
+                state: BackupState::Running {
+                    phase: BackupPhase::Uploading
+                },
+                progress: Some(BackupProgress {
+                    percent_done: Some(50),
+                    ..
+                }),
+                ..
+            }
+        ));
+
+        let before = Utc::now();
+        let interval_hours = runtime.config().schedule.interval_hours;
+        runtime.finish_backup(&BackupOutcome::succeeded(BackupSummary {
+            files_processed: 10,
+            bytes_processed: 1_000,
+            data_added: 200,
+            snapshot_id: Some("snapshot".to_owned()),
+        }));
+        let status = runtime.status();
+        assert_eq!(status.state, BackupState::Succeeded);
+        assert!(status.last_success.is_some_and(|value| value >= before));
+        assert!(
+            status.next_deadline.is_some_and(|value| {
+                value >= before + Duration::hours(i64::from(interval_hours))
+            })
+        );
+        assert_eq!(status.progress, None);
+    }
+
+    #[test]
+    fn cancellation_request_is_forwarded_only_while_running() {
+        let (runtime, events) = runtime(true);
+        let idle_cancel =
+            runtime.handle_request(Request::new(8, RequestCommand::CancelBackup), USER);
+        assert!(matches!(
+            idle_cancel.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "not_running"
+        ));
+
+        let _ = runtime.handle_request(Request::new(9, RequestCommand::RunBackupNow), USER);
+        assert_eq!(events.recv().expect("run event"), RuntimeEvent::RunNow);
+        let running_cancel =
+            runtime.handle_request(Request::new(10, RequestCommand::CancelBackup), USER);
+        assert!(matches!(
+            running_cancel.payload,
+            ResponsePayload::Accepted { .. }
+        ));
+        assert_eq!(events.recv().expect("cancel event"), RuntimeEvent::Cancel);
     }
 
     #[test]

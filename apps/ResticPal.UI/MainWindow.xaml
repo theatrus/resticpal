@@ -85,6 +85,7 @@
 
                 <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="12">
                     <Button x:Name="RunBackupButton" Click="RunBackupButton_Click" Content="Run backup now" IsEnabled="False" />
+                    <Button x:Name="CancelBackupButton" Click="CancelBackupButton_Click" Content="Cancel backup" IsEnabled="False" />
                     <Button Content="Open settings" IsEnabled="False" />
                 </StackPanel>
 

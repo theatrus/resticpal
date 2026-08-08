@@ -24,50 +24,71 @@ internal sealed class ResticPalServiceClient
         string repositoryMode = status.GetProperty("repository_mode").GetString() ?? "standard";
         string? repositoryName = status.GetProperty("repository_display_name").GetString();
 
-        (string headline, string description, bool canRun) = stateName switch
+        (string headline, string description, bool canRun, bool canCancel) = stateName switch
         {
             "unconfigured" => (
                 "Setup required",
                 "Choose backup sources and connect a repository to begin protecting this PC.",
+                false,
                 false),
             "idle" or "succeeded" => (
                 "Protected",
                 DescribeRepository(repositoryName, repositoryMode),
-                true),
+                true,
+                false),
             "waiting" => (
                 "Backup waiting",
                 "The service is waiting for its scheduling conditions.",
-                true),
+                true,
+                false),
             "running" => (
                 "Backup in progress",
-                DescribeRepository(repositoryName, repositoryMode),
-                false),
+                DescribeProgress(status, repositoryName, repositoryMode),
+                false,
+                true),
             "succeeded_with_warnings" => (
                 "Protected with warnings",
                 "The latest backup completed, but some files need attention.",
-                true),
+                true,
+                false),
             "failed" => (
                 "Backup needs attention",
                 "Open diagnostics for the sanitized error and local service logs.",
-                true),
+                true,
+                false),
             "cancelled" => (
                 "Last backup cancelled",
                 DescribeRepository(repositoryName, repositoryMode),
-                true),
+                true,
+                false),
             "paused" => (
                 "Backups paused",
                 "Backup execution is currently disabled by policy.",
+                false,
                 false),
-            _ => ("Unknown service state", stateName, false),
+            _ => ("Unknown service state", stateName, false, false),
         };
 
-        return new ServiceSnapshot(headline, description, canRun);
+        return new ServiceSnapshot(headline, description, canRun, canCancel);
     }
 
     public async Task<CommandResult> RunBackupNowAsync(
         CancellationToken cancellationToken = default)
     {
-        JsonElement payload = await SendAsync("run_backup_now", cancellationToken);
+        return await SendCommandAsync("run_backup_now", cancellationToken);
+    }
+
+    public async Task<CommandResult> CancelBackupAsync(
+        CancellationToken cancellationToken = default)
+    {
+        return await SendCommandAsync("cancel_backup", cancellationToken);
+    }
+
+    private static async Task<CommandResult> SendCommandAsync(
+        string command,
+        CancellationToken cancellationToken)
+    {
+        JsonElement payload = await SendAsync(command, cancellationToken);
         string responseType = payload.GetProperty("type").GetString() ?? "rejected";
         string message = payload.GetProperty("message").GetString() ?? "No message was returned.";
         return new CommandResult(responseType == "accepted", message);
@@ -138,8 +159,45 @@ internal sealed class ResticPalServiceClient
             ? $"{name} · append-only, with retention managed by the server"
             : $"{name} · retention managed by this PC";
     }
+
+    private static string DescribeProgress(
+        JsonElement status,
+        string? repositoryName,
+        string repositoryMode)
+    {
+        if (!status.TryGetProperty("progress", out JsonElement progress))
+        {
+            return $"Preparing {DescribeRepository(repositoryName, repositoryMode)}";
+        }
+
+        string percent = progress.TryGetProperty("percent_done", out JsonElement percentElement)
+            && percentElement.ValueKind == JsonValueKind.Number
+            ? $"{percentElement.GetByte()}% complete"
+            : "Backup in progress";
+        ulong filesDone = progress.GetProperty("files_done").GetUInt64();
+        ulong bytesDone = progress.GetProperty("bytes_done").GetUInt64();
+        return $"{percent} · {filesDone:N0} files · {FormatBytes(bytesDone)} processed";
+    }
+
+    private static string FormatBytes(ulong bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        double value = bytes;
+        int unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return $"{value:0.#} {units[unit]}";
+    }
 }
 
-internal sealed record ServiceSnapshot(string Headline, string Description, bool CanRunBackup);
+internal sealed record ServiceSnapshot(
+    string Headline,
+    string Description,
+    bool CanRunBackup,
+    bool CanCancelBackup);
 
 internal sealed record CommandResult(bool Accepted, string Message);

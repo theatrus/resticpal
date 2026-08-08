@@ -38,6 +38,17 @@ pub enum BackupPhase {
     Checking,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupProgress {
+    /// Whole-number percentage, clamped to the inclusive range 0..=100.
+    pub percent_done: Option<u8>,
+    pub files_done: u64,
+    pub total_files: Option<u64>,
+    pub bytes_done: u64,
+    pub total_bytes: Option<u64>,
+    pub error_count: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceStatus {
     pub state: BackupState,
@@ -48,4 +59,6 @@ pub struct ServiceStatus {
     pub repository_display_name: Option<String>,
     pub repository_mode: RepositoryMode,
     pub managed_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<BackupProgress>,
 }

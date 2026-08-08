@@ -1,3 +1,4 @@
+mod executor;
 mod power_request;
 mod runtime;
 
@@ -10,6 +11,10 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
+use executor::{
+    BackupOutcome, CancellationToken, ResticExecutor, SystemWakeLockProvider,
+    UnavailableSecretResolver,
+};
 use resticpal_windows::named_pipe::{DEFAULT_PIPE_NAME, NamedPipeServer};
 use runtime::{RuntimeEvent, ServiceRuntime};
 use windows_service::define_windows_service;
@@ -102,10 +107,15 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
                 "could not load configuration from {}: {error}",
                 config_path.display()
             );
-            Arc::new(ServiceRuntime::configuration_error(event_tx))
+            Arc::new(ServiceRuntime::configuration_error(event_tx.clone()))
         }
     };
     start_ipc_server(Arc::clone(&runtime));
+    let executor = ResticExecutor::new(
+        restic_path(),
+        Arc::new(UnavailableSecretResolver),
+        Arc::new(SystemWakeLockProvider),
+    );
 
     status_handle.set_service_status(ScmServiceStatus {
         service_type: SERVICE_TYPE,
@@ -120,7 +130,7 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
         process_id: None,
     })?;
 
-    run_event_loop(&event_rx, &runtime);
+    run_event_loop(&event_rx, Arc::clone(&runtime), executor, event_tx);
 
     status_handle.set_service_status(ScmServiceStatus {
         service_type: SERVICE_TYPE,
@@ -159,17 +169,54 @@ fn start_ipc_server(runtime: Arc<ServiceRuntime>) {
         .expect("the service must be able to create its IPC thread");
 }
 
-fn run_event_loop(events: &Receiver<RuntimeEvent>, _runtime: &ServiceRuntime) {
+fn run_event_loop(
+    events: &Receiver<RuntimeEvent>,
+    runtime: Arc<ServiceRuntime>,
+    executor: ResticExecutor,
+    event_sender: mpsc::Sender<RuntimeEvent>,
+) {
     // The scheduler and backup executor will share this event loop. A long
     // timeout is intentional: control, timer, network, and IPC sources wake it.
+    let mut active_backup: Option<CancellationToken> = None;
     loop {
         match events.recv_timeout(Duration::from_secs(60)) {
-            Ok(RuntimeEvent::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(RuntimeEvent::Stop) | Err(RecvTimeoutError::Disconnected) => {
+                if let Some(cancellation) = &active_backup {
+                    cancellation.cancel();
+                }
+                break;
+            }
+            Ok(RuntimeEvent::RunNow) => {
+                if active_backup.is_some() {
+                    continue;
+                }
+                let cancellation = CancellationToken::default();
+                active_backup = Some(cancellation.clone());
+                if start_backup_worker(
+                    Arc::clone(&runtime),
+                    executor.clone(),
+                    cancellation,
+                    event_sender.clone(),
+                )
+                .is_err()
+                {
+                    runtime.finish_backup(&BackupOutcome::failed("executor_start_failed"));
+                    active_backup = None;
+                }
+            }
+            Ok(RuntimeEvent::Cancel) => {
+                if let Some(cancellation) = &active_backup {
+                    cancellation.cancel();
+                }
+            }
+            Ok(RuntimeEvent::BackupFinished(outcome)) => {
+                runtime.finish_backup(&outcome);
+                active_backup = None;
+            }
             Ok(
                 RuntimeEvent::Resume
                 | RuntimeEvent::PowerStatusChanged
                 | RuntimeEvent::TimeChanged
-                | RuntimeEvent::Cancel
                 | RuntimeEvent::Deferred,
             )
             | Err(RecvTimeoutError::Timeout) => {
@@ -177,6 +224,23 @@ fn run_event_loop(events: &Receiver<RuntimeEvent>, _runtime: &ServiceRuntime) {
             }
         }
     }
+}
+
+fn start_backup_worker(
+    runtime: Arc<ServiceRuntime>,
+    executor: ResticExecutor,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<RuntimeEvent>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("resticpal-backup".to_owned())
+        .spawn(move || {
+            let config = runtime.config();
+            let outcome = executor.backup(&config, &cancellation, |progress| {
+                runtime.update_progress(progress);
+            });
+            let _ = events.send(RuntimeEvent::BackupFinished(outcome));
+        })
 }
 
 fn config_path(arguments: &[OsString]) -> PathBuf {
@@ -192,4 +256,13 @@ fn default_config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
         .join("ResticPal")
         .join("config.toml")
+}
+
+fn restic_path() -> PathBuf {
+    env::current_exe()
+        .map(|mut executable| {
+            executable.set_file_name("restic.exe");
+            executable
+        })
+        .unwrap_or_else(|_| PathBuf::from("restic.exe"))
 }
