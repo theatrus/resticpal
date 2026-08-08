@@ -1,0 +1,18 @@
+[package]
+name = "resticpal-protocol"
+description = "Versioned local IPC messages and framing for resticpal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+resticpal-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

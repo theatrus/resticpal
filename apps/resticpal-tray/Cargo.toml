@@ -9,6 +9,8 @@ license.workspace = true
 
 [dependencies]
 resticpal-core.workspace = true
+resticpal-protocol.workspace = true
+resticpal-windows.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -19,4 +21,3 @@ windows = { workspace = true, features = [
 
 [lints]
 workspace = true
-

@@ -7,6 +7,8 @@ The agreed product and architecture direction is recorded in [DESIGN.md](DESIGN.
 ## Repository layout
 
 - `crates/resticpal-core`: testable policy, scheduling, status, and restic invocation logic
+- `crates/resticpal-protocol`: versioned and length-bounded local IPC messages
+- `crates/resticpal-windows`: ACL-protected Windows named-pipe integration
 - `apps/resticpal-service`: Rust Windows service host
 - `apps/resticpal-tray`: low-resource native Rust/Win32 tray host
 - `apps/ResticPal.UI`: on-demand .NET 10 / WinUI 3 application
@@ -24,10 +26,12 @@ The first slice establishes:
 - shell-free restic backup invocation construction with opaque secret references;
 - service control handling for stop, shutdown, resume, power, and time changes;
 - an RAII Windows system-required power request;
-- a native tray icon and context-menu shell;
-- a buildable on-demand WinUI application shell.
+- machine configuration loading with a friendly invalid/unconfigured state;
+- authenticated local IPC using client token impersonation and a protected DACL;
+- a native tray icon whose status and run-now command come from the service;
+- an on-demand WinUI application that reads service status and sends run-now requests.
 
-Service IPC, persistence, secret resolution, actual restic process execution, source discovery, installation, and enrollment are not wired up yet.
+Persistence, secret resolution, actual restic process execution, source discovery, installation, and enrollment are not wired up yet. IPC currently uses bounded one-request/response connections; a later status-subscription channel will replace UI polling.
 
 ## Build and test
 
@@ -43,7 +47,7 @@ dotnet build ResticPal.slnx --configuration Debug
 Run a non-service smoke test for the service host:
 
 ```powershell
-cargo run -p resticpal-service -- --console
+cargo run -p resticpal-service -- --console --config config/resticpal.example.toml
 ```
 
 The tray binary creates a native notification-area icon and waits in its Windows message loop:
@@ -59,4 +63,3 @@ cargo run -p resticpal-tray
 ## License
 
 BSD 2-Clause. Copyright (c) 2026 Yann Ramin. See [LICENSE](LICENSE).
-

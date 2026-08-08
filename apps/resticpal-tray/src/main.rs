@@ -2,11 +2,15 @@
 
 use std::mem::size_of;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use resticpal_core::status::BackupState;
+use resticpal_protocol::{Request, RequestCommand, Response, ResponsePayload};
+use resticpal_windows::named_pipe::{NamedPipeClient, NamedPipeError};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -26,6 +30,7 @@ const MENU_OPEN: usize = 1;
 const MENU_RUN_BACKUP: usize = 2;
 const MENU_EXIT: usize = 3;
 const MF_STRING: MENU_ITEM_FLAGS = MENU_ITEM_FLAGS(0);
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn main() {
     if let Err(error) = run() {
@@ -99,7 +104,9 @@ fn add_tray_icon(window: HWND) -> Result<()> {
         hIcon: icon,
         ..NOTIFYICONDATAW::default()
     };
-    copy_wide("resticpal: connecting to backup service", &mut data.szTip);
+    let tooltip = fetch_status_tooltip()
+        .unwrap_or_else(|_| "resticpal: backup service unavailable".to_owned());
+    copy_wide(&tooltip, &mut data.szTip);
 
     // SAFETY: data is fully initialized and points to the live hidden window.
     if unsafe { Shell_NotifyIconW(NIM_ADD, &raw const data) }.as_bool() {
@@ -199,10 +206,7 @@ fn show_context_menu(window: HWND) -> Result<()> {
 
         match usize::try_from(command.0).unwrap_or_default() {
             MENU_OPEN => launch_ui(window),
-            MENU_RUN_BACKUP => show_information(
-                window,
-                "The tray is ready. Service IPC will wire up Run backup now next.",
-            ),
+            MENU_RUN_BACKUP => run_backup_now(window),
             MENU_EXIT => {
                 // SAFETY: window is owned by this UI thread.
                 unsafe { DestroyWindow(window) }?;
@@ -229,6 +233,75 @@ fn launch_ui(window: HWND) {
             &format!("The resticpal settings application could not be opened.\n\n{error}"),
         );
     }
+}
+
+fn run_backup_now(window: HWND) {
+    match send_request(RequestCommand::RunBackupNow) {
+        Ok(Response {
+            payload: ResponsePayload::Accepted { message },
+            ..
+        }) => {
+            show_information(window, &message);
+            let _ = refresh_tray_status(window);
+        }
+        Ok(Response {
+            payload: ResponsePayload::Rejected { message, .. },
+            ..
+        }) => show_error(window, &message),
+        Ok(_) => show_error(
+            window,
+            "The backup service returned an unexpected response.",
+        ),
+        Err(error) => show_error(
+            window,
+            &format!("The backup service could not be reached.\n\n{error}"),
+        ),
+    }
+}
+
+fn fetch_status_tooltip() -> std::result::Result<String, NamedPipeError> {
+    let response = send_request(RequestCommand::GetStatus)?;
+    Ok(match response.payload {
+        ResponsePayload::Status { status } => match status.state {
+            BackupState::Unconfigured => "resticpal: setup required".to_owned(),
+            BackupState::Idle | BackupState::Succeeded => "resticpal: protected".to_owned(),
+            BackupState::Waiting { .. } => "resticpal: backup waiting".to_owned(),
+            BackupState::Running { .. } => "resticpal: backup running".to_owned(),
+            BackupState::SucceededWithWarnings => {
+                "resticpal: backup completed with warnings".to_owned()
+            }
+            BackupState::Failed { .. } => "resticpal: backup needs attention".to_owned(),
+            BackupState::Cancelled => "resticpal: last backup cancelled".to_owned(),
+            BackupState::Paused => "resticpal: backups paused".to_owned(),
+        },
+        ResponsePayload::Rejected { message, .. } => format!("resticpal: {message}"),
+        ResponsePayload::Accepted { .. } => "resticpal: connected".to_owned(),
+    })
+}
+
+fn refresh_tray_status(window: HWND) -> std::result::Result<(), NamedPipeError> {
+    let tooltip = fetch_status_tooltip()?;
+    let mut data = NOTIFYICONDATAW {
+        cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>())
+            .expect("NOTIFYICONDATAW size fits in u32"),
+        hWnd: window,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_TIP | NIF_SHOWTIP,
+        ..NOTIFYICONDATAW::default()
+    };
+    copy_wide(&tooltip, &mut data.szTip);
+
+    // SAFETY: data identifies our live notification icon and contains a valid tip.
+    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const data) }.as_bool() {
+        Ok(())
+    } else {
+        Err(windows::core::Error::from_thread().into())
+    }
+}
+
+fn send_request(command: RequestCommand) -> std::result::Result<Response, NamedPipeError> {
+    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    NamedPipeClient::request(&Request::new(request_id, command))
 }
 
 fn remove_tray_icon(window: HWND) {

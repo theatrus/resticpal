@@ -3,6 +3,8 @@ members = [
     "apps/resticpal-service",
     "apps/resticpal-tray",
     "crates/resticpal-core",
+    "crates/resticpal-protocol",
+    "crates/resticpal-windows",
 ]
 resolver = "3"
 
@@ -16,7 +18,10 @@ license = "BSD-2-Clause"
 [workspace.dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
 resticpal-core = { path = "crates/resticpal-core" }
+resticpal-protocol = { path = "crates/resticpal-protocol" }
+resticpal-windows = { path = "crates/resticpal-windows" }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 thiserror = "2.0.20"
 toml = "1.1.4"
 windows = "0.62.2"
@@ -33,4 +38,3 @@ codegen-units = 1
 lto = "thin"
 panic = "abort"
 strip = "symbols"
-

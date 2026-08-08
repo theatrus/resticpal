@@ -8,6 +8,7 @@
     <NavigationView
         IsBackButtonVisible="Collapsed"
         IsSettingsVisible="True"
+        Loaded="NavigationView_Loaded"
         PaneDisplayMode="Left"
         PaneTitle="resticpal"
         SelectedItem="{x:Bind OverviewItem}">
@@ -45,11 +46,12 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
                 <StackPanel Spacing="6">
-                    <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Backup status" />
-                    <TextBlock
+                    <TextBlock x:Name="StatusTitle" Style="{StaticResource TitleTextBlockStyle}" Text="Connecting" />
+                    <TextBlock x:Name="StatusDescription"
                         Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                         Text="Waiting for the resticpal service"
                         TextWrapping="Wrap" />
@@ -72,8 +74,8 @@
                             Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
                             Glyph="&#xE753;" />
                         <StackPanel Grid.Column="1" Spacing="4">
-                            <TextBlock FontSize="18" FontWeight="SemiBold" Text="Service connection pending" />
-                            <TextBlock
+                            <TextBlock x:Name="StatusCardTitle" FontSize="18" FontWeight="SemiBold" Text="Service connection pending" />
+                            <TextBlock x:Name="StatusCardDescription"
                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                 Text="The first implementation slice is ready for named-pipe status wiring."
                                 TextWrapping="Wrap" />
@@ -82,11 +84,16 @@
                 </Border>
 
                 <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="12">
-                    <Button Content="Run backup now" IsEnabled="False" />
+                    <Button x:Name="RunBackupButton" Click="RunBackupButton_Click" Content="Run backup now" IsEnabled="False" />
                     <Button Content="Open settings" IsEnabled="False" />
                 </StackPanel>
+
+                <InfoBar
+                    x:Name="MessageBar"
+                    Grid.Row="3"
+                    IsClosable="True"
+                    IsOpen="False" />
             </Grid>
         </ScrollViewer>
     </NavigationView>
 </Window>
-

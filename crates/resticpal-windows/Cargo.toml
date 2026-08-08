@@ -1,6 +1,6 @@
 [package]
-name = "resticpal-service"
-description = "Windows service host for resticpal"
+name = "resticpal-windows"
+description = "Shared Windows integrations for resticpal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,17 +8,16 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-chrono.workspace = true
-resticpal-core.workspace = true
 resticpal-protocol.workspace = true
-resticpal-windows.workspace = true
 thiserror.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
-    "Win32_System_Power",
-    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
 ] }
-windows-service.workspace = true
 
 [lints]
 workspace = true
