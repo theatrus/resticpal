@@ -1,0 +1,8 @@
+/target/
+/.vs/
+**/bin/
+**/obj/
+*.user
+*.suo
+*.log
+

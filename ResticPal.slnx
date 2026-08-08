@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/apps/">
+    <Project Path="apps/ResticPal.UI/ResticPal.UI.csproj" />
+  </Folder>
+</Solution>
+

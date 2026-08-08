@@ -1,0 +1,439 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::config::{
+    BackupConfig, CONFIG_SCHEMA_VERSION, ConfigValidationError, EffectiveConfig, LocalConfig,
+    RepositoryConfig, RepositoryMode, RetentionConfig, ScheduleConfig, SecretEnvironmentVariable,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManagedPolicy {
+    pub schema_version: u32,
+    pub revision: String,
+    pub backup: ManagedBackupPolicy,
+    pub repository: ManagedRepositoryPolicy,
+    pub schedule: ManagedSchedulePolicy,
+    pub retention: ManagedRetentionPolicy,
+}
+
+impl Default for ManagedPolicy {
+    fn default() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            revision: String::new(),
+            backup: ManagedBackupPolicy::default(),
+            repository: ManagedRepositoryPolicy::default(),
+            schedule: ManagedSchedulePolicy::default(),
+            retention: ManagedRetentionPolicy::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManagedBackupPolicy {
+    pub paths: Option<Managed<Vec<PathBuf>>>,
+    pub exclusions: Option<Managed<Vec<String>>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManagedRepositoryPolicy {
+    pub display_name: Option<Managed<Option<String>>>,
+    pub url: Option<Managed<Option<String>>>,
+    pub mode: Option<Managed<RepositoryMode>>,
+    pub options: Option<Managed<BTreeMap<String, String>>>,
+    pub secret_refs: Option<Managed<BTreeMap<SecretEnvironmentVariable, String>>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManagedSchedulePolicy {
+    pub interval_hours: Option<Managed<u32>>,
+    pub wake_grace_seconds: Option<Managed<u64>>,
+    pub wake_lock_timeout_seconds: Option<Managed<u64>>,
+    pub allow_on_battery: Option<Managed<bool>>,
+    pub allow_metered_network: Option<Managed<bool>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManagedRetentionPolicy {
+    pub daily: Option<Managed<u32>>,
+    pub weekly: Option<Managed<u32>>,
+    pub monthly: Option<Managed<u32>>,
+    pub yearly: Option<Managed<u32>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Managed<T> {
+    pub value: T,
+    #[serde(default)]
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyField {
+    BackupPaths,
+    BackupExclusions,
+    RepositoryDisplayName,
+    RepositoryUrl,
+    RepositoryMode,
+    RepositoryOptions,
+    RepositorySecretRefs,
+    ScheduleIntervalHours,
+    ScheduleWakeGraceSeconds,
+    ScheduleWakeLockTimeoutSeconds,
+    ScheduleAllowOnBattery,
+    ScheduleAllowMeteredNetwork,
+    RetentionDaily,
+    RetentionWeekly,
+    RetentionMonthly,
+    RetentionYearly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueSource {
+    ProductDefault,
+    LocalAdministrator,
+    ManagedRecommendation,
+    ManagedLocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldResolution {
+    pub source: ValueSource,
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedConfig {
+    pub effective: EffectiveConfig,
+    pub managed_revision: Option<String>,
+    pub fields: BTreeMap<PolicyField, FieldResolution>,
+}
+
+impl ResolvedConfig {
+    #[must_use]
+    pub fn locked_fields(&self) -> BTreeSet<PolicyField> {
+        self.fields
+            .iter()
+            .filter_map(|(field, resolution)| resolution.locked.then_some(*field))
+            .collect()
+    }
+}
+
+pub fn resolve_config(
+    defaults: &EffectiveConfig,
+    local: &LocalConfig,
+    managed: Option<&ManagedPolicy>,
+) -> Result<ResolvedConfig, PolicyError> {
+    if local.schema_version != CONFIG_SCHEMA_VERSION {
+        return Err(PolicyError::UnsupportedLocalSchema(local.schema_version));
+    }
+
+    if let Some(policy) = managed
+        && policy.schema_version != CONFIG_SCHEMA_VERSION
+    {
+        return Err(PolicyError::UnsupportedManagedSchema(policy.schema_version));
+    }
+
+    let mut fields = BTreeMap::new();
+    let no_backup = ManagedBackupPolicy::default();
+    let no_repository = ManagedRepositoryPolicy::default();
+    let no_schedule = ManagedSchedulePolicy::default();
+    let no_retention = ManagedRetentionPolicy::default();
+    let managed_backup = managed.map_or(&no_backup, |policy| &policy.backup);
+    let managed_repository = managed.map_or(&no_repository, |policy| &policy.repository);
+    let managed_schedule = managed.map_or(&no_schedule, |policy| &policy.schedule);
+    let managed_retention = managed.map_or(&no_retention, |policy| &policy.retention);
+    let local_repository_display_name = local.repository.display_name.clone().map(Some);
+    let local_repository_url = local.repository.url.clone().map(Some);
+
+    let effective = EffectiveConfig {
+        backup: BackupConfig {
+            paths: choose(
+                PolicyField::BackupPaths,
+                &defaults.backup.paths,
+                local.backup.paths.as_ref(),
+                managed_backup.paths.as_ref(),
+                &mut fields,
+            ),
+            exclusions: choose(
+                PolicyField::BackupExclusions,
+                &defaults.backup.exclusions,
+                local.backup.exclusions.as_ref(),
+                managed_backup.exclusions.as_ref(),
+                &mut fields,
+            ),
+        },
+        repository: RepositoryConfig {
+            display_name: choose(
+                PolicyField::RepositoryDisplayName,
+                &defaults.repository.display_name,
+                local_repository_display_name.as_ref(),
+                managed_repository.display_name.as_ref(),
+                &mut fields,
+            ),
+            url: choose(
+                PolicyField::RepositoryUrl,
+                &defaults.repository.url,
+                local_repository_url.as_ref(),
+                managed_repository.url.as_ref(),
+                &mut fields,
+            ),
+            mode: choose(
+                PolicyField::RepositoryMode,
+                &defaults.repository.mode,
+                local.repository.mode.as_ref(),
+                managed_repository.mode.as_ref(),
+                &mut fields,
+            ),
+            options: choose(
+                PolicyField::RepositoryOptions,
+                &defaults.repository.options,
+                local.repository.options.as_ref(),
+                managed_repository.options.as_ref(),
+                &mut fields,
+            ),
+            secret_refs: choose(
+                PolicyField::RepositorySecretRefs,
+                &defaults.repository.secret_refs,
+                local.repository.secret_refs.as_ref(),
+                managed_repository.secret_refs.as_ref(),
+                &mut fields,
+            ),
+        },
+        schedule: ScheduleConfig {
+            interval_hours: choose(
+                PolicyField::ScheduleIntervalHours,
+                &defaults.schedule.interval_hours,
+                local.schedule.interval_hours.as_ref(),
+                managed_schedule.interval_hours.as_ref(),
+                &mut fields,
+            ),
+            wake_grace_seconds: choose(
+                PolicyField::ScheduleWakeGraceSeconds,
+                &defaults.schedule.wake_grace_seconds,
+                local.schedule.wake_grace_seconds.as_ref(),
+                managed_schedule.wake_grace_seconds.as_ref(),
+                &mut fields,
+            ),
+            wake_lock_timeout_seconds: choose(
+                PolicyField::ScheduleWakeLockTimeoutSeconds,
+                &defaults.schedule.wake_lock_timeout_seconds,
+                local.schedule.wake_lock_timeout_seconds.as_ref(),
+                managed_schedule.wake_lock_timeout_seconds.as_ref(),
+                &mut fields,
+            ),
+            allow_on_battery: choose(
+                PolicyField::ScheduleAllowOnBattery,
+                &defaults.schedule.allow_on_battery,
+                local.schedule.allow_on_battery.as_ref(),
+                managed_schedule.allow_on_battery.as_ref(),
+                &mut fields,
+            ),
+            allow_metered_network: choose(
+                PolicyField::ScheduleAllowMeteredNetwork,
+                &defaults.schedule.allow_metered_network,
+                local.schedule.allow_metered_network.as_ref(),
+                managed_schedule.allow_metered_network.as_ref(),
+                &mut fields,
+            ),
+        },
+        retention: RetentionConfig {
+            daily: choose(
+                PolicyField::RetentionDaily,
+                &defaults.retention.daily,
+                local.retention.daily.as_ref(),
+                managed_retention.daily.as_ref(),
+                &mut fields,
+            ),
+            weekly: choose(
+                PolicyField::RetentionWeekly,
+                &defaults.retention.weekly,
+                local.retention.weekly.as_ref(),
+                managed_retention.weekly.as_ref(),
+                &mut fields,
+            ),
+            monthly: choose(
+                PolicyField::RetentionMonthly,
+                &defaults.retention.monthly,
+                local.retention.monthly.as_ref(),
+                managed_retention.monthly.as_ref(),
+                &mut fields,
+            ),
+            yearly: choose(
+                PolicyField::RetentionYearly,
+                &defaults.retention.yearly,
+                local.retention.yearly.as_ref(),
+                managed_retention.yearly.as_ref(),
+                &mut fields,
+            ),
+        },
+    };
+
+    effective.validate()?;
+
+    Ok(ResolvedConfig {
+        effective,
+        managed_revision: managed.map(|policy| policy.revision.clone()),
+        fields,
+    })
+}
+
+fn choose<T: Clone>(
+    field: PolicyField,
+    default: &T,
+    local: Option<&T>,
+    managed: Option<&Managed<T>>,
+    resolutions: &mut BTreeMap<PolicyField, FieldResolution>,
+) -> T {
+    let (value, source, locked) = match managed {
+        Some(managed) if managed.locked => (&managed.value, ValueSource::ManagedLocked, true),
+        Some(_) if local.is_some() => (
+            local.expect("local value was checked"),
+            ValueSource::LocalAdministrator,
+            false,
+        ),
+        Some(managed) => (&managed.value, ValueSource::ManagedRecommendation, false),
+        None => match local {
+            Some(local) => (local, ValueSource::LocalAdministrator, false),
+            None => (default, ValueSource::ProductDefault, false),
+        },
+    };
+
+    resolutions.insert(field, FieldResolution { source, locked });
+    value.clone()
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PolicyError {
+    #[error("unsupported local configuration schema {0}")]
+    UnsupportedLocalSchema(u32),
+    #[error("unsupported managed policy schema {0}")]
+    UnsupportedManagedSchema(u32),
+    #[error(transparent)]
+    InvalidEffectiveConfig(#[from] ConfigValidationError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{LocalRepositoryConfig, LocalScheduleConfig};
+
+    fn managed<T>(value: T, locked: bool) -> Option<Managed<T>> {
+        Some(Managed { value, locked })
+    }
+
+    #[test]
+    fn locked_managed_value_wins_and_is_reported() {
+        let local = LocalConfig {
+            schedule: LocalScheduleConfig {
+                interval_hours: Some(12),
+                ..LocalScheduleConfig::default()
+            },
+            ..LocalConfig::default()
+        };
+        let policy = ManagedPolicy {
+            revision: "policy-7".to_owned(),
+            schedule: ManagedSchedulePolicy {
+                interval_hours: managed(6, true),
+                ..ManagedSchedulePolicy::default()
+            },
+            ..ManagedPolicy::default()
+        };
+
+        let result = resolve_config(&EffectiveConfig::default(), &local, Some(&policy))
+            .expect("policy should resolve");
+
+        assert_eq!(result.effective.schedule.interval_hours, 6);
+        assert_eq!(result.managed_revision.as_deref(), Some("policy-7"));
+        assert!(
+            result
+                .locked_fields()
+                .contains(&PolicyField::ScheduleIntervalHours)
+        );
+    }
+
+    #[test]
+    fn local_value_wins_over_unlocked_managed_recommendation() {
+        let local = LocalConfig {
+            schedule: LocalScheduleConfig {
+                allow_on_battery: Some(false),
+                ..LocalScheduleConfig::default()
+            },
+            ..LocalConfig::default()
+        };
+        let policy = ManagedPolicy {
+            schedule: ManagedSchedulePolicy {
+                allow_on_battery: managed(true, false),
+                ..ManagedSchedulePolicy::default()
+            },
+            ..ManagedPolicy::default()
+        };
+
+        let result = resolve_config(&EffectiveConfig::default(), &local, Some(&policy))
+            .expect("policy should resolve");
+
+        assert!(!result.effective.schedule.allow_on_battery);
+        assert_eq!(
+            result.fields[&PolicyField::ScheduleAllowOnBattery].source,
+            ValueSource::LocalAdministrator
+        );
+    }
+
+    #[test]
+    fn unlocked_managed_value_fills_an_absent_local_value() {
+        let policy = ManagedPolicy {
+            repository: ManagedRepositoryPolicy {
+                mode: managed(RepositoryMode::AppendOnly, false),
+                ..ManagedRepositoryPolicy::default()
+            },
+            ..ManagedPolicy::default()
+        };
+
+        let result = resolve_config(
+            &EffectiveConfig::default(),
+            &LocalConfig::default(),
+            Some(&policy),
+        )
+        .expect("policy should resolve");
+
+        assert_eq!(result.effective.repository.mode, RepositoryMode::AppendOnly);
+        assert_eq!(
+            result.fields[&PolicyField::RepositoryMode].source,
+            ValueSource::ManagedRecommendation
+        );
+    }
+
+    #[test]
+    fn locked_repository_url_can_clear_a_local_url() {
+        let local = LocalConfig {
+            repository: LocalRepositoryConfig {
+                url: Some("local:C:/backups".to_owned()),
+                ..LocalRepositoryConfig::default()
+            },
+            ..LocalConfig::default()
+        };
+        let policy = ManagedPolicy {
+            repository: ManagedRepositoryPolicy {
+                url: managed(None, true),
+                ..ManagedRepositoryPolicy::default()
+            },
+            ..ManagedPolicy::default()
+        };
+
+        let result = resolve_config(&EffectiveConfig::default(), &local, Some(&policy))
+            .expect("policy should resolve");
+
+        assert_eq!(result.effective.repository.url, None);
+    }
+}

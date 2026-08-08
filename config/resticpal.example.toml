@@ -1,0 +1,42 @@
+schema_version = 1
+
+[backup]
+paths = [
+  'C:\Users\Example\Desktop',
+  'C:\Users\Example\Documents',
+  'C:\Users\Example\Pictures',
+]
+exclusions = [
+  '*.tmp',
+  'node_modules',
+]
+
+[repository]
+display_name = "Managed S3 backup"
+url = "s3:https://s3.example.test/restic-backups/device-1"
+mode = "append_only"
+
+[repository.options]
+"s3.region" = "us-west-2"
+"s3.bucket-lookup" = "path"
+
+# Values are opaque IDs resolved from the service-only protected credential store.
+[repository.secret_refs]
+RESTIC_PASSWORD = "repository-password"
+AWS_ACCESS_KEY_ID = "s3-access-key-id"
+AWS_SECRET_ACCESS_KEY = "s3-secret-access-key"
+
+[schedule]
+interval_hours = 24
+wake_grace_seconds = 300
+wake_lock_timeout_seconds = 7200
+allow_on_battery = true
+allow_metered_network = true
+
+# Informational in append-only mode; server-side maintenance owns retention.
+[retention]
+daily = 7
+weekly = 5
+monthly = 12
+yearly = 3
+

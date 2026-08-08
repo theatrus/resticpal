@@ -1,0 +1,20 @@
+[package]
+name = "resticpal-service"
+description = "Windows service host for resticpal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+resticpal-core.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Power",
+    "Win32_System_Threading",
+] }
+windows-service.workspace = true
+
+[lints]
+workspace = true
