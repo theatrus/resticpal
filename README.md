@@ -33,8 +33,9 @@ The first slice establishes:
 - direct restic process execution in a kill-on-close Windows Job Object;
 - bounded JSON progress parsing, cancellation, and sanitized outcomes;
 - a system-required wake lock that automatically expires at the configured safety timeout.
+- DPAPI credential encryption bound to the service identity, with protected service/admin ACLs and atomic credential-file replacement.
 
-Persistence, production secret resolution, source discovery, installation, scheduled/resume-triggered execution, and enrollment are not wired up yet. The executor fails closed when a configuration references a secret until the Windows credential store lands, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
+Persistence, credential provisioning through setup/enrollment, source discovery, installation, scheduled/resume-triggered execution, and enrollment are not wired up yet. The executor fails closed when a referenced credential is absent, corrupt, or not a valid environment value, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
 
 ## Build and test
 

@@ -12,9 +12,10 @@ use std::thread;
 use std::time::Duration;
 
 use executor::{
-    BackupOutcome, CancellationToken, ResticExecutor, SystemWakeLockProvider,
-    UnavailableSecretResolver,
+    BackupOutcome, CancellationToken, DpapiSecretResolver, ResticExecutor, SecretResolver,
+    SystemWakeLockProvider, UnavailableSecretResolver,
 };
+use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::{DEFAULT_PIPE_NAME, NamedPipeServer};
 use runtime::{RuntimeEvent, ServiceRuntime};
 use windows_service::define_windows_service;
@@ -113,7 +114,7 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
     start_ipc_server(Arc::clone(&runtime));
     let executor = ResticExecutor::new(
         restic_path(),
-        Arc::new(UnavailableSecretResolver),
+        secret_resolver(),
         Arc::new(SystemWakeLockProvider),
     );
 
@@ -251,11 +252,28 @@ fn config_path(arguments: &[OsString]) -> PathBuf {
 }
 
 fn default_config_path() -> PathBuf {
+    program_data_root().join("config.toml")
+}
+
+fn credential_store_path() -> PathBuf {
+    program_data_root().join("Credentials")
+}
+
+fn program_data_root() -> PathBuf {
     env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
         .join("ResticPal")
-        .join("config.toml")
+}
+
+fn secret_resolver() -> Arc<dyn SecretResolver> {
+    match DpapiSecretStore::open(credential_store_path()) {
+        Ok(store) => Arc::new(DpapiSecretResolver::new(store)),
+        Err(error) => {
+            eprintln!("could not initialize the credential store: {error}");
+            Arc::new(UnavailableSecretResolver)
+        }
+    }
 }
 
 fn restic_path() -> PathBuf {

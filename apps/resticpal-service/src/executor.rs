@@ -16,6 +16,7 @@ use std::time::Duration;
 use resticpal_core::config::{EffectiveConfig, SecretEnvironmentVariable};
 use resticpal_core::restic::{ResticCommandBuilder, ResticInvocation};
 use resticpal_core::status::BackupProgress;
+use resticpal_windows::credentials::DpapiSecretStore;
 use serde::Deserialize;
 use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE};
 use windows::Win32::System::JobObjects::{
@@ -63,6 +64,28 @@ pub struct UnavailableSecretResolver;
 impl SecretResolver for UnavailableSecretResolver {
     fn resolve(&self, _reference: &str) -> Result<Zeroizing<String>, SecretResolveError> {
         Err(SecretResolveError)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DpapiSecretResolver {
+    store: DpapiSecretStore,
+}
+
+impl DpapiSecretResolver {
+    pub fn new(store: DpapiSecretStore) -> Self {
+        Self { store }
+    }
+}
+
+impl SecretResolver for DpapiSecretResolver {
+    fn resolve(&self, reference: &str) -> Result<Zeroizing<String>, SecretResolveError> {
+        let bytes = self.store.get(reference).map_err(|_| SecretResolveError)?;
+        let value = String::from_utf8(bytes.to_vec()).map_err(|_| SecretResolveError)?;
+        if value.contains('\0') {
+            return Err(SecretResolveError);
+        }
+        Ok(Zeroizing::new(value))
     }
 }
 
@@ -699,6 +722,40 @@ mod tests {
                 code: "credential_unavailable".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn dpapi_resolver_returns_a_stored_utf8_secret() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = DpapiSecretStore::open(directory.path().join("credentials"))
+            .expect("store should open");
+        store
+            .put("repository-password", b"protected-value")
+            .expect("secret should store");
+        let resolver = DpapiSecretResolver::new(store);
+
+        let secret = resolver
+            .resolve("repository-password")
+            .expect("secret should resolve");
+
+        assert_eq!(secret.as_str(), "protected-value");
+    }
+
+    #[test]
+    fn dpapi_resolver_rejects_non_environment_values() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = DpapiSecretStore::open(directory.path().join("credentials"))
+            .expect("store should open");
+        store
+            .put("binary-value", &[0xff, 0xfe])
+            .expect("binary value should store");
+        store
+            .put("nul-value", b"before\0after")
+            .expect("nul value should store");
+        let resolver = DpapiSecretResolver::new(store);
+
+        assert!(resolver.resolve("binary-value").is_err());
+        assert!(resolver.resolve("nul-value").is_err());
     }
 
     #[test]
