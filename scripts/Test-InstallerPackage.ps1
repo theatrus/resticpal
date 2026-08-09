@@ -33,7 +33,7 @@ try {
     }
     $decompiledPackage = Get-Content -LiteralPath $decompiledPath -Raw
     foreach ($requiredAuthoring in @(
-        'Account="NT SERVICE\ResticPal"',
+        'Account="LocalSystem"',
         'Start="install" Stop="both" Remove="uninstall"',
         'Software\Microsoft\Windows\CurrentVersion\Run',
         'Property Id="RESTICPAL_BOOTSTRAP_URL"',
@@ -47,8 +47,8 @@ try {
             throw "MSI database is missing required authoring: $requiredAuthoring"
         }
     }
-    if (-not $decompiledPackage.Contains('<Data Column="User" Value="NT SERVICE\ResticPal" />')) {
-        throw 'MSI database does not contain the virtual service account ProgramData ACL entry.'
+    if (-not $decompiledPackage.Contains('<Data Column="User" Value="NT AUTHORITY\SYSTEM" />')) {
+        throw 'MSI database does not contain the LocalSystem application-data ACL entry.'
     }
 
     $arguments = "/a `"$resolvedMsiPath`" TARGETDIR=`"$adminImageRoot`" /qn /norestart /l*v `"$logPath`""

@@ -180,7 +180,7 @@ try {
     $service = Get-Service -Name ResticPal
     $service.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(30))
     $serviceConfiguration = Get-CimInstance Win32_Service -Filter "Name='ResticPal'"
-    if ($serviceConfiguration.StartName -ne 'NT SERVICE\ResticPal') {
+    if ($serviceConfiguration.StartName -ne 'LocalSystem') {
         throw "Unexpected service identity: $($serviceConfiguration.StartName)"
     }
     if ($serviceConfiguration.StartMode -ne 'Auto') {

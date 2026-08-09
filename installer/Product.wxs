@@ -38,7 +38,7 @@
                         Type="ownProcess"
                         Start="auto"
                         ErrorControl="normal"
-                        Account="NT SERVICE\ResticPal"
+                        Account="LocalSystem"
                         Vital="yes">
           <util:ServiceConfig FirstFailureActionType="restart"
                               SecondFailureActionType="restart"
@@ -59,7 +59,6 @@
                  Directory="PROGRAMDATADIR"
                  KeyPath="yes">
         <CreateFolder>
-          <util:PermissionEx User="NT SERVICE\ResticPal" GenericAll="yes" />
           <util:PermissionEx User="BUILTIN\Administrators" GenericAll="yes" />
           <util:PermissionEx User="NT AUTHORITY\SYSTEM" GenericAll="yes" />
         </CreateFolder>
@@ -87,7 +86,6 @@
                          Type="string"
                          Value="[RESTICPAL_BOOTSTRAP_URL]"
                          KeyPath="yes" />
-          <util:PermissionEx User="NT SERVICE\ResticPal" GenericAll="yes" />
           <util:PermissionEx User="BUILTIN\Administrators" GenericAll="yes" />
           <util:PermissionEx User="NT AUTHORITY\SYSTEM" GenericAll="yes" />
         </RegistryKey>

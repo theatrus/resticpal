@@ -6,17 +6,17 @@ This document records the product requirements, architecture decisions, and curr
 
 ## Implementation status
 
-The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The active automated baseline is 124 passing client tests plus eight passing tests in the adjacent `resticpal-server` repository and a warning-free WinUI build. The MSI is build/ICE/admin-image validated but its privileged install and VSS behavior are not yet production-qualified.
+The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The active automated baseline is 124 passing client tests plus eight passing tests in the adjacent `resticpal-server` repository and a warning-free WinUI build. The MSI is build/ICE/admin-image validated, and its installed LocalSystem service and VSS backup path pass in a disposable Windows 11 Sandbox; the wider Windows 10/11 matrix is not yet production-qualified.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
 | Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, append-only command authorization, versioned manifest and enrollment payloads, strict Ed25519 envelopes, X25519/HKDF/ChaCha20-Poly1305 secret bootstrap, freshness, and replay checks | Standard-mode retention execution and schema evolution beyond v1 |
-| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository and enrollment credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler checkpoint, bounded SQLite history, bounded shutdown outcome draining, plain/signed manifest fetching, last-known-good cache, runtime policy application, bounded status delivery, one-time enrollment/rotation, and unenrollment | Installer-created service identity/ACL validation, direct-file watching, structured logs/audit, graceful cancellation before escalation, and production VSS testing |
+| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository and enrollment credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler checkpoint, bounded SQLite history, bounded shutdown outcome draining, plain/signed manifest fetching, last-known-good cache, runtime policy application, bounded status delivery, one-time enrollment/rotation, unenrollment, and Sandbox-qualified LocalSystem/VSS execution | Windows 10/11 matrix ACL/VSS qualification, direct-file watching, structured logs/audit, and graceful cancellation before escalation |
 | Local IPC | Protocol v3, 1 MiB bounded frames, bounded per-connection I/O, protected named pipe, client-token authorization, ordinary-user status/history/run/cancel/defer, and elevated configuration/enrollment operations | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v3 |
 | Tray | Native Win32 notification icon, current status tooltip, run/cancel action, and elevated UI launch | Push-driven live icon updates, deferral UI, notifications, richer health icons, and startup registration |
 | WinUI application | Overview, backup sources, repository, schedule/power/network, bounded backup history, and managed enrollment/rotation/unenrollment pages | Diagnostics/logs, updates/settings, accessibility and Windows 10 qualification |
 | Remote management | Plain HTTP/HTTPS manifest mode without reporting; signed HTTPS manifest mode with pinned Ed25519 key, atomic cache, replay/freshness checks, authenticated status delivery; one-time signed enrollment with encrypted credentials; adjacent server with signed manifests, bounded SQLite status, and admin-only maintenance jobs | Conditional requests, enrollment audit/rate limits, and production deployment hardening |
-| Distribution | Per-machine x64 WiX MSI, pinned restic 0.19.1, release service/tray, self-contained WinUI payload, virtual-account service/recovery authoring, ProgramData and bootstrap registry ACL authoring, optional hidden bootstrap property, tray logon registration, data-preserving uninstall design, notices, and local E2E harness | Elevated service/VSS qualification, interactive installer bootstrap dialog, Start Menu integration, code signing, complete license generation, update UI/appcast verification, elevated updater, and upgrade/repair matrix |
+| Distribution | Per-machine x64 WiX MSI, pinned restic 0.19.1, statically linked Rust CRT, self-contained WinUI payload, LocalSystem service/recovery authoring, ProgramData and bootstrap registry ACL authoring, optional hidden bootstrap property, tray logon registration, data-preserving uninstall, notices, and disposable Sandbox E2E harness | Windows 10/11 installer/VSS matrix, interactive installer bootstrap dialog, Start Menu integration, code signing, complete license generation, update UI/appcast verification, elevated updater, and upgrade/repair matrix |
 
 Current durable state consists of atomic `config.toml`, DPAPI-protected credential files, `state.json` for scheduler/repository-verification state, and lazy `state.db` backup history. The history retains the newest 200 attempts and exposes at most 100 per IPC request; the WinUI page requests 50.
 
@@ -124,17 +124,11 @@ The current unpackaged x64 application uses Windows App SDK 2.3.1, targets .NET 
 
 ## Windows service identity and access
 
-The preferred identity is a dedicated virtual service account, `NT SERVICE\ResticPal`, with a service SID, the minimum required Windows privileges, and narrowly ACLed application state. An early compatibility spike must confirm that this identity can:
+The preferred feasibility candidate was a dedicated virtual service account, `NT SERVICE\ResticPal`, with a service SID, the minimum required Windows privileges, and narrowly ACLed application state. The clean-machine Sandbox spike confirmed that the service can start and access its ACLed repository under that identity, but restic cannot use VSS: Windows rejects a VSS requester that is not LocalSystem or a member of Administrators/Backup Operators by default. The same identity also cannot reliably read arbitrary user profiles without weakening their ACLs.
 
-- read configured user data without weakening user-file ACLs;
-- enable the filesystem/backup privileges restic expects;
-- create and use VSS snapshots;
-- access local, network, and supported remote repositories;
-- start the bundled restic child process with the intended restricted environment.
+The x64 v1 installer therefore uses the documented fallback, LocalSystem. This supplies the filesystem access and VSS requester rights required for machine-wide user-data backup. `%ProgramData%\ResticPal`, the installed binaries, bootstrap registry state, named-pipe command surface, typed restic invocation boundary, and future update path must remain tightly ACLed and validated because this identity is highly privileged.
 
-If reliable file access or VSS cannot be achieved with the virtual account, the installer may offer or use LocalSystem as a documented fallback. LocalSystem is highly privileged, so the service command surface, binaries, configuration, named pipes, and update path must be tightly ACLed and validated.
-
-The service host, service-control handling, and virtual-account MSI authoring exist, but the virtual account has not yet been validated against real user ACLs, VSS, network shares, or cloud credentials on the supported Windows matrix. DPAPI data is intentionally bound to whichever identity runs the service, so changing that identity requires an explicit credential migration or reprovisioning design.
+DPAPI data is intentionally bound to the service identity. The LocalSystem decision was made before release; any future identity change will require explicit credential migration or reprovisioning. Network-share access under the machine identity and the complete Windows 10/11 ACL/VSS matrix still require qualification.
 
 ## IPC and authorization
 
@@ -413,21 +407,21 @@ The first development installer is implemented as a per-machine x64 WiX 6 MSI. I
 The MSI currently:
 
 - installs the application under 64-bit Program Files;
-- registers an automatically started `ResticPal` service under `NT SERVICE\ResticPal` with bounded restart recovery actions;
+- registers an automatically started LocalSystem `ResticPal` service with bounded restart recovery actions;
 - authors service/admin/system access for `%ProgramData%\ResticPal` while leaving created configuration, credentials, state, history, and repositories untracked by MSI so uninstall preserves them;
 - registers the lightweight tray under the machine Run key for future interactive logons;
 - installs the on-demand self-contained WinUI application beside the tray so the tray can launch it;
 - embeds the pinned restic binary and development license/notice inventory;
 - supports standard MSI reinstall, repair, upgrade, and uninstall mechanics, though the upgrade/repair matrix is not yet qualified.
 
-An elevated PowerShell E2E harness refuses to touch a pre-existing installation or data directory, installs the MSI, verifies identity/payload/registration, configures a disposable local repository and DPAPI password through protected IPC, initializes then switches it to append-only mode, runs a VSS backup, checks restart-persistent history, uninstalls, proves data preservation, and removes only its synthetic state. The current desktop session could build and inspect the package but could not cross the UAC boundary, so the privileged cycle remains ready but unexecuted here.
+An elevated PowerShell E2E harness refuses to touch a pre-existing installation or data directory, installs the MSI, verifies identity/payload/registration, configures a disposable local repository and DPAPI password through protected IPC, initializes then switches it to append-only mode, runs a VSS backup, checks restart-persistent history, uninstalls, proves data preservation, and removes only its synthetic state. The same lifecycle runs in a disposable Windows Sandbox through the Windows 11 Sandbox CLI, with a `.wsb` fallback on older hosts.
 
 The following packaging work remains:
 
 The development WinUI project currently declares `10.0.17763.0` (Windows 10 version 1809) as its target-platform minimum. That is a build setting, not yet a qualified support promise.
 
 - Target Windows 10 and Windows 11; the exact minimum Windows 10 build will be validated with the first WinUI/installer prototype.
-- Qualify virtual-account source access, ProgramData ACL behavior, VSS privileges, repair, same/major upgrades, and reboot/restart cases.
+- Qualify LocalSystem source access, ProgramData ACL behavior, VSS, repair, same/major upgrades, and reboot/restart cases across supported Windows 10/11 builds.
 - Add a Start Menu entry and installer UI.
 - Install an updater after its trust and rollback design is implemented.
 - Offers initial local setup or optional enrollment by bootstrap URL.
@@ -456,13 +450,13 @@ The service-only execution boundary, shell-free command construction, typed opti
 ## Initial delivery milestones
 
 1. **Windows feasibility spike — in progress**
-   - Service installation and virtual-account identity.
+   - Service installation and least-privilege identity feasibility.
    - Named-pipe authorization.
    - VSS backup of known folders on Windows 10 and Windows 11.
    - Sleep/resume event handling and two-hour power request.
    - Measure idle service/tray resource use.
 
-   The service host, named-pipe authorization, resume event, timed power request, MSI service registration, and elevated installed-service harness exist. A real-restic disposable local-repository lifecycle is covered by an opt-in non-elevated test, and exact VSS variants are available for elevated/executed-service qualification. Successful elevated identity/VSS execution, OS-matrix qualification, and resource measurement remain.
+   The service host, named-pipe authorization, resume event, timed power request, MSI service registration, and installed-service harness exist. A virtual service account was rejected for v1 after clean-machine testing proved it could not request VSS or reliably cover arbitrary user ACLs; the LocalSystem fallback now passes the disposable installed-service VSS lifecycle. OS-matrix qualification and resource measurement remain.
 
 2. **Local vertical slice — functional development slice**
    - Rust service and tray.
@@ -499,13 +493,12 @@ The following themes remain required as their corresponding product areas land:
 - End-to-end command tests proving enrolled configuration cannot introduce arbitrary arguments or executables.
 - Append-only integration tests for storage-side delete/overwrite rejection.
 - S3 integration tests for endpoint variants, regions, bucket addressing, temporary credentials, and rotation.
-- Service security tests for installed binary/config ACLs, virtual-account privileges, and VSS access.
+- Service security tests for installed binary/config ACLs, LocalSystem command-surface restrictions, and VSS access across the supported OS matrix.
 - Update tests for signature failure, interrupted download/install, an active backup, rollback/repair, and restic version replacement.
 - Resource tests for long idle periods, repeated UI open/close, disconnected server/network, and large progress streams.
 
 ## Open implementation decisions
 
-- Whether the virtual service account is sufficient for reliable VSS and arbitrary configured user paths; LocalSystem is the fallback.
 - Remote schema shapes, signature envelopes, and API/metadata serialization.
 - Local IPC subscription framing and compatibility policy beyond protocol v3.
 - Concrete idle memory/CPU targets after the feasibility prototype.
@@ -529,5 +522,6 @@ The bundled restic binary and all other third-party components retain their own 
 - [restic Windows VSS backup documentation](https://restic.readthedocs.io/en/stable/040_backup.html)
 - [restic repository backends and S3 configuration](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html)
 - [restic append-only maintenance guidance](https://restic.readthedocs.io/en/latest/060_forget.html)
+- [Microsoft VSS requester security considerations](https://learn.microsoft.com/en-us/windows/win32/vss/security-considerations-for-requestors)
 - [Windows App SDK platform overview](https://learn.microsoft.com/en-us/windows/apps/develop/platform/)
 - [NetSparkleUpdater](https://github.com/NetSparkleUpdater/NetSparkle)

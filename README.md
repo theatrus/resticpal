@@ -66,7 +66,7 @@ All three policy transport paths now have an end-to-end implementation. A one-ti
 - DPAPI-encrypted, service-owned credential storage with protected ACLs and opaque references
 - Direct restic execution inside a kill-on-close Windows Job Object, bounded JSON progress, and sanitized outcomes
 - Durable repository validation, scheduler state, and privacy-bounded SQLite run history
-- Per-machine x64 MSI with a virtual service account, recovery policy, tray startup, bundled restic, and data-preserving uninstall
+- Per-machine x64 MSI with a LocalSystem backup service, recovery policy, tray startup, bundled restic, and data-preserving uninstall
 - Optional companion server for signed manifests, latest-device status, and server-only retention/prune jobs
 
 ## The append-only model
