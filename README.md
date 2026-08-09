@@ -50,7 +50,7 @@ The first slice establishes:
 - an RAII Windows system-required power request;
 - machine configuration loading with a friendly invalid/unconfigured state;
 - authenticated, size- and time-bounded local IPC using client token impersonation and a protected DACL;
-- a native tray icon whose status and run-now command come from the service;
+- a branded native tray icon whose status and run-now command come from the service;
 - an on-demand WinUI application that reads service status and sends run-now requests;
 - direct restic process execution in a kill-on-close Windows Job Object;
 - bounded JSON progress parsing, cancellation, and sanitized outcomes;

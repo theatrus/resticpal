@@ -13,11 +13,12 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, IDC_ARROW, IDI_APPLICATION,
-    LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MENU_ITEM_FLAGS, MSG,
-    MessageBoxW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY,
+    AppendMenuW, CW_USEDEFAULT, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
+    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, LR_DEFAULTCOLOR, LoadCursorW, LoadIconW,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MENU_ITEM_FLAGS, MSG, MessageBoxW, PostQuitMessage,
+    RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY,
     WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{Error, Result, w};
@@ -29,7 +30,48 @@ const MENU_OPEN: usize = 1;
 const MENU_RUN_BACKUP: usize = 2;
 const MENU_EXIT: usize = 3;
 const MF_STRING: MENU_ITEM_FLAGS = MENU_ITEM_FLAGS(0);
+const TRAY_ICON_BYTES: &[u8] = include_bytes!("../assets/resticpal.ico");
+const PREFERRED_TRAY_ICON_SIZE: u16 = 32;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+struct TrayIcon {
+    handle: HICON,
+    owned: bool,
+}
+
+impl TrayIcon {
+    fn load() -> Result<Self> {
+        if let Some(image) = select_icon_image(TRAY_ICON_BYTES, PREFERRED_TRAY_ICON_SIZE) {
+            // SAFETY: `image` is a bounded image resource from the embedded ICO and
+            // remains live for the duration of this synchronous call.
+            if let Ok(handle) =
+                unsafe { CreateIconFromResourceEx(image, true, 0x0003_0000, 0, 0, LR_DEFAULTCOLOR) }
+            {
+                return Ok(Self {
+                    handle,
+                    owned: true,
+                });
+            }
+        }
+
+        // SAFETY: loading a predefined Windows resource returns a shared handle.
+        let handle = unsafe { LoadIconW(None, IDI_APPLICATION) }?;
+        Ok(Self {
+            handle,
+            owned: false,
+        })
+    }
+}
+
+impl Drop for TrayIcon {
+    fn drop(&mut self) {
+        if self.owned {
+            // SAFETY: an owned handle is created exactly once above and remains live
+            // until this process has removed its notification-area icon.
+            let _ = unsafe { DestroyIcon(self.handle) };
+        }
+    }
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -54,6 +96,7 @@ fn run() -> Result<()> {
     let instance = HINSTANCE(module.0);
     // SAFETY: loading predefined Windows resources does not transfer ownership.
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }?;
+    let tray_icon = TrayIcon::load()?;
 
     let window_class = WNDCLASSW {
         hCursor: cursor,
@@ -86,13 +129,11 @@ fn run() -> Result<()> {
         )
     }?;
 
-    add_tray_icon(window)?;
+    add_tray_icon(window, tray_icon.handle)?;
     run_message_loop()
 }
 
-fn add_tray_icon(window: HWND) -> Result<()> {
-    // SAFETY: loading a predefined application icon returns a shared handle.
-    let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }?;
+fn add_tray_icon(window: HWND, icon: HICON) -> Result<()> {
     let mut data = NOTIFYICONDATAW {
         cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>())
             .expect("NOTIFYICONDATAW size fits in u32"),
@@ -113,6 +154,59 @@ fn add_tray_icon(window: HWND) -> Result<()> {
     } else {
         Err(Error::from_thread())
     }
+}
+
+fn select_icon_image(bytes: &[u8], preferred_size: u16) -> Option<&[u8]> {
+    if read_u16(bytes, 0)? != 0 || read_u16(bytes, 2)? != 1 {
+        return None;
+    }
+
+    let count = usize::from(read_u16(bytes, 4)?);
+    let directory_end = 6usize.checked_add(count.checked_mul(16)?)?;
+    if count == 0 || directory_end > bytes.len() {
+        return None;
+    }
+
+    let preferred_size = u32::from(preferred_size);
+    let mut selected: Option<(u32, &[u8])> = None;
+    for index in 0..count {
+        let entry_offset = 6 + index * 16;
+        let entry = bytes.get(entry_offset..entry_offset + 16)?;
+        let width = if entry[0] == 0 {
+            256
+        } else {
+            u32::from(entry[0])
+        };
+        let height = if entry[1] == 0 {
+            256
+        } else {
+            u32::from(entry[1])
+        };
+        let image_size = usize::try_from(read_u32(entry, 8)?).ok()?;
+        let image_offset = usize::try_from(read_u32(entry, 12)?).ok()?;
+        let image_end = image_offset.checked_add(image_size)?;
+        let image = bytes.get(image_offset..image_end)?;
+        let score = width.abs_diff(preferred_size) + height.abs_diff(preferred_size);
+
+        if selected
+            .as_ref()
+            .is_none_or(|(selected_score, _)| score < *selected_score)
+        {
+            selected = Some((score, image));
+        }
+    }
+
+    selected.map(|(_, image)| image)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let raw: [u8; 2] = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
+    Some(u16::from_le_bytes(raw))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let raw: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(raw))
 }
 
 fn run_message_loop() -> Result<()> {
@@ -409,4 +503,37 @@ fn copy_wide(value: &str, destination: &mut [u16]) {
 
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_tray_icon_contains_the_preferred_png_image() {
+        let image = select_icon_image(TRAY_ICON_BYTES, PREFERRED_TRAY_ICON_SIZE)
+            .expect("embedded tray icon should contain a valid image");
+
+        assert_eq!(image.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()));
+    }
+
+    #[test]
+    fn windows_can_create_the_embedded_tray_icon() {
+        let image = select_icon_image(TRAY_ICON_BYTES, PREFERRED_TRAY_ICON_SIZE)
+            .expect("embedded tray icon should contain a valid image");
+        // SAFETY: `image` is a complete, bounded icon image owned by the static ICO.
+        let icon =
+            unsafe { CreateIconFromResourceEx(image, true, 0x0003_0000, 0, 0, LR_DEFAULTCOLOR) }
+                .expect("Windows should create an icon from the embedded image");
+
+        // SAFETY: the icon was created by this test and has not been destroyed yet.
+        unsafe { DestroyIcon(icon) }.expect("Windows should destroy the test icon");
+    }
+
+    #[test]
+    fn icon_selection_rejects_truncated_directories() {
+        let truncated = [0, 0, 1, 0, 1, 0, 32, 32];
+
+        assert!(select_icon_image(&truncated, 32).is_none());
+    }
 }
