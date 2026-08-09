@@ -36,6 +36,7 @@ try {
         'Account="NT SERVICE\ResticPal"',
         'Start="install" Stop="both" Remove="uninstall"',
         'Software\Microsoft\Windows\CurrentVersion\Run',
+        'Property Id="ARPPRODUCTICON" Value="ResticPalIcon"',
         '<CustomTable Id="Wix4SecureObject">'
     )) {
         if (-not $decompiledPackage.Contains($requiredAuthoring)) {
@@ -64,6 +65,8 @@ try {
         'App.xbf',
         'MainWindow.xbf',
         'resources.pri',
+        'resticpal.ico',
+        'resticpal-logo.png',
         'restic.exe',
         'LICENSE-resticpal.txt',
         'THIRD-PARTY-NOTICES.md'

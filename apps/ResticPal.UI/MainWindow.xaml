@@ -10,9 +10,14 @@
         IsSettingsVisible="True"
         Loaded="NavigationView_Loaded"
         PaneDisplayMode="Left"
-        PaneTitle="resticpal"
         SelectionChanged="NavigationView_SelectionChanged"
         SelectedItem="{x:Bind OverviewItem}">
+        <NavigationView.PaneHeader>
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <Image Width="32" Height="32" Source="resticpal-logo.png" />
+                <TextBlock VerticalAlignment="Center" FontSize="20" FontWeight="SemiBold" Text="resticpal" />
+            </StackPanel>
+        </NavigationView.PaneHeader>
         <NavigationView.MenuItems>
             <NavigationViewItem x:Name="OverviewItem" Content="Overview" Tag="overview">
                 <NavigationViewItem.Icon>

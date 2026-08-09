@@ -30,7 +30,7 @@ const MENU_OPEN: usize = 1;
 const MENU_RUN_BACKUP: usize = 2;
 const MENU_EXIT: usize = 3;
 const MF_STRING: MENU_ITEM_FLAGS = MENU_ITEM_FLAGS(0);
-const TRAY_ICON_BYTES: &[u8] = include_bytes!("../assets/resticpal.ico");
+const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../../assets/resticpal.ico");
 const PREFERRED_TRAY_ICON_SIZE: u16 = 32;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 

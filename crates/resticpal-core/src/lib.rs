@@ -7,6 +7,7 @@
 //! they can be exercised without installing a service or touching a repository.
 
 pub mod config;
+pub mod management;
 pub mod policy;
 pub mod restic;
 pub mod schedule;

@@ -1,21 +1,21 @@
 # resticpal product and architecture design
 
-Status: living design and implementation record, updated 2026-08-08
+Status: living design and implementation record, updated 2026-08-09
 
 This document records the product requirements, architecture decisions, and current implementation boundary for **resticpal**, a friendly, Windows-focused wrapper around [restic](https://restic.net/). It is the source of truth for the first implementation. Items explicitly marked "open", "proposed", "planned", or "not yet implemented" still require work or validation.
 
 ## Implementation status
 
-The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The automated baseline is 109 Rust tests plus a warning-free WinUI build. The MSI is build/ICE/admin-image validated but its privileged install and VSS behavior are not yet production-qualified.
+The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The active automated baseline is 120 passing client tests plus five passing tests in the adjacent `resticpal-server` repository and a warning-free WinUI build. The MSI is build/ICE/admin-image validated but its privileged install and VSS behavior are not yet production-qualified.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, and append-only command authorization | Signed managed-policy ingestion, policy freshness/replay handling, and standard-mode retention execution |
-| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler checkpoint, bounded SQLite history, and bounded shutdown outcome draining | Installer-created service identity/ACL validation, direct-file watching, structured logs/audit, graceful cancellation before escalation, and production VSS testing |
+| Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, append-only command authorization, versioned manifest payloads, strict Ed25519 envelopes, freshness, and replay checks | Standard-mode retention execution, enrollment/device-key contracts, and schema evolution beyond v1 |
+| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler checkpoint, bounded SQLite history, bounded shutdown outcome draining, plain/signed manifest fetching, last-known-good cache, runtime policy application, and bounded status delivery | Installer-created service identity/ACL validation, enrollment/bootstrap token consumption, direct-file watching, structured logs/audit, graceful cancellation before escalation, and production VSS testing |
 | Local IPC | Protocol v2, 1 MiB bounded frames, bounded per-connection I/O, protected named pipe, client-token authorization, ordinary-user status/history/run/cancel/defer, and elevated configuration operations | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v2 |
 | Tray | Native Win32 notification icon, current status tooltip, run/cancel action, and elevated UI launch | Push-driven live icon updates, deferral UI, notifications, richer health icons, and startup registration |
 | WinUI application | Overview, backup sources, repository, schedule/power/network, and bounded backup-history pages | Diagnostics/logs, enrollment/managed-policy, updates/settings, accessibility and Windows 10 qualification |
-| Remote management | Typed managed-policy data model and lock-aware service/UI paths | Enrollment, device keys, signed policy cache, credential bootstrap, metadata/API schemas, and status delivery |
+| Remote management | Plain HTTP/HTTPS manifest mode without reporting; signed HTTPS manifest mode with pinned Ed25519 key, atomic cache, replay/freshness checks, authenticated status delivery; adjacent server with signed manifests, bounded SQLite status, and admin-only maintenance jobs | One-time enrollment, device keys, encrypted credential bootstrap, UI/installer enrollment, key rotation, conditional requests, and production deployment hardening |
 | Distribution | Per-machine x64 WiX MSI, pinned restic 0.19.1, release service/tray, self-contained WinUI payload, virtual-account service/recovery authoring, ProgramData ACL authoring, tray logon registration, data-preserving uninstall design, notices, and local E2E harness | Elevated service/VSS qualification, installer UI/bootstrap, Start Menu integration, code signing, complete license generation, update UI/appcast verification, elevated updater, and upgrade/repair matrix |
 
 Current durable state consists of atomic `config.toml`, DPAPI-protected credential files, `state.json` for scheduler/repository-verification state, and lazy `state.db` backup history. The history retains the newest 200 attempts and exposes at most 100 per IPC request; the WinUI page requests 50.
@@ -44,7 +44,7 @@ The first release is Windows x64. A macOS implementation and a restore UI may co
 
 - A restore browser or restore workflow.
 - Bare-metal recovery, Windows installation imaging, or guaranteed application-consistent database backup.
-- A management server implementation. The repository will define the client protocol, schemas, and fixtures needed to integrate with one.
+- A large multi-tenant backup SaaS. The optional companion server remains small, self-hostable, and separable from standalone/plain-file operation.
 - macOS support.
 - ARM64 packages.
 - Fully unattended updates while releases lack an Authenticode code-signing certificate.
@@ -88,7 +88,7 @@ The Rust Windows service is the sole owner of:
 
 No tray or UI process may invoke restic directly.
 
-The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler state, and backup history. Remote enrollment/reporting, structured logs, and update coordination remain planned. The service expects a fixed sibling `restic.exe`; the development MSI now supplies a checksum-verified pinned binary at that location.
+The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler state, backup history, managed-manifest fetching/caching, runtime policy refresh, and authenticated status delivery. One-time enrollment/bootstrap, structured logs, and update coordination remain planned. The service expects a fixed sibling `restic.exe`; the development MSI now supplies a checksum-verified pinned binary at that location.
 
 ### `resticpal-tray.exe`
 
@@ -249,7 +249,7 @@ In append-only mode, the backup client is intentionally not a repository adminis
 - The retention UI displays **Managed by server** and does not offer a local prune action.
 - Any retention values received by the client are informational unless the repository is later switched to standard mode with appropriate credentials.
 - Remote status reports include the configured repository maintenance mode.
-- The server or another isolated maintenance host uses separate full-access credentials to perform pruning and other administration.
+- The server or another isolated maintenance host uses separate full-access credentials to perform pruning and other administration. The initial `resticpal-server` runner queues one job per repository and constructs an allowlisted `forget --keep-within … --prune` invocation. Repository secrets are mapped from explicitly named server environment variables, never accepted from an API request, and never delivered to clients.
 
 The client-side command restriction is defense in depth, not proof of append-only storage. Real protection must also be enforced by the repository service, proxy, S3 IAM/bucket policy, object immutability/versioning controls, or another storage-side mechanism. resticpal must label the mode as configured; it must not claim to have verified backend immutability unless a future backend-specific verification exists.
 
@@ -305,7 +305,9 @@ The target credential/device-key model is:
 
 ## Enrollment and remote policy
 
-This section remains a proposed protocol. No bootstrap URL consumption, device identity, signed policy cache, policy/status HTTP client, metadata-file adapter, schemas, or fixtures are implemented yet.
+The transport is now split into two explicit modes. `plain_manifest` fetches a direct v1 payload from any bounded HTTP or HTTPS URL, supports offline last-known-good startup, and cannot configure signing or status reporting. `signed_manifest` fetches a v1 Ed25519 envelope, pins the public key locally, requires HTTPS except on loopback, rejects expiry/tampering/rollback/schema mismatch, and may use a DPAPI-backed bearer token for manifest and status requests. Both modes apply only typed `ManagedPolicy` fields through the existing resolver.
+
+The remaining enrollment protocol below is still proposed. Bootstrap URL consumption, generated device key pairs, encrypted secret bootstrap, unenrollment, and rotation are not implemented.
 
 The installer offers an optional bootstrap URL field. Interactive entry is preferred because one-time URLs and tokens can leak through process listings, shell history, response logs, or MSI logs when passed on a command line.
 
@@ -328,7 +330,7 @@ The installer offers an optional bootstrap URL field. Interactive entry is prefe
 6. The service verifies and commits enrollment, then erases the one-time bootstrap material.
 7. Future policy fetches use conditional requests such as ETag/version and retain the last-known-good policy when offline.
 
-The protocol should permit a metadata-file-only integration as well as a conventional API. This repository will provide versioned JSON Schemas, an OpenAPI description for optional endpoints, signature test vectors, and example fixtures; it will not implement the server.
+The adjacent `resticpal-server` repository implements the initial conventional API and carries v1 JSON Schemas and a plain-manifest fixture. A normal static HTTP server remains a supported metadata-only integration and never gains status reporting. OpenAPI generation and signature test-vector publication remain.
 
 ## Backup state and local status
 
@@ -366,7 +368,7 @@ The current local status protocol exposes redacted state, repository name/mode, 
 
 ## Remote status reporting
 
-Remote status reporting is not implemented. The following remains the agreed reporting contract for the enrollment milestone.
+Authenticated status delivery is implemented for signed-manifest configurations that provide a device ID, status URL, and DPAPI token reference. The worker reports important state changes, every five minutes while running, every six hours while idle, and uses bounded exponential backoff after failure. Delivery is isolated from backup success. Jitter, richer version fields, durable delivery state, and enrollment-created credentials remain.
 
 Remote reporting occurs only when enrolled. The default cadence is:
 
@@ -476,10 +478,10 @@ The service-only execution boundary, shell-free command construction, typed opti
    - Standard retention and append-only/server-maintained mode.
    - Configuration file reload and per-field managed locks.
 
-   Create/connect, S3/advanced configuration, append-only enforcement, typed policy precedence, and per-field lock enforcement are implemented. Standard retention execution/UI, live file reload, and signed managed-policy ingestion remain.
+   Create/connect, S3/advanced configuration, append-only enforcement, typed policy precedence, per-field lock enforcement, plain/signed manifest ingestion, and live remote policy application are implemented. Standard client-side retention UI/execution and live local-file reload remain.
 
-4. **Enrollment and reporting — not started**
-   - Bootstrap flow, device identity, signed policy cache, encrypted secret bootstrap, metadata-file mode, status reports, schemas, fixtures, and protocol tests.
+4. **Enrollment and reporting — in progress**
+   Plain-file mode, signed-envelope verification, replay/freshness checks, atomic cache fallback, authenticated status delivery, schemas, fixtures, and the initial companion server are implemented. One-time bootstrap, generated device identity, encrypted secret bootstrap, installer/UI enrollment, key rotation, and unenrollment remain.
 
 5. **Packaging and updates — installer prototype**
    - WiX MSI, startup registration, upgrade/repair/uninstall behavior, NetSparkle appcast verification, and elevated atomic updater.
@@ -488,12 +490,12 @@ The service-only execution boundary, shell-free command construction, typed opti
 
 ## Required test themes
 
-The 109-test automated Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, policy precedence and locks, command construction, append-only authorization, configuration bounds, named-pipe framing/ACL/token checks, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, and SQLite history retention/redaction/restart behavior. Two additional ignored, opt-in real-restic tests create disposable local repositories: the normal developer variant removes only the VSS flag after asserting the production builder supplied it, while the exact production variant requires an elevated token with VSS access. The lifecycle verifies missing-repository detection, initialization, wrong-password rejection, probe, append-only backup, snapshots, check, and changed second-backup behavior. A PowerShell helper locates or checksum-verifies a pinned restic test binary without writing it into the repository. The MSI is release-build, ICE, administrative-image, payload-hash, restic-version, and packaged-service console validated. The elevated installed-service lifecycle is implemented but still awaiting execution across the local UAC boundary. The WinUI project is build-validated but does not yet have an automated UI test suite.
+The automated Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, policy precedence and locks, command construction, append-only authorization, configuration bounds, signed-manifest tampering/expiry/replay, plain-HTTP fetch and offline cache recovery, named-pipe framing/ACL/token checks, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, and SQLite history retention/redaction/restart behavior. The server baseline covers constant-time token authentication, API manifest/status round trips, bounded SQLite state, configuration allowlists, and maintenance environment isolation. Two additional ignored, opt-in real-restic tests create disposable local repositories. The MSI is release-build, ICE, administrative-image, payload-hash, restic-version, and packaged-service console validated. The elevated installed-service lifecycle is implemented but still awaiting execution across the local UAC boundary. The WinUI project is build-validated but does not yet have an automated UI test suite.
 
 The following themes remain required as their corresponding product areas land:
 
 - Scheduler tests for shutdown races, daylight-saving transitions, dedicated network-change events, and graceful cancellation escalation.
-- Policy tests for stale/offline signed policy, signature failure, rollback/replay attempts, schema evolution, and atomic cache recovery.
+- Policy tests for signed-cache offline expiry behavior, key rotation, schema evolution, and atomic-cache interruption recovery.
 - End-to-end command tests proving enrolled configuration cannot introduce arbitrary arguments or executables.
 - Append-only integration tests for storage-side delete/overwrite rejection.
 - S3 integration tests for endpoint variants, regions, bucket addressing, temporary credentials, and rotation.

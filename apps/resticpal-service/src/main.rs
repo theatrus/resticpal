@@ -3,6 +3,7 @@ mod conditions;
 mod config_store;
 mod executor;
 mod history;
+mod management;
 mod power_request;
 mod runtime;
 mod state;
@@ -20,11 +21,13 @@ use std::time::Instant;
 
 use chrono::Utc;
 use conditions::{SystemConditions, WinRtApartment};
+use config_store::LocalConfigStore;
 use executor::{
     BackupOutcome, CancellationToken, DpapiSecretResolver, RepositoryOutcome, ResticExecutor,
     SecretResolver, SystemWakeLockProvider, UnavailableSecretResolver,
 };
 use resticpal_core::restic::ResticOperation;
+use resticpal_core::status::BackupState;
 use resticpal_protocol::RepositoryOperationKind;
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::{DEFAULT_PIPE_NAME, NamedPipeServer};
@@ -121,12 +124,34 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
     };
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
+    status_handle.set_service_status(ScmServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: ServiceState::StartPending,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 1,
+        wait_hint: Duration::from_secs(45),
+        process_id: None,
+    })?;
     let config_path = config_path(arguments);
     let credential_store = credential_store();
-    let runtime = match ServiceRuntime::load_with_credentials(
+    let local_for_management = LocalConfigStore::new(&config_path).load().ok();
+    let loaded_policy = local_for_management.as_ref().and_then(|local| {
+        match management::load_best_policy(&config_path, local, credential_store.as_ref()) {
+            Ok(policy) => policy,
+            Err(error) => {
+                eprintln!(
+                    "managed policy is unavailable; continuing with local configuration: {error}"
+                );
+                None
+            }
+        }
+    });
+    let runtime = match ServiceRuntime::load_with_credentials_and_policy(
         &config_path,
         event_tx.clone(),
         credential_store.clone(),
+        loaded_policy.as_ref().map(|loaded| &loaded.policy),
     ) {
         Ok(runtime) => Arc::new(runtime),
         Err(error) => {
@@ -142,6 +167,15 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
         }
     };
     start_ipc_server(Arc::clone(&runtime));
+    if let Some(local) = local_for_management {
+        start_management_worker(
+            Arc::clone(&runtime),
+            config_path.clone(),
+            local,
+            loaded_policy.map_or(0, |loaded| loaded.sequence),
+            credential_store.clone(),
+        );
+    }
     let executor = ResticExecutor::new(
         restic_path(),
         secret_resolver(credential_store),
@@ -180,6 +214,101 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
     })?;
 
     Ok(())
+}
+
+fn start_management_worker(
+    runtime: Arc<ServiceRuntime>,
+    config_path: PathBuf,
+    local: resticpal_core::config::LocalConfig,
+    initial_sequence: u64,
+    credential_store: Option<DpapiSecretStore>,
+) {
+    if local.management.mode == resticpal_core::config::ManagementMode::Disabled {
+        return;
+    }
+    thread::Builder::new()
+        .name("resticpal-management".to_owned())
+        .spawn(move || {
+            let client = management::ManagementClient::new();
+            let mut sequence = initial_sequence;
+            let refresh_interval =
+                Duration::from_secs(u64::from(local.management.refresh_interval_minutes()) * 60);
+            let mut next_refresh = Instant::now() + refresh_interval;
+            let reporting_enabled = local.management.status_url.is_some();
+            let mut next_report = Instant::now();
+            let mut report_failures = 0_u32;
+            let mut last_observed_state: Option<BackupState> = None;
+
+            loop {
+                let now = Instant::now();
+                if now >= next_refresh {
+                    match management::refresh_policy(
+                        &client,
+                        &config_path,
+                        &local,
+                        sequence,
+                        credential_store.as_ref(),
+                    ) {
+                        Ok(loaded) => {
+                            if loaded.sequence > sequence {
+                                match runtime.apply_managed_policy(&loaded.policy) {
+                                    Ok(true) => sequence = loaded.sequence,
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        eprintln!("managed policy could not be applied: {error}")
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => eprintln!("managed policy refresh failed: {error}"),
+                    }
+                    next_refresh = now + refresh_interval;
+                }
+
+                if reporting_enabled {
+                    let status = runtime.status();
+                    let state_changed = last_observed_state
+                        .as_ref()
+                        .is_none_or(|previous| previous != &status.state);
+                    if state_changed {
+                        next_report = now;
+                        last_observed_state = Some(status.state.clone());
+                    }
+                    if now >= next_report {
+                        let result = credential_store.as_ref().map_or_else(
+                            || Err("protected credential store is unavailable".to_owned()),
+                            |store| {
+                                client
+                                    .report_status(&local.management, store, status.clone())
+                                    .map_err(|error| error.to_string())
+                            },
+                        );
+                        match result {
+                            Ok(()) => {
+                                report_failures = 0;
+                                let cadence = if matches!(status.state, BackupState::Running { .. })
+                                {
+                                    Duration::from_secs(5 * 60)
+                                } else {
+                                    Duration::from_secs(6 * 60 * 60)
+                                };
+                                next_report = now + cadence;
+                            }
+                            Err(error) => {
+                                eprintln!("managed status delivery failed: {error}");
+                                report_failures = report_failures.saturating_add(1);
+                                let exponent = report_failures.saturating_sub(1).min(6);
+                                next_report = now
+                                    + Duration::from_secs(60_u64.saturating_mul(1_u64 << exponent));
+                            }
+                        }
+                    }
+                }
+
+                thread::sleep(Duration::from_secs(30));
+            }
+        })
+        .expect("the service must be able to create its management thread");
 }
 
 fn start_ipc_server(runtime: Arc<ServiceRuntime>) {

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const MAX_BACKUP_PATHS: usize = 128;
@@ -15,6 +16,10 @@ pub const MAX_REPOSITORY_OPTIONS: usize = 64;
 pub const MAX_REPOSITORY_OPTION_VALUE_CHARACTERS: usize = 4 * 1_024;
 pub const MAX_SECRET_REFERENCE_BYTES: usize = 64;
 pub const MAX_SCHEDULE_INTERVAL_HOURS: u32 = 24 * 365;
+pub const MAX_MANAGEMENT_URL_CHARACTERS: usize = 8 * 1_024;
+pub const MAX_MANAGEMENT_ID_CHARACTERS: usize = 256;
+pub const MIN_MANAGEMENT_REFRESH_MINUTES: u32 = 5;
+pub const MAX_MANAGEMENT_REFRESH_MINUTES: u32 = 24 * 60;
 
 const DEFAULT_INTERVAL_HOURS: u32 = 24;
 const DEFAULT_WAKE_GRACE_SECONDS: u64 = 5 * 60;
@@ -28,6 +33,7 @@ pub struct LocalConfig {
     pub repository: LocalRepositoryConfig,
     pub schedule: LocalScheduleConfig,
     pub retention: LocalRetentionConfig,
+    pub management: LocalManagementConfig,
 }
 
 impl Default for LocalConfig {
@@ -38,6 +44,7 @@ impl Default for LocalConfig {
             repository: LocalRepositoryConfig::default(),
             schedule: LocalScheduleConfig::default(),
             retention: LocalRetentionConfig::default(),
+            management: LocalManagementConfig::default(),
         }
     }
 }
@@ -55,6 +62,7 @@ impl LocalConfig {
                 actual: config.schema_version,
             });
         }
+        config.management.validate()?;
         Ok(config)
     }
 
@@ -97,6 +105,138 @@ pub struct LocalRetentionConfig {
     pub weekly: Option<u32>,
     pub monthly: Option<u32>,
     pub yearly: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalManagementConfig {
+    pub mode: ManagementMode,
+    pub manifest_url: Option<String>,
+    pub signing_public_key: Option<String>,
+    pub refresh_interval_minutes: Option<u32>,
+    pub status_url: Option<String>,
+    pub device_id: Option<String>,
+    pub status_token_ref: Option<String>,
+}
+
+impl LocalManagementConfig {
+    pub fn validate(&self) -> Result<(), ManagementConfigError> {
+        let refresh = self.refresh_interval_minutes.unwrap_or(15);
+        if !(MIN_MANAGEMENT_REFRESH_MINUTES..=MAX_MANAGEMENT_REFRESH_MINUTES).contains(&refresh) {
+            return Err(ManagementConfigError::InvalidRefreshInterval);
+        }
+
+        match self.mode {
+            ManagementMode::Disabled => {
+                if self.manifest_url.is_some()
+                    || self.signing_public_key.is_some()
+                    || self.status_url.is_some()
+                    || self.device_id.is_some()
+                    || self.status_token_ref.is_some()
+                {
+                    return Err(ManagementConfigError::UnexpectedDisabledFields);
+                }
+            }
+            ManagementMode::PlainManifest => {
+                validate_management_url(self.manifest_url.as_deref())?;
+                if self.signing_public_key.is_some()
+                    || self.status_url.is_some()
+                    || self.device_id.is_some()
+                    || self.status_token_ref.is_some()
+                {
+                    return Err(ManagementConfigError::PlainModeCannotReport);
+                }
+            }
+            ManagementMode::SignedManifest => {
+                let manifest_url = validate_management_url(self.manifest_url.as_deref())?;
+                validate_signed_transport(&manifest_url)?;
+                let key = self
+                    .signing_public_key
+                    .as_deref()
+                    .ok_or(ManagementConfigError::MissingSigningKey)?;
+                if key.is_empty() || key.len() > 256 || key.contains(['\0', '\r', '\n']) {
+                    return Err(ManagementConfigError::InvalidSigningKey);
+                }
+
+                let reporting_fields = [
+                    self.status_url.is_some(),
+                    self.device_id.is_some(),
+                    self.status_token_ref.is_some(),
+                ];
+                if reporting_fields.iter().any(|present| *present)
+                    && !reporting_fields.iter().all(|present| *present)
+                {
+                    return Err(ManagementConfigError::IncompleteStatusConfiguration);
+                }
+                if let Some(status_url) = self.status_url.as_deref() {
+                    let status_url = validate_management_url(Some(status_url))?;
+                    validate_signed_transport(&status_url)?;
+                }
+                if self.device_id.as_ref().is_some_and(|value| {
+                    value.is_empty()
+                        || value.len() > MAX_MANAGEMENT_ID_CHARACTERS
+                        || !value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                }) {
+                    return Err(ManagementConfigError::InvalidDeviceId);
+                }
+                if self
+                    .status_token_ref
+                    .as_deref()
+                    .is_some_and(|reference| !is_valid_secret_reference(reference))
+                {
+                    return Err(ManagementConfigError::InvalidStatusTokenReference);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn refresh_interval_minutes(&self) -> u32 {
+        self.refresh_interval_minutes.unwrap_or(15)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementMode {
+    #[default]
+    Disabled,
+    PlainManifest,
+    SignedManifest,
+}
+
+fn validate_management_url(value: Option<&str>) -> Result<Url, ManagementConfigError> {
+    let value = value.ok_or(ManagementConfigError::MissingManifestUrl)?;
+    if value.chars().count() > MAX_MANAGEMENT_URL_CHARACTERS || value.contains(['\0', '\r', '\n']) {
+        return Err(ManagementConfigError::InvalidUrl);
+    }
+    let url = Url::parse(value).map_err(|_| ManagementConfigError::InvalidUrl)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ManagementConfigError::InvalidUrl);
+    }
+    Ok(url)
+}
+
+fn validate_signed_transport(value: &Url) -> Result<(), ManagementConfigError> {
+    let loopback = value.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if value.scheme() == "https" || loopback {
+        Ok(())
+    } else {
+        Err(ManagementConfigError::InsecureSignedTransport)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,6 +478,36 @@ pub enum LocalConfigError {
     Serialize(#[from] toml::ser::Error),
     #[error("unsupported configuration schema {actual}; expected {expected}")]
     UnsupportedSchema { expected: u32, actual: u32 },
+    #[error(transparent)]
+    Management(#[from] ManagementConfigError),
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum ManagementConfigError {
+    #[error("management refresh interval must be between 5 minutes and 24 hours")]
+    InvalidRefreshInterval,
+    #[error("disabled management mode cannot contain manifest or reporting settings")]
+    UnexpectedDisabledFields,
+    #[error("management mode requires an HTTP or HTTPS manifest URL")]
+    MissingManifestUrl,
+    #[error("management URLs must be bounded, single-line HTTP or HTTPS URLs")]
+    InvalidUrl,
+    #[error("plain-manifest mode cannot configure signing or status reporting")]
+    PlainModeCannotReport,
+    #[error("signed-manifest mode requires a pinned Ed25519 public key")]
+    MissingSigningKey,
+    #[error("the pinned signing key is malformed")]
+    InvalidSigningKey,
+    #[error(
+        "signed management and status URLs require HTTPS (loopback HTTP is allowed for testing)"
+    )]
+    InsecureSignedTransport,
+    #[error("status URL, device ID, and token reference must be configured together")]
+    IncompleteStatusConfiguration,
+    #[error("the managed device ID is malformed")]
+    InvalidDeviceId,
+    #[error("the status token reference is malformed")]
+    InvalidStatusTokenReference,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -389,6 +559,57 @@ mod tests {
         assert_eq!(config.retention.weekly, 5);
         assert_eq!(config.retention.monthly, 12);
         assert_eq!(config.retention.yearly, 3);
+    }
+
+    #[test]
+    fn management_modes_keep_plain_files_separate_from_reporting() {
+        let plain = LocalManagementConfig {
+            mode: ManagementMode::PlainManifest,
+            manifest_url: Some("http://files.example.test/resticpal.json".to_owned()),
+            ..LocalManagementConfig::default()
+        };
+        assert!(plain.validate().is_ok());
+
+        let plain_with_reporting = LocalManagementConfig {
+            status_url: Some("http://files.example.test/status".to_owned()),
+            ..plain
+        };
+        assert_eq!(
+            plain_with_reporting.validate(),
+            Err(ManagementConfigError::PlainModeCannotReport)
+        );
+
+        let insecure_signed = LocalManagementConfig {
+            mode: ManagementMode::SignedManifest,
+            manifest_url: Some("http://management.example.test/policy".to_owned()),
+            signing_public_key: Some("pinned-key".to_owned()),
+            ..LocalManagementConfig::default()
+        };
+        assert_eq!(
+            insecure_signed.validate(),
+            Err(ManagementConfigError::InsecureSignedTransport)
+        );
+
+        let lookalike_loopback = LocalManagementConfig {
+            mode: ManagementMode::SignedManifest,
+            manifest_url: Some("http://localhost.example.test/policy".to_owned()),
+            signing_public_key: Some("pinned-key".to_owned()),
+            ..LocalManagementConfig::default()
+        };
+        assert_eq!(
+            lookalike_loopback.validate(),
+            Err(ManagementConfigError::InsecureSignedTransport)
+        );
+
+        let credentialed_url = LocalManagementConfig {
+            mode: ManagementMode::PlainManifest,
+            manifest_url: Some("https://user:password@example.test/policy".to_owned()),
+            ..LocalManagementConfig::default()
+        };
+        assert_eq!(
+            credentialed_url.validate(),
+            Err(ManagementConfigError::InvalidUrl)
+        );
     }
 
     #[test]

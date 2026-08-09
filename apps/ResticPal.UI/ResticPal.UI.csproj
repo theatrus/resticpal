@@ -8,6 +8,7 @@
     <Platforms>x64</Platforms>
     <RootNamespace>ResticPal.UI</RootNamespace>
     <AssemblyName>resticpal-ui</AssemblyName>
+    <ApplicationIcon>..\..\assets\resticpal.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <UseWinUI>true</UseWinUI>
     <WindowsPackageType>None</WindowsPackageType>
@@ -19,6 +20,10 @@
 
   <ItemGroup>
     <Manifest Include="$(ApplicationManifest)" />
+    <Content Include="..\..\assets\resticpal.ico" Link="resticpal.ico"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\resticpal-logo.png" Link="resticpal-logo.png"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

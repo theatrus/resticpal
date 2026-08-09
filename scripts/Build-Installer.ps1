@@ -116,6 +116,7 @@ try {
         -arch x64 `
         -ext WixToolset.Util.wixext `
         -d "StageDir=$stageRoot" `
+        -d "BrandIcon=$(Join-Path $repositoryRoot 'assets\resticpal.ico')" `
         -d "ProductVersion=$Version" `
         -intermediatefolder $intermediateRoot `
         -out $msiPath

@@ -16,6 +16,7 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+ureq.workspace = true
 windows = { workspace = true, features = [
     "Networking_Connectivity",
     "Win32_Foundation",
@@ -28,6 +29,9 @@ windows = { workspace = true, features = [
 ] }
 windows-service.workspace = true
 zeroize.workspace = true
+
+[build-dependencies]
+embed-resource.workspace = true
 
 [lints]
 workspace = true

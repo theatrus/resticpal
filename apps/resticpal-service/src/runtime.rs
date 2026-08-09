@@ -9,7 +9,7 @@ use resticpal_core::config::{
     EffectiveConfig, LocalConfig, RepositoryMode, SecretEnvironmentVariable,
 };
 use resticpal_core::policy::{
-    FieldResolution, PolicyError, PolicyField, ResolvedConfig, resolve_config,
+    FieldResolution, ManagedPolicy, PolicyError, PolicyField, ResolvedConfig, resolve_config,
 };
 use resticpal_core::restic::ResticOperation;
 use resticpal_core::schedule::{
@@ -84,7 +84,7 @@ struct RuntimeStores {
 pub struct ServiceRuntime {
     config: RwLock<EffectiveConfig>,
     local_config: Mutex<LocalConfig>,
-    field_resolutions: BTreeMap<PolicyField, FieldResolution>,
+    field_resolutions: RwLock<BTreeMap<PolicyField, FieldResolution>>,
     config_store: Option<LocalConfigStore>,
     credential_store: Option<DpapiSecretStore>,
     state: Mutex<RuntimeState>,
@@ -103,9 +103,18 @@ impl ServiceRuntime {
         events: Sender<RuntimeEvent>,
         credential_store: Option<DpapiSecretStore>,
     ) -> Result<Self, RuntimeInitError> {
+        Self::load_with_credentials_and_policy(path, events, credential_store, None)
+    }
+
+    pub fn load_with_credentials_and_policy(
+        path: &Path,
+        events: Sender<RuntimeEvent>,
+        credential_store: Option<DpapiSecretStore>,
+        managed_policy: Option<&ManagedPolicy>,
+    ) -> Result<Self, RuntimeInitError> {
         let config_store = LocalConfigStore::new(path);
         let local = config_store.load()?;
-        let resolved = resolve_config(&EffectiveConfig::default(), &local, None)?;
+        let resolved = resolve_config(&EffectiveConfig::default(), &local, managed_policy)?;
         let state_store = ScheduleStateStore::next_to_config(path);
         let service_state = match state_store.load() {
             Ok(state) => state,
@@ -211,7 +220,7 @@ impl ServiceRuntime {
         Self {
             config: RwLock::new(resolved.effective),
             local_config: Mutex::new(local_config),
-            field_resolutions: resolved.fields,
+            field_resolutions: RwLock::new(resolved.fields),
             config_store,
             credential_store,
             state: Mutex::new(RuntimeState {
@@ -238,7 +247,7 @@ impl ServiceRuntime {
         Self {
             config: RwLock::new(EffectiveConfig::default()),
             local_config: Mutex::new(LocalConfig::default()),
-            field_resolutions: BTreeMap::new(),
+            field_resolutions: RwLock::new(BTreeMap::new()),
             config_store: Some(LocalConfigStore::new(path)),
             credential_store,
             state: Mutex::new(RuntimeState {
@@ -1275,8 +1284,50 @@ impl ServiceRuntime {
 
     fn field_locked(&self, field: PolicyField) -> bool {
         self.field_resolutions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&field)
             .is_some_and(|resolution| resolution.locked)
+    }
+
+    pub fn apply_managed_policy(&self, policy: &ManagedPolicy) -> Result<bool, PolicyError> {
+        let local = self.local_config_guard().clone();
+        let resolved = resolve_config(&EffectiveConfig::default(), &local, Some(policy))?;
+        let next_config = resolved.effective;
+        let now = Utc::now();
+        let mut state = self.state_guard();
+        if matches!(state.status.state, BackupState::Running { .. })
+            || matches!(
+                state.repository_operation,
+                RepositoryOperationStatus::Running { .. }
+            )
+        {
+            return Ok(false);
+        }
+
+        if state
+            .service_state
+            .repository_requires_validation(&next_config)
+        {
+            state.service_state.require_repository_validation();
+            if let Some(store) = &self.state_store
+                && let Err(error) = store.save(&state.service_state)
+            {
+                eprintln!("could not persist repository validation requirement: {error}");
+            }
+            state.repository_operation = RepositoryOperationStatus::ValidationRequired;
+        }
+
+        *self.config_write() = next_config.clone();
+        *self
+            .field_resolutions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = resolved.fields;
+        state.status.managed_revision = resolved.managed_revision;
+        Self::apply_configuration_status(&mut state, &next_config, now);
+        drop(state);
+        let _ = self.events.send(RuntimeEvent::ConfigurationChanged);
+        Ok(true)
     }
 
     fn send_event(&self, event: RuntimeEvent, message: &str) -> ResponsePayload {
@@ -1421,6 +1472,7 @@ mod tests {
         BackupConfig, LocalBackupConfig, LocalRepositoryConfig, RepositoryConfig,
         SecretEnvironmentVariable,
     };
+    use resticpal_core::policy::{Managed, ManagedSchedulePolicy};
     use resticpal_protocol::{PROTOCOL_VERSION, SecretValue};
     use resticpal_windows::credentials::CredentialStoreError;
     use resticpal_windows::named_pipe::{NamedPipeClient, NamedPipeServer};
@@ -1945,7 +1997,7 @@ mod tests {
     #[test]
     fn managed_source_locks_are_enforced_by_the_service() {
         let (mut runtime, _events) = runtime(true);
-        runtime.field_resolutions.insert(
+        runtime.field_resolutions.get_mut().unwrap().insert(
             PolicyField::BackupPaths,
             FieldResolution {
                 source: resticpal_core::policy::ValueSource::ManagedLocked,
@@ -1971,10 +2023,62 @@ mod tests {
     }
 
     #[test]
+    fn managed_policy_is_applied_live_and_reports_its_lock() {
+        let (runtime, events) = runtime(false);
+        let policy = ManagedPolicy {
+            revision: "managed-8".to_owned(),
+            schedule: ManagedSchedulePolicy {
+                interval_hours: Some(Managed {
+                    value: 8,
+                    locked: true,
+                }),
+                ..ManagedSchedulePolicy::default()
+            },
+            ..ManagedPolicy::default()
+        };
+
+        assert!(runtime.apply_managed_policy(&policy).expect("valid policy"));
+        assert_eq!(runtime.config().schedule.interval_hours, 8);
+        assert_eq!(
+            runtime.status().managed_revision.as_deref(),
+            Some("managed-8")
+        );
+        assert!(runtime.field_locked(PolicyField::ScheduleIntervalHours));
+        assert_eq!(
+            events.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+    }
+
+    #[test]
+    fn managed_policy_waits_until_an_active_backup_finishes() {
+        let (runtime, events) = runtime(false);
+        runtime.state_guard().status.state = BackupState::Running {
+            phase: BackupPhase::Uploading,
+        };
+        let policy = ManagedPolicy {
+            revision: "managed-later".to_owned(),
+            schedule: ManagedSchedulePolicy {
+                interval_hours: Some(Managed {
+                    value: 4,
+                    locked: false,
+                }),
+                ..ManagedSchedulePolicy::default()
+            },
+            ..ManagedPolicy::default()
+        };
+
+        assert!(!runtime.apply_managed_policy(&policy).expect("valid policy"));
+        assert_eq!(runtime.config().schedule.interval_hours, 24);
+        assert!(runtime.status().managed_revision.is_none());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
     fn an_unlocked_source_field_can_change_without_overwriting_a_locked_field() {
         let (mut runtime, events) = runtime(true);
         runtime.config_write().backup.exclusions = vec!["managed-pattern".to_owned()];
-        runtime.field_resolutions.insert(
+        runtime.field_resolutions.get_mut().unwrap().insert(
             PolicyField::BackupExclusions,
             FieldResolution {
                 source: resticpal_core::policy::ValueSource::ManagedLocked,
@@ -2172,7 +2276,7 @@ mod tests {
     #[test]
     fn repository_policy_locks_are_reported_and_enforced_per_field() {
         let (mut runtime, events) = runtime(true);
-        runtime.field_resolutions.insert(
+        runtime.field_resolutions.get_mut().unwrap().insert(
             PolicyField::RepositoryUrl,
             FieldResolution {
                 source: resticpal_core::policy::ValueSource::ManagedLocked,
@@ -2516,7 +2620,7 @@ mod tests {
     #[test]
     fn schedule_policy_locks_are_reported_and_enforced_per_field() {
         let (mut runtime, events) = runtime(true);
-        runtime.field_resolutions.insert(
+        runtime.field_resolutions.get_mut().unwrap().insert(
             PolicyField::ScheduleIntervalHours,
             FieldResolution {
                 source: resticpal_core::policy::ValueSource::ManagedLocked,

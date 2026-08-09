@@ -37,6 +37,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "resticpal.ico"));
     }
 
     private async void NavigationView_Loaded(object sender, RoutedEventArgs e)

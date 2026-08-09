@@ -40,3 +40,22 @@ weekly = 5
 monthly = 12
 yearly = 3
 
+[management]
+mode = "disabled"
+
+# Plain-file mode accepts a direct ManifestPayload from any ordinary HTTP or
+# HTTPS file server and never uploads device status:
+# mode = "plain_manifest"
+# manifest_url = "http://config.example.test/resticpal/example-laptop.json"
+# refresh_interval_minutes = 15
+
+# Signed mode pins an Ed25519 public key. Non-loopback URLs require HTTPS.
+# status_url, device_id, and status_token_ref must be supplied together; the
+# opaque token reference is resolved only by the service DPAPI store.
+# mode = "signed_manifest"
+# manifest_url = "https://backup.example.test/v1/manifest/example-laptop"
+# signing_public_key = "base64url-ed25519-public-key"
+# refresh_interval_minutes = 15
+# status_url = "https://backup.example.test/v1/status"
+# device_id = "example-laptop"
+# status_token_ref = "management-token-opaque-reference"
