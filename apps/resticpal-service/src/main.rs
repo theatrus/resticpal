@@ -19,9 +19,11 @@ use std::time::Duration;
 use chrono::Utc;
 use conditions::{SystemConditions, WinRtApartment};
 use executor::{
-    BackupOutcome, CancellationToken, DpapiSecretResolver, ResticExecutor, SecretResolver,
-    SystemWakeLockProvider, UnavailableSecretResolver,
+    BackupOutcome, CancellationToken, DpapiSecretResolver, RepositoryOutcome, ResticExecutor,
+    SecretResolver, SystemWakeLockProvider, UnavailableSecretResolver,
 };
+use resticpal_core::restic::ResticOperation;
+use resticpal_protocol::RepositoryOperationKind;
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::{DEFAULT_PIPE_NAME, NamedPipeServer};
 use runtime::{RuntimeEvent, ScheduleAction, ServiceRuntime};
@@ -196,12 +198,16 @@ fn run_event_loop(
     event_sender: mpsc::Sender<RuntimeEvent>,
 ) {
     let mut active_backup: Option<CancellationToken> = None;
+    let mut active_repository_operation: Option<CancellationToken> = None;
     evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
     loop {
         let delay = runtime.next_evaluation_delay(Utc::now());
         match events.recv_timeout(delay) {
             Ok(RuntimeEvent::Stop) | Err(RecvTimeoutError::Disconnected) => {
                 if let Some(cancellation) = &active_backup {
+                    cancellation.cancel();
+                }
+                if let Some(cancellation) = &active_repository_operation {
                     cancellation.cancel();
                 }
                 break;
@@ -217,6 +223,37 @@ fn run_event_loop(
             Ok(RuntimeEvent::BackupFinished(outcome)) => {
                 runtime.finish_backup(&outcome);
                 active_backup = None;
+            }
+            Ok(RuntimeEvent::RepositoryOperationRequested(operation)) => {
+                if active_backup.is_some() || active_repository_operation.is_some() {
+                    runtime.finish_repository_operation(
+                        operation,
+                        &RepositoryOutcome::failed("repository_operation_conflict"),
+                    );
+                    continue;
+                }
+                let cancellation = CancellationToken::default();
+                active_repository_operation = Some(cancellation.clone());
+                if start_repository_worker(
+                    Arc::clone(&runtime),
+                    executor.clone(),
+                    operation,
+                    cancellation,
+                    event_sender.clone(),
+                )
+                .is_err()
+                {
+                    runtime.finish_repository_operation(
+                        operation,
+                        &RepositoryOutcome::failed("executor_start_failed"),
+                    );
+                    active_repository_operation = None;
+                }
+            }
+            Ok(RuntimeEvent::RepositoryOperationFinished { operation, outcome }) => {
+                runtime.finish_repository_operation(operation, &outcome);
+                active_repository_operation = None;
+                evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
             }
             Ok(RuntimeEvent::Resume) => {
                 runtime.record_resume(Utc::now());
@@ -294,6 +331,26 @@ fn start_backup_worker(
                 runtime.update_progress(progress);
             });
             let _ = events.send(RuntimeEvent::BackupFinished(outcome));
+        })
+}
+
+fn start_repository_worker(
+    runtime: Arc<ServiceRuntime>,
+    executor: ResticExecutor,
+    operation: RepositoryOperationKind,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<RuntimeEvent>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("resticpal-repository".to_owned())
+        .spawn(move || {
+            let config = runtime.config();
+            let restic_operation = match operation {
+                RepositoryOperationKind::Validate => ResticOperation::Probe,
+                RepositoryOperationKind::Initialize => ResticOperation::Initialize,
+            };
+            let outcome = executor.repository_operation(&config, restic_operation, &cancellation);
+            let _ = events.send(RuntimeEvent::RepositoryOperationFinished { operation, outcome });
         })
 }
 

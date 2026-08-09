@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use resticpal_core::config::{EffectiveConfig, SecretEnvironmentVariable};
-use resticpal_core::restic::{ResticCommandBuilder, ResticInvocation};
+use resticpal_core::restic::{ResticCommandBuilder, ResticInvocation, ResticOperation};
 use resticpal_core::status::BackupProgress;
 use resticpal_windows::credentials::DpapiSecretStore;
 use serde::Deserialize;
@@ -31,6 +31,7 @@ use zeroize::Zeroizing;
 use crate::power_request::TimedSystemPowerRequest;
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const REPOSITORY_OPERATION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
 const INHERITED_ENVIRONMENT: &[&str] = &[
     "SystemRoot",
@@ -151,6 +152,112 @@ impl ResticExecutor {
             cancellation,
             on_progress,
         )
+    }
+
+    pub fn repository_operation(
+        &self,
+        config: &EffectiveConfig,
+        operation: ResticOperation,
+        cancellation: &CancellationToken,
+    ) -> RepositoryOutcome {
+        let invocation = match ResticCommandBuilder::new(self.executable.as_ref())
+            .repository_setup(config, operation)
+        {
+            Ok(invocation) => invocation,
+            Err(_) => return RepositoryOutcome::failed("invalid_repository_configuration"),
+        };
+
+        self.execute_repository_invocation(&invocation, REPOSITORY_OPERATION_TIMEOUT, cancellation)
+    }
+
+    fn execute_repository_invocation(
+        &self,
+        invocation: &ResticInvocation,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> RepositoryOutcome {
+        let secret_environment = match self.resolve_secrets(&invocation.secret_environment) {
+            Ok(environment) => environment,
+            Err(_) => return RepositoryOutcome::failed("credential_unavailable"),
+        };
+        let _wake_lock = match self.wake_locks.acquire(timeout) {
+            Ok(lock) => lock,
+            Err(_) => return RepositoryOutcome::failed("wake_lock_unavailable"),
+        };
+        if cancellation.is_cancelled() {
+            return RepositoryOutcome::cancelled();
+        }
+
+        let job = match KillOnDropJob::new() {
+            Ok(job) => job,
+            Err(_) => return RepositoryOutcome::failed("process_isolation_failed"),
+        };
+        let mut command = command_for(invocation, &secret_environment);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => return RepositoryOutcome::failed("restic_start_failed"),
+        };
+        if job.assign(&child).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return RepositoryOutcome::failed("process_isolation_failed");
+        }
+
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => return RepositoryOutcome::failed("restic_output_unavailable"),
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => return RepositoryOutcome::failed("restic_output_unavailable"),
+        };
+        let stdout_thread = thread::spawn(move || drain(stdout));
+        let stderr_thread = thread::spawn(move || drain(stderr));
+        let started = Instant::now();
+        let mut cancelled = false;
+        let mut timed_out = false;
+        let status = loop {
+            if cancellation.is_cancelled() && !cancelled {
+                cancelled = true;
+                let _ = job.terminate();
+            } else if started.elapsed() >= timeout && !timed_out {
+                timed_out = true;
+                let _ = job.terminate();
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
+                Err(_) => {
+                    let _ = job.terminate();
+                    break Err(());
+                }
+            }
+        };
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
+
+        if cancelled {
+            return RepositoryOutcome::cancelled();
+        }
+        if timed_out {
+            return RepositoryOutcome::failed("repository_operation_timed_out");
+        }
+        let status = match status {
+            Ok(status) => status,
+            Err(()) => return RepositoryOutcome::failed("restic_wait_failed"),
+        };
+        if status.success() {
+            return RepositoryOutcome::succeeded();
+        }
+
+        let code = match (invocation.operation, status.code()) {
+            (ResticOperation::Probe, Some(10)) => "repository_not_found",
+            (ResticOperation::Probe, _) => "repository_validation_failed",
+            (ResticOperation::Initialize, _) => "repository_initialization_failed",
+            _ => "repository_operation_failed",
+        };
+        RepositoryOutcome::failed(code)
     }
 
     fn execute_invocation(
@@ -322,6 +429,40 @@ impl BackupOutcome {
 pub enum BackupOutcomeKind {
     Succeeded,
     SucceededWithWarnings,
+    Failed { code: String },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryOutcome {
+    pub kind: RepositoryOutcomeKind,
+}
+
+impl RepositoryOutcome {
+    fn succeeded() -> Self {
+        Self {
+            kind: RepositoryOutcomeKind::Succeeded,
+        }
+    }
+
+    pub(crate) fn failed(code: &str) -> Self {
+        Self {
+            kind: RepositoryOutcomeKind::Failed {
+                code: code.to_owned(),
+            },
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            kind: RepositoryOutcomeKind::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryOutcomeKind {
+    Succeeded,
     Failed { code: String },
     Cancelled,
 }
@@ -676,6 +817,62 @@ mod tests {
         canceller.join().expect("canceller should finish");
 
         assert_eq!(outcome.kind, BackupOutcomeKind::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn repository_probe_reports_success_and_not_found_without_parsing_console_text() {
+        let mut successful = powershell_invocation(
+            "[Console]::Out.WriteLine('untrusted repository metadata'); exit 0",
+        );
+        successful.operation = ResticOperation::Probe;
+        let runner = executor(BTreeMap::new());
+        assert_eq!(
+            runner
+                .execute_repository_invocation(
+                    &successful,
+                    Duration::from_secs(10),
+                    &CancellationToken::default(),
+                )
+                .kind,
+            RepositoryOutcomeKind::Succeeded
+        );
+
+        let mut absent = powershell_invocation("exit 10");
+        absent.operation = ResticOperation::Probe;
+        assert_eq!(
+            runner
+                .execute_repository_invocation(
+                    &absent,
+                    Duration::from_secs(10),
+                    &CancellationToken::default(),
+                )
+                .kind,
+            RepositoryOutcomeKind::Failed {
+                code: "repository_not_found".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn repository_operation_has_a_hard_timeout() {
+        let mut invocation = powershell_invocation("Start-Sleep -Seconds 30");
+        invocation.operation = ResticOperation::Initialize;
+        let runner = executor(BTreeMap::new());
+        let started = Instant::now();
+
+        let outcome = runner.execute_repository_invocation(
+            &invocation,
+            Duration::from_millis(200),
+            &CancellationToken::default(),
+        );
+
+        assert_eq!(
+            outcome.kind,
+            RepositoryOutcomeKind::Failed {
+                code: "repository_operation_timed_out".to_owned()
+            }
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

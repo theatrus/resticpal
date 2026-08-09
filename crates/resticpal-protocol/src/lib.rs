@@ -7,6 +7,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use resticpal_core::config::{RepositoryMode, SecretEnvironmentVariable};
 use resticpal_core::status::ServiceStatus;
 use serde::de::DeserializeOwned;
@@ -14,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +54,8 @@ pub enum RequestCommand {
         options: Option<BTreeMap<String, String>>,
         secret_updates: Vec<RepositorySecretUpdate>,
     },
+    ValidateRepository,
+    InitializeRepository,
     RunBackupNow,
     CancelBackup,
     DeferBackup {
@@ -147,11 +150,38 @@ pub struct RepositoryView {
     pub mode: RepositoryMode,
     pub options: BTreeMap<String, String>,
     pub configured_secrets: Vec<SecretEnvironmentVariable>,
+    pub operation_status: RepositoryOperationStatus,
     pub display_name_locked: bool,
     pub url_locked: bool,
     pub mode_locked: bool,
     pub options_locked: bool,
     pub secrets_locked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryOperationKind {
+    Validate,
+    Initialize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RepositoryOperationStatus {
+    NotRun,
+    ValidationRequired,
+    Running {
+        operation: RepositoryOperationKind,
+    },
+    Succeeded {
+        operation: RepositoryOperationKind,
+        completed_at: DateTime<Utc>,
+    },
+    Failed {
+        operation: RepositoryOperationKind,
+        completed_at: DateTime<Utc>,
+        code: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,5 +397,38 @@ mod tests {
         let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn repository_operation_status_round_trips() {
+        let completed_at = Utc::now();
+        let response = Response::new(
+            102,
+            ResponsePayload::Repository {
+                configuration: RepositoryView {
+                    display_name: Some("S3 backup".to_owned()),
+                    url: Some("s3:https://example.test/bucket".to_owned()),
+                    mode: RepositoryMode::AppendOnly,
+                    options: BTreeMap::new(),
+                    configured_secrets: vec![SecretEnvironmentVariable::ResticPassword],
+                    operation_status: RepositoryOperationStatus::Succeeded {
+                        operation: RepositoryOperationKind::Validate,
+                        completed_at,
+                    },
+                    display_name_locked: false,
+                    url_locked: false,
+                    mode_locked: true,
+                    options_locked: false,
+                    secrets_locked: false,
+                },
+            },
+        );
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &response).expect("response should serialize");
+        let decoded: Response =
+            read_frame(Cursor::new(bytes)).expect("response should deserialize");
+
+        assert_eq!(decoded, response);
     }
 }

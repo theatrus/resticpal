@@ -13,6 +13,7 @@ use crate::config::{
 #[serde(rename_all = "snake_case")]
 pub enum ResticOperation {
     Backup,
+    Probe,
     Snapshots,
     Check,
     Initialize,
@@ -30,7 +31,10 @@ impl ResticOperation {
         match mode {
             RepositoryMode::Standard => true,
             RepositoryMode::AppendOnly => {
-                matches!(self, Self::Backup | Self::Snapshots | Self::Check)
+                matches!(
+                    self,
+                    Self::Backup | Self::Probe | Self::Snapshots | Self::Check
+                )
             }
         }
     }
@@ -143,6 +147,47 @@ impl ResticCommandBuilder {
             secret_environment: config.repository.secret_refs.clone(),
         })
     }
+
+    pub fn repository_setup(
+        &self,
+        config: &EffectiveConfig,
+        operation: ResticOperation,
+    ) -> Result<ResticInvocation, InvocationError> {
+        if !matches!(
+            operation,
+            ResticOperation::Probe | ResticOperation::Initialize
+        ) {
+            return Err(InvocationError::NotRepositorySetupOperation(operation));
+        }
+        authorize_operation(config.repository.mode, operation)?;
+        config.validate()?;
+        let repository = config
+            .repository
+            .url
+            .as_ref()
+            .ok_or(InvocationError::MissingRepository)?;
+
+        let mut arguments = repository_options(config);
+        match operation {
+            ResticOperation::Probe => {
+                arguments.push("cat".into());
+                arguments.push("config".into());
+            }
+            ResticOperation::Initialize => arguments.push("init".into()),
+            _ => unreachable!("operation was checked above"),
+        }
+
+        Ok(ResticInvocation {
+            operation,
+            executable: self.executable.clone(),
+            arguments,
+            environment: BTreeMap::from([(
+                OsString::from("RESTIC_REPOSITORY"),
+                OsString::from(repository),
+            )]),
+            secret_environment: config.repository.secret_refs.clone(),
+        })
+    }
 }
 
 pub fn authorize_operation(
@@ -180,6 +225,8 @@ pub enum InvocationError {
     },
     #[error("{0:?} is not an inspection operation")]
     NotInspectionOperation(ResticOperation),
+    #[error("{0:?} is not a repository setup operation")]
+    NotRepositorySetupOperation(ResticOperation),
 }
 
 #[cfg(test)]
@@ -249,6 +296,7 @@ mod tests {
     fn append_only_allows_backup_and_read_only_inspection() {
         for operation in [
             ResticOperation::Backup,
+            ResticOperation::Probe,
             ResticOperation::Snapshots,
             ResticOperation::Check,
         ] {
@@ -257,6 +305,29 @@ mod tests {
                 Ok(())
             );
         }
+    }
+
+    #[test]
+    fn setup_invocations_are_allowlisted_and_inherit_repository_secrets() {
+        let config = configured(RepositoryMode::Standard);
+        let builder = ResticCommandBuilder::new("restic.exe");
+
+        let probe = builder
+            .repository_setup(&config, ResticOperation::Probe)
+            .expect("probe");
+        assert_eq!(
+            probe.arguments,
+            ["--option", "s3.region=us-west-2", "cat", "config"].map(OsString::from)
+        );
+        assert_eq!(probe.secret_environment, config.repository.secret_refs);
+
+        let initialize = builder
+            .repository_setup(&config, ResticOperation::Initialize)
+            .expect("initialize");
+        assert_eq!(
+            initialize.arguments,
+            ["--option", "s3.region=us-west-2", "init"].map(OsString::from)
+        );
     }
 
     #[test]

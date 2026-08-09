@@ -19,6 +19,9 @@ public sealed partial class MainWindow : Window
     private bool _repositoryModeLocked;
     private bool _repositoryOptionsLocked;
     private bool _repositorySecretsLocked;
+    private bool _repositoryBusy;
+    private bool _applyingRepositoryConfiguration;
+    private bool _repositoryDirty;
     private IReadOnlySet<string> _configuredRepositorySecrets = new HashSet<string>();
 
     public ObservableCollection<string> BackupPaths { get; } = new();
@@ -327,12 +330,128 @@ public sealed partial class MainWindow : Window
         };
     }
 
+    private void RepositoryModeBox_SelectionChanged(
+        object sender,
+        SelectionChangedEventArgs e)
+    {
+        MarkRepositoryDirty();
+        if (CreateRepositoryButton is not null)
+        {
+            CreateRepositoryButton.IsEnabled =
+                !_repositoryBusy && !_repositoryDirty && SelectedRepositoryMode() == "standard";
+        }
+    }
+
+    private void RepositoryField_Changed(object sender, RoutedEventArgs e)
+    {
+        MarkRepositoryDirty();
+    }
+
+    private void MarkRepositoryDirty()
+    {
+        if (_applyingRepositoryConfiguration)
+        {
+            return;
+        }
+
+        _repositoryDirty = true;
+        if (!_repositoryBusy && RepositoryOperationMessage is not null)
+        {
+            RepositoryOperationMessage.Title = "Save changes first";
+            RepositoryOperationMessage.Message =
+                "Connection tests and repository creation use the service's saved settings.";
+            RepositoryOperationMessage.Severity = InfoBarSeverity.Warning;
+            RepositoryOperationMessage.IsOpen = true;
+            if (ValidateRepositoryButton is not null)
+            {
+                ValidateRepositoryButton.IsEnabled = false;
+            }
+            if (CreateRepositoryButton is not null)
+            {
+                CreateRepositoryButton.IsEnabled = false;
+            }
+        }
+    }
+
+    private async void ValidateRepositoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RunRepositoryOperationAsync(initialize: false);
+    }
+
+    private async void CreateRepositoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (Content is not FrameworkElement root)
+        {
+            return;
+        }
+        var confirmation = new ContentDialog
+        {
+            XamlRoot = root.XamlRoot,
+            Title = "Create a new repository?",
+            Content = "resticpal will initialize the saved repository location. restic refuses to overwrite an existing repository.",
+            PrimaryButtonText = "Create repository",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close,
+        };
+        if (await confirmation.ShowAsync() == ContentDialogResult.Primary)
+        {
+            await RunRepositoryOperationAsync(initialize: true);
+        }
+    }
+
+    private async Task RunRepositoryOperationAsync(bool initialize)
+    {
+        SetRepositoryBusy(true);
+        try
+        {
+            CommandResult result = initialize
+                ? await _service.InitializeRepositoryAsync()
+                : await _service.ValidateRepositoryAsync();
+            ShowMessage(
+                result.Accepted ? InfoBarSeverity.Informational : InfoBarSeverity.Warning,
+                result.Message);
+            if (!result.Accepted)
+            {
+                return;
+            }
+
+            RepositoryConfiguration? latest = null;
+            for (int attempt = 0; attempt < 260; attempt++)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(500));
+                latest = await _service.GetRepositoryAsync();
+                ShowRepositoryOperationStatus(latest.OperationStatus);
+                if (latest.OperationStatus.State != "running")
+                {
+                    break;
+                }
+            }
+            if (latest?.OperationStatus.State == "running")
+            {
+                throw new TimeoutException("The repository operation did not finish within its safety timeout.");
+            }
+
+            _repositoryLoaded = false;
+            await LoadRepositoryAsync();
+            await RefreshStatusAsync();
+        }
+        catch (Exception exception)
+        {
+            ShowConnectionError(exception);
+        }
+        finally
+        {
+            SetRepositoryBusy(false);
+        }
+    }
+
     private async Task LoadRepositoryAsync()
     {
         SetRepositoryBusy(true);
         try
         {
             RepositoryConfiguration configuration = await _service.GetRepositoryAsync();
+            _applyingRepositoryConfiguration = true;
             RepositoryDisplayNameBox.Text = configuration.DisplayName ?? string.Empty;
             RepositoryUrlBox.Text = configuration.Url ?? string.Empty;
             RepositoryKindBox.SelectedIndex = RepositoryKindIndex(configuration.Url);
@@ -349,6 +468,8 @@ public sealed partial class MainWindow : Window
             _repositorySecretsLocked = configuration.SecretsLocked;
             _configuredRepositorySecrets = configuration.ConfiguredSecrets;
             ClearRepositoryCredentialInputs();
+            _applyingRepositoryConfiguration = false;
+            _repositoryDirty = false;
 
             int lockedFields = new[]
             {
@@ -365,10 +486,12 @@ public sealed partial class MainWindow : Window
             RepositoryCredentialStatus.Text = configuration.ConfiguredSecrets.Count == 0
                 ? "No stored credentials. Enter only the values this repository requires."
                 : $"Stored securely: {string.Join(", ", configuration.ConfiguredSecrets.Order())}. Leave fields blank to keep them.";
+            ShowRepositoryOperationStatus(configuration.OperationStatus);
             _repositoryLoaded = true;
         }
         catch (Exception exception)
         {
+            _applyingRepositoryConfiguration = false;
             ShowConnectionError(exception);
         }
         finally
@@ -379,6 +502,7 @@ public sealed partial class MainWindow : Window
 
     private void SetRepositoryBusy(bool busy)
     {
+        _repositoryBusy = busy;
         RepositoryProgress.IsActive = busy;
         RepositoryDisplayNameBox.IsEnabled = !busy && !_repositoryDisplayNameLocked;
         RepositoryKindBox.IsEnabled = !busy && !_repositoryUrlLocked;
@@ -402,7 +526,63 @@ public sealed partial class MainWindow : Window
             && _repositoryModeLocked
             && _repositoryOptionsLocked
             && _repositorySecretsLocked);
+        ValidateRepositoryButton.IsEnabled = !busy && !_repositoryDirty;
+        CreateRepositoryButton.IsEnabled =
+            !busy && !_repositoryDirty && SelectedRepositoryMode() == "standard";
     }
+
+    private string SelectedRepositoryMode() =>
+        (RepositoryModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "standard";
+
+    private void ShowRepositoryOperationStatus(RepositoryOperationStatus status)
+    {
+        (RepositoryOperationMessage.Title, RepositoryOperationMessage.Message, RepositoryOperationMessage.Severity) =
+            status.State switch
+            {
+                "validation_required" => (
+                    "Connection test required",
+                    "Repository connection fields changed. Backups remain paused until the saved settings pass a connection test or repository creation succeeds.",
+                    InfoBarSeverity.Warning),
+                "running" when status.Operation == "initialize" => (
+                    "Creating repository",
+                    "The service is initializing the repository. This window can be closed without stopping the operation.",
+                    InfoBarSeverity.Informational),
+                "running" => (
+                    "Testing connection",
+                    "The service is verifying the saved repository and credentials.",
+                    InfoBarSeverity.Informational),
+                "succeeded" => (
+                    status.Operation == "initialize" ? "Repository created" : "Connection verified",
+                    status.CompletedAt is DateTimeOffset completed
+                        ? $"Completed {completed.ToLocalTime():g}. Backups may use this repository."
+                        : "Backups may use this repository.",
+                    InfoBarSeverity.Success),
+                "failed" => (
+                    "Repository needs attention",
+                    RepositoryFailureMessage(status.Code),
+                    InfoBarSeverity.Error),
+                _ => (
+                    "Connection not tested",
+                    "Save the repository settings, then test the connection or create a new repository.",
+                    InfoBarSeverity.Informational),
+            };
+        RepositoryOperationMessage.IsOpen = true;
+    }
+
+    private static string RepositoryFailureMessage(string? code) => code switch
+    {
+        "repository_not_found" =>
+            "The location is reachable but does not contain a restic repository. Create one or check the URL.",
+        "credential_unavailable" =>
+            "A required stored credential is unavailable. Enter it again and save the repository.",
+        "repository_operation_timed_out" =>
+            "The repository did not respond within two minutes. Check the network and backend address.",
+        "repository_initialization_failed" =>
+            "restic could not create the repository. Check the address, credentials, and backend permissions.",
+        "state_save_failed" =>
+            "The result could not be recorded safely. Check the service data directory and try again.",
+        _ => "The saved repository or credentials could not be verified. Check them and try again.",
+    };
 
     private bool TryReadRepositoryOptions(
         out IReadOnlyDictionary<string, string> options,

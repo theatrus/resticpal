@@ -5,17 +5,22 @@ use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use resticpal_core::config::{EffectiveConfig, LocalConfig, RepositoryMode};
+use resticpal_core::config::{
+    EffectiveConfig, LocalConfig, RepositoryMode, SecretEnvironmentVariable,
+};
 use resticpal_core::policy::{
     FieldResolution, PolicyError, PolicyField, ResolvedConfig, resolve_config,
 };
+use resticpal_core::restic::ResticOperation;
 use resticpal_core::schedule::{
     BackupTrigger, ScheduleBlocker, ScheduleDecision, SchedulerSnapshot, decide,
 };
-use resticpal_core::status::{BackupPhase, BackupProgress, BackupState, ServiceStatus};
+use resticpal_core::status::{
+    BackupPhase, BackupProgress, BackupState, ServiceStatus, WaitingReason,
+};
 use resticpal_protocol::{
-    BackupSourcesView, RepositorySecretUpdate, RepositoryView, Request, RequestCommand, Response,
-    ResponsePayload,
+    BackupSourcesView, RepositoryOperationKind, RepositoryOperationStatus, RepositorySecretUpdate,
+    RepositoryView, Request, RequestCommand, Response, ResponsePayload,
 };
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::ClientIdentity;
@@ -24,8 +29,8 @@ use thiserror::Error;
 
 use crate::conditions::SystemConditions;
 use crate::config_store::{ConfigStoreError, LocalConfigStore};
-use crate::executor::{BackupOutcome, BackupOutcomeKind};
-use crate::state::ScheduleStateStore;
+use crate::executor::{BackupOutcome, BackupOutcomeKind, RepositoryOutcome, RepositoryOutcomeKind};
+use crate::state::{ScheduleStateStore, ServiceStateSnapshot};
 
 const CONDITION_RETRY_SECONDS: u64 = 60;
 const INITIAL_FAILURE_RETRY_MINUTES: i64 = 5;
@@ -42,6 +47,11 @@ pub enum RuntimeEvent {
     Cancel,
     Deferred,
     ConfigurationChanged,
+    RepositoryOperationRequested(RepositoryOperationKind),
+    RepositoryOperationFinished {
+        operation: RepositoryOperationKind,
+        outcome: RepositoryOutcome,
+    },
     BackupFinished(BackupOutcome),
 }
 
@@ -57,6 +67,8 @@ struct RuntimeState {
     not_before: Option<DateTime<Utc>>,
     manual_requested: bool,
     consecutive_failures: u32,
+    repository_operation: RepositoryOperationStatus,
+    service_state: ServiceStateSnapshot,
 }
 
 pub struct ServiceRuntime {
@@ -84,21 +96,25 @@ impl ServiceRuntime {
         let local = config_store.load()?;
         let resolved = resolve_config(&EffectiveConfig::default(), &local, None)?;
         let state_store = ScheduleStateStore::next_to_config(path);
-        let last_success = match state_store.load_last_success() {
-            Ok(last_success) => last_success,
+        let service_state = match state_store.load() {
+            Ok(state) => state,
             Err(error) => {
                 eprintln!(
-                    "could not load schedule state next to {}: {error}; an immediate backup will be eligible",
+                    "could not load service state next to {}: {error}; repository validation will be required",
                     path.display()
                 );
-                None
+                let mut state = ServiceStateSnapshot::default();
+                if resolved.effective.repository.url.is_some() {
+                    state.require_repository_validation();
+                }
+                state
             }
         };
         Ok(Self::from_resolved_with_state(
             resolved,
             local,
             events,
-            last_success,
+            service_state,
             Some(state_store),
             Some(config_store),
             credential_store,
@@ -111,7 +127,7 @@ impl ServiceRuntime {
             resolved,
             LocalConfig::default(),
             events,
-            None,
+            ServiceStateSnapshot::default(),
             None,
             None,
             None,
@@ -122,21 +138,40 @@ impl ServiceRuntime {
         resolved: ResolvedConfig,
         local_config: LocalConfig,
         events: Sender<RuntimeEvent>,
-        last_success: Option<DateTime<Utc>>,
+        service_state: ServiceStateSnapshot,
         state_store: Option<ScheduleStateStore>,
         config_store: Option<LocalConfigStore>,
         credential_store: Option<DpapiSecretStore>,
     ) -> Self {
         let now = Utc::now();
         let configured = resolved.effective.is_configured();
-        let next_deadline = configured.then(|| {
+        let last_success = service_state.last_success;
+        let repository_operation = if service_state
+            .repository_requires_validation(&resolved.effective)
+        {
+            RepositoryOperationStatus::ValidationRequired
+        } else if let Some(completed_at) = service_state.repository_verified_at(&resolved.effective)
+        {
+            RepositoryOperationStatus::Succeeded {
+                operation: RepositoryOperationKind::Validate,
+                completed_at,
+            }
+        } else {
+            RepositoryOperationStatus::NotRun
+        };
+        let repository_ready = repository_operation_allows_backup(&repository_operation);
+        let next_deadline = (configured && repository_ready).then(|| {
             last_success.map_or(now, |last_success| {
                 last_success
                     + Duration::hours(i64::from(resolved.effective.schedule.interval_hours))
             })
         });
         let status = ServiceStatus {
-            state: if configured {
+            state: if configured && !repository_ready {
+                BackupState::Waiting {
+                    reason: WaitingReason::RepositoryValidation,
+                }
+            } else if configured {
                 BackupState::Idle
             } else {
                 BackupState::Unconfigured
@@ -163,6 +198,8 @@ impl ServiceRuntime {
                 not_before: None,
                 manual_requested: false,
                 consecutive_failures: 0,
+                repository_operation,
+                service_state,
             }),
             state_store,
             events,
@@ -195,6 +232,8 @@ impl ServiceRuntime {
                 not_before: None,
                 manual_requested: false,
                 consecutive_failures: 0,
+                repository_operation: RepositoryOperationStatus::NotRun,
+                service_state: ServiceStateSnapshot::default(),
             }),
             state_store: None,
             events,
@@ -239,6 +278,7 @@ impl ServiceRuntime {
         };
         if succeeded {
             state.status.last_success = Some(now);
+            state.service_state.last_success = Some(now);
             state.status.next_deadline = Some(now + Duration::hours(i64::from(interval_hours)));
             state.not_before = None;
             state.consecutive_failures = 0;
@@ -258,11 +298,12 @@ impl ServiceRuntime {
         state.resumed_at = None;
         state.status.state_since = now;
         state.status.progress = None;
+        let service_state = state.service_state.clone();
         drop(state);
 
         if succeeded
             && let Some(store) = &self.state_store
-            && let Err(error) = store.save_last_success(now)
+            && let Err(error) = store.save(&service_state)
         {
             eprintln!("could not persist the last successful backup time: {error}");
         }
@@ -283,6 +324,9 @@ impl ServiceRuntime {
         }
 
         let mut state = self.state_guard();
+        if !repository_operation_allows_backup(&state.repository_operation) {
+            return ScheduleAction::None;
+        }
         let decision = decide(
             &config.schedule,
             &SchedulerSnapshot {
@@ -407,11 +451,24 @@ impl ServiceRuntime {
                 options,
                 secret_updates,
             } => self.update_repository(display_name, url, mode, options, secret_updates, identity),
+            RequestCommand::ValidateRepository => {
+                self.begin_repository_operation(RepositoryOperationKind::Validate, identity)
+            }
+            RequestCommand::InitializeRepository => {
+                self.begin_repository_operation(RepositoryOperationKind::Initialize, identity)
+            }
             RequestCommand::RunBackupNow => {
                 if !self.config_read().is_configured() {
                     rejected(
                         "not_configured",
                         "Configure backup sources and a repository first.",
+                    )
+                } else if !repository_operation_allows_backup(
+                    &self.state_guard().repository_operation,
+                ) {
+                    rejected(
+                        "repository_not_ready",
+                        "Validate or initialize the repository before starting a backup.",
                     )
                 } else {
                     let mut state = self.state_guard();
@@ -476,6 +533,7 @@ impl ServiceRuntime {
     }
 
     fn repository_view(&self) -> RepositoryView {
+        let operation_status = self.state_guard().repository_operation.clone();
         let config = self.config_read();
         RepositoryView {
             display_name: config.repository.display_name.clone(),
@@ -483,12 +541,169 @@ impl ServiceRuntime {
             mode: config.repository.mode,
             options: config.repository.options.clone(),
             configured_secrets: config.repository.secret_refs.keys().copied().collect(),
+            operation_status,
             display_name_locked: self.field_locked(PolicyField::RepositoryDisplayName),
             url_locked: self.field_locked(PolicyField::RepositoryUrl),
             mode_locked: self.field_locked(PolicyField::RepositoryMode),
             options_locked: self.field_locked(PolicyField::RepositoryOptions),
             secrets_locked: self.field_locked(PolicyField::RepositorySecretRefs),
         }
+    }
+
+    fn begin_repository_operation(
+        &self,
+        operation: RepositoryOperationKind,
+        identity: ClientIdentity,
+    ) -> ResponsePayload {
+        if !identity.is_elevated_administrator {
+            return administrator_required();
+        }
+        let config = self.config();
+        if config.repository.url.is_none() {
+            return rejected(
+                "repository_not_configured",
+                "Save a repository URL before testing the connection.",
+            );
+        }
+        if !config
+            .repository
+            .secret_refs
+            .contains_key(&SecretEnvironmentVariable::ResticPassword)
+        {
+            return rejected(
+                "repository_password_required",
+                "Store the repository password before testing the connection.",
+            );
+        }
+        if operation == RepositoryOperationKind::Initialize
+            && !ResticOperation::Initialize.allowed_in(config.repository.mode)
+        {
+            return rejected(
+                "append_only_initialization_forbidden",
+                "Repository creation is disabled in append-only mode.",
+            );
+        }
+
+        let mut state = self.state_guard();
+        if matches!(state.status.state, BackupState::Running { .. }) {
+            return rejected(
+                "backup_running",
+                "Wait for the active backup to finish before testing its repository.",
+            );
+        }
+        if matches!(
+            state.repository_operation,
+            RepositoryOperationStatus::Running { .. }
+        ) {
+            return rejected(
+                "repository_operation_running",
+                "A repository operation is already running.",
+            );
+        }
+
+        state.repository_operation = RepositoryOperationStatus::Running { operation };
+        if config.is_configured() {
+            transition_state(
+                &mut state.status,
+                BackupState::Waiting {
+                    reason: WaitingReason::RepositoryValidation,
+                },
+                Utc::now(),
+            );
+            state.status.next_deadline = None;
+        }
+        state.service_state.require_repository_validation();
+        if let Some(store) = &self.state_store
+            && let Err(error) = store.save(&state.service_state)
+        {
+            eprintln!("could not persist required repository validation: {error}");
+            state.repository_operation = RepositoryOperationStatus::Failed {
+                operation,
+                completed_at: Utc::now(),
+                code: "state_save_failed".to_owned(),
+            };
+            return rejected(
+                "state_save_failed",
+                "Repository validation state could not be saved.",
+            );
+        }
+        if self
+            .events
+            .send(RuntimeEvent::RepositoryOperationRequested(operation))
+            .is_err()
+        {
+            state.repository_operation = RepositoryOperationStatus::Failed {
+                operation,
+                completed_at: Utc::now(),
+                code: "service_stopping".to_owned(),
+            };
+            return rejected(
+                "service_stopping",
+                "The backup service is stopping. Try again shortly.",
+            );
+        }
+
+        ResponsePayload::Accepted {
+            message: match operation {
+                RepositoryOperationKind::Validate => {
+                    "Repository connection test started.".to_owned()
+                }
+                RepositoryOperationKind::Initialize => "Repository creation started.".to_owned(),
+            },
+        }
+    }
+
+    pub fn finish_repository_operation(
+        &self,
+        operation: RepositoryOperationKind,
+        outcome: &RepositoryOutcome,
+    ) {
+        let completed_at = Utc::now();
+        let config = self.config();
+        let mut state = self.state_guard();
+        if !matches!(
+            state.repository_operation,
+            RepositoryOperationStatus::Running {
+                operation: running
+            } if running == operation
+        ) {
+            return;
+        }
+        state.repository_operation = match &outcome.kind {
+            RepositoryOutcomeKind::Succeeded => {
+                state
+                    .service_state
+                    .mark_repository_verified(&config, completed_at);
+                let save_result = self
+                    .state_store
+                    .as_ref()
+                    .map_or(Ok(()), |store| store.save(&state.service_state));
+                if let Err(error) = save_result {
+                    eprintln!("could not persist successful repository validation: {error}");
+                    RepositoryOperationStatus::Failed {
+                        operation,
+                        completed_at,
+                        code: "state_save_failed".to_owned(),
+                    }
+                } else {
+                    RepositoryOperationStatus::Succeeded {
+                        operation,
+                        completed_at,
+                    }
+                }
+            }
+            RepositoryOutcomeKind::Failed { code } => RepositoryOperationStatus::Failed {
+                operation,
+                completed_at,
+                code: code.clone(),
+            },
+            RepositoryOutcomeKind::Cancelled => RepositoryOperationStatus::Failed {
+                operation,
+                completed_at,
+                code: "repository_operation_cancelled".to_owned(),
+            },
+        };
+        Self::apply_configuration_status(&mut state, &config, completed_at);
     }
 
     fn update_backup_sources(
@@ -569,6 +784,7 @@ impl ServiceRuntime {
         secret_updates: Vec<RepositorySecretUpdate>,
         identity: ClientIdentity,
     ) -> ResponsePayload {
+        let connection_changed = url.is_some() || options.is_some() || !secret_updates.is_empty();
         if !identity.is_elevated_administrator {
             return administrator_required();
         }
@@ -651,6 +867,15 @@ impl ServiceRuntime {
                 "Wait for the active backup to finish before changing its repository.",
             );
         }
+        if matches!(
+            runtime_state.repository_operation,
+            RepositoryOperationStatus::Running { .. }
+        ) {
+            return rejected(
+                "repository_operation_running",
+                "Wait for the repository operation to finish before changing its settings.",
+            );
+        }
 
         let mut created_references = Vec::new();
         let mut retired_references = std::collections::BTreeSet::new();
@@ -709,6 +934,22 @@ impl ServiceRuntime {
             }
             return rejected("invalid_repository", &error.to_string());
         }
+        let mut next_service_state = runtime_state.service_state.clone();
+        if connection_changed {
+            next_service_state.require_repository_validation();
+            if let Some(store) = &self.state_store
+                && let Err(error) = store.save(&next_service_state)
+            {
+                eprintln!("could not persist required repository validation: {error}");
+                if let Some(credentials) = &self.credential_store {
+                    cleanup_credentials(credentials, &created_references);
+                }
+                return rejected(
+                    "state_save_failed",
+                    "Repository validation state could not be saved.",
+                );
+            }
+        }
         if let Some(store) = &self.config_store
             && let Err(error) = store.save(&candidate)
         {
@@ -727,6 +968,10 @@ impl ServiceRuntime {
 
         *self.local_config_guard() = candidate;
         *self.config_write() = effective.clone();
+        if connection_changed {
+            runtime_state.repository_operation = RepositoryOperationStatus::ValidationRequired;
+            runtime_state.service_state = next_service_state;
+        }
         Self::apply_configuration_status(&mut runtime_state, &effective, Utc::now());
         drop(runtime_state);
         if let Some(store) = &self.credential_store {
@@ -750,6 +995,17 @@ impl ServiceRuntime {
         state.status.repository_display_name = config.repository.display_name.clone();
         state.status.repository_mode = config.repository.mode;
         if config.is_configured() {
+            if !repository_operation_allows_backup(&state.repository_operation) {
+                transition_state(
+                    &mut state.status,
+                    BackupState::Waiting {
+                        reason: WaitingReason::RepositoryValidation,
+                    },
+                    now,
+                );
+                state.status.next_deadline = None;
+                return;
+            }
             let scheduled_deadline = state.status.last_success.map_or(now, |last_success| {
                 last_success + Duration::hours(i64::from(config.schedule.interval_hours))
             });
@@ -757,7 +1013,13 @@ impl ServiceRuntime {
                 Some(state.not_before.map_or(scheduled_deadline, |not_before| {
                     scheduled_deadline.max(not_before)
                 }));
-            if matches!(state.status.state, BackupState::Unconfigured) {
+            if matches!(
+                state.status.state,
+                BackupState::Unconfigured
+                    | BackupState::Waiting {
+                        reason: WaitingReason::RepositoryValidation
+                    }
+            ) {
                 transition_state(&mut state.status, BackupState::Idle, now);
             }
         } else {
@@ -838,6 +1100,13 @@ fn cleanup_credentials(store: &DpapiSecretStore, references: &[String]) {
     }
 }
 
+fn repository_operation_allows_backup(status: &RepositoryOperationStatus) -> bool {
+    matches!(
+        status,
+        RepositoryOperationStatus::NotRun | RepositoryOperationStatus::Succeeded { .. }
+    )
+}
+
 fn transition_state(status: &mut ServiceStatus, next: BackupState, now: DateTime<Utc>) {
     if status.state != next {
         status.state = next;
@@ -909,7 +1178,8 @@ mod tests {
     use std::time::Duration as StdDuration;
 
     use resticpal_core::config::{
-        BackupConfig, LocalBackupConfig, RepositoryConfig, SecretEnvironmentVariable,
+        BackupConfig, LocalBackupConfig, LocalRepositoryConfig, RepositoryConfig,
+        SecretEnvironmentVariable,
     };
     use resticpal_protocol::{PROTOCOL_VERSION, SecretValue};
     use resticpal_windows::credentials::CredentialStoreError;
@@ -1426,7 +1696,12 @@ mod tests {
             secret_updates: Vec::new(),
         };
 
-        for command in [RequestCommand::GetRepository, update] {
+        for command in [
+            RequestCommand::GetRepository,
+            update,
+            RequestCommand::ValidateRepository,
+            RequestCommand::InitializeRepository,
+        ] {
             let response = runtime.handle_request(Request::new(30, command), USER);
             assert!(matches!(
                 response.payload,
@@ -1643,5 +1918,222 @@ mod tests {
             config.repository.display_name.as_deref(),
             Some("Friendly name")
         );
+    }
+
+    #[test]
+    fn repository_validation_is_queued_and_reported_until_completion() {
+        let (runtime, events) = runtime(true);
+        runtime.config_write().repository.secret_refs.insert(
+            SecretEnvironmentVariable::ResticPassword,
+            "repository-password".to_owned(),
+        );
+
+        let response =
+            runtime.handle_request(Request::new(40, RequestCommand::ValidateRepository), ADMIN);
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(
+            events.recv().expect("repository event"),
+            RuntimeEvent::RepositoryOperationRequested(RepositoryOperationKind::Validate)
+        );
+        let duplicate =
+            runtime.handle_request(Request::new(41, RequestCommand::ValidateRepository), ADMIN);
+        assert!(matches!(
+            duplicate.payload,
+            ResponsePayload::Rejected { ref code, .. }
+                if code == "repository_operation_running"
+        ));
+        let running =
+            runtime.handle_request(Request::new(42, RequestCommand::GetRepository), ADMIN);
+        assert!(matches!(
+            running.payload,
+            ResponsePayload::Repository {
+                configuration: RepositoryView {
+                    operation_status: RepositoryOperationStatus::Running {
+                        operation: RepositoryOperationKind::Validate
+                    },
+                    ..
+                }
+            }
+        ));
+
+        runtime.finish_repository_operation(
+            RepositoryOperationKind::Validate,
+            &RepositoryOutcome {
+                kind: RepositoryOutcomeKind::Succeeded,
+            },
+        );
+        let succeeded =
+            runtime.handle_request(Request::new(43, RequestCommand::GetRepository), ADMIN);
+        assert!(matches!(
+            succeeded.payload,
+            ResponsePayload::Repository {
+                configuration: RepositoryView {
+                    operation_status: RepositoryOperationStatus::Succeeded {
+                        operation: RepositoryOperationKind::Validate,
+                        ..
+                    },
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn append_only_mode_rejects_repository_initialization() {
+        let (runtime, _events) = runtime(true);
+        {
+            let mut config = runtime.config_write();
+            config.repository.mode = RepositoryMode::AppendOnly;
+            config.repository.secret_refs.insert(
+                SecretEnvironmentVariable::ResticPassword,
+                "repository-password".to_owned(),
+            );
+        }
+
+        let response = runtime.handle_request(
+            Request::new(43, RequestCommand::InitializeRepository),
+            ADMIN,
+        );
+
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Rejected { ref code, .. }
+                if code == "append_only_initialization_forbidden"
+        ));
+    }
+
+    #[test]
+    fn connection_changes_require_validation_before_backup() {
+        let (runtime, events) = runtime(true);
+        let response = runtime.handle_request(
+            Request::new(
+                44,
+                RequestCommand::UpdateRepository {
+                    display_name: None,
+                    url: Some("local:D:/replacement".to_owned()),
+                    mode: None,
+                    options: None,
+                    secret_updates: Vec::new(),
+                },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(
+            events.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        assert_eq!(
+            runtime.evaluate_schedule(Utc::now(), available_conditions()),
+            ScheduleAction::None
+        );
+        assert!(matches!(
+            runtime.status().state,
+            BackupState::Waiting {
+                reason: WaitingReason::RepositoryValidation
+            }
+        ));
+
+        let run = runtime.handle_request(Request::new(45, RequestCommand::RunBackupNow), ADMIN);
+        assert!(matches!(
+            run.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "repository_not_ready"
+        ));
+        let view = runtime.handle_request(Request::new(46, RequestCommand::GetRepository), ADMIN);
+        assert!(matches!(
+            view.payload,
+            ResponsePayload::Repository {
+                configuration: RepositoryView {
+                    operation_status: RepositoryOperationStatus::ValidationRequired,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn repository_validation_gate_survives_service_restart() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        LocalConfigStore::new(&config_path)
+            .save(&LocalConfig {
+                backup: LocalBackupConfig {
+                    paths: Some(vec![PathBuf::from(r"C:\Data")]),
+                    exclusions: Some(Vec::new()),
+                },
+                repository: LocalRepositoryConfig {
+                    url: Some("local:C:/backup".to_owned()),
+                    secret_refs: Some(BTreeMap::from([(
+                        SecretEnvironmentVariable::ResticPassword,
+                        "repository-password".to_owned(),
+                    )])),
+                    ..LocalRepositoryConfig::default()
+                },
+                ..LocalConfig::default()
+            })
+            .expect("initial config");
+        let (events, receiver) = mpsc::channel();
+        let runtime = ServiceRuntime::load(&config_path, events).expect("runtime");
+
+        let response = runtime.handle_request(
+            Request::new(
+                47,
+                RequestCommand::UpdateRepository {
+                    display_name: None,
+                    url: Some("local:D:/replacement".to_owned()),
+                    mode: None,
+                    options: None,
+                    secret_updates: Vec::new(),
+                },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(
+            receiver.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        drop(runtime);
+
+        let (events, receiver) = mpsc::channel();
+        let runtime = ServiceRuntime::load(&config_path, events).expect("restarted runtime");
+        assert_eq!(
+            runtime.evaluate_schedule(Utc::now(), available_conditions()),
+            ScheduleAction::None
+        );
+        let response =
+            runtime.handle_request(Request::new(48, RequestCommand::ValidateRepository), ADMIN);
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(
+            receiver.recv().expect("repository event"),
+            RuntimeEvent::RepositoryOperationRequested(RepositoryOperationKind::Validate)
+        );
+        runtime.finish_repository_operation(
+            RepositoryOperationKind::Validate,
+            &RepositoryOutcome {
+                kind: RepositoryOutcomeKind::Succeeded,
+            },
+        );
+        drop(runtime);
+
+        let (events, _receiver) = mpsc::channel();
+        let runtime = ServiceRuntime::load(&config_path, events).expect("verified restart");
+        let view = runtime.handle_request(Request::new(49, RequestCommand::GetRepository), ADMIN);
+        assert!(matches!(
+            view.payload,
+            ResponsePayload::Repository {
+                configuration: RepositoryView {
+                    operation_status: RepositoryOperationStatus::Succeeded {
+                        operation: RepositoryOperationKind::Validate,
+                        ..
+                    },
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            runtime.evaluate_schedule(Utc::now(), available_conditions()),
+            ScheduleAction::Start { .. }
+        ));
     }
 }

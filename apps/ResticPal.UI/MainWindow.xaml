@@ -198,11 +198,19 @@
                             BorderThickness="1"
                             CornerRadius="8">
                             <StackPanel Spacing="16">
+                                <InfoBar
+                                    x:Name="RepositoryOperationMessage"
+                                    IsClosable="False"
+                                    IsOpen="True"
+                                    Message="Save the repository settings, then test the connection or create a new repository."
+                                    Severity="Informational"
+                                    Title="Connection not tested" />
                                 <TextBox
                                     x:Name="RepositoryDisplayNameBox"
                                     Header="Display name"
                                     MaxLength="256"
-                                    PlaceholderText="Office backup" />
+                                    PlaceholderText="Office backup"
+                                    TextChanged="RepositoryField_Changed" />
                                 <ComboBox
                                     x:Name="RepositoryKindBox"
                                     Header="Repository type"
@@ -216,9 +224,14 @@
                                     x:Name="RepositoryUrlBox"
                                     Header="Repository URL or path"
                                     IsSpellCheckEnabled="False"
-                                    PlaceholderText="s3:https://storage.example.com/backups/computer-name" />
+                                    PlaceholderText="s3:https://storage.example.com/backups/computer-name"
+                                    TextChanged="RepositoryField_Changed" />
                                 <StackPanel Spacing="6">
-                                    <ComboBox x:Name="RepositoryModeBox" Header="Repository behavior" SelectedIndex="0">
+                                    <ComboBox
+                                        x:Name="RepositoryModeBox"
+                                        Header="Repository behavior"
+                                        SelectedIndex="0"
+                                        SelectionChanged="RepositoryModeBox_SelectionChanged">
                                         <ComboBoxItem Content="Standard — this PC may apply retention" Tag="standard" />
                                         <ComboBoxItem Content="Append-only — retention is managed elsewhere" Tag="append_only" />
                                     </ComboBox>
@@ -234,6 +247,7 @@
                                     IsSpellCheckEnabled="False"
                                     MinHeight="96"
                                     PlaceholderText="s3.connections=5"
+                                    TextChanged="RepositoryField_Changed"
                                     TextWrapping="NoWrap" />
                                 <TextBlock
                                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
@@ -261,6 +275,7 @@
                                 <PasswordBox
                                     x:Name="ResticPasswordBox"
                                     Header="Repository password (RESTIC_PASSWORD)"
+                                    PasswordChanged="RepositoryField_Changed"
                                     PasswordRevealMode="Peek" />
                                 <Grid ColumnSpacing="16">
                                     <Grid.ColumnDefinitions>
@@ -270,27 +285,31 @@
                                     <PasswordBox
                                         x:Name="AwsAccessKeyBox"
                                         Header="AWS access key ID"
+                                        PasswordChanged="RepositoryField_Changed"
                                         PasswordRevealMode="Peek" />
                                     <PasswordBox
                                         x:Name="AwsSecretKeyBox"
                                         Grid.Column="1"
                                         Header="AWS secret access key"
+                                        PasswordChanged="RepositoryField_Changed"
                                         PasswordRevealMode="Peek" />
                                 </Grid>
                                 <PasswordBox
                                     x:Name="AwsSessionTokenBox"
                                     Header="AWS session token (optional)"
+                                    PasswordChanged="RepositoryField_Changed"
                                     PasswordRevealMode="Peek" />
                                 <Expander Header="Other backend credentials">
                                     <StackPanel Padding="0,12,0,0" Spacing="12">
-                                        <PasswordBox x:Name="AzureAccountKeyBox" Header="Azure account key" PasswordRevealMode="Peek" />
-                                        <PasswordBox x:Name="B2AccountKeyBox" Header="Backblaze B2 account key" PasswordRevealMode="Peek" />
-                                        <TextBox x:Name="GoogleCredentialsBox" Header="Google application credentials path" IsSpellCheckEnabled="False" />
-                                        <PasswordBox x:Name="RcloneConfigPasswordBox" Header="rclone configuration password" PasswordRevealMode="Peek" />
+                                        <PasswordBox x:Name="AzureAccountKeyBox" Header="Azure account key" PasswordChanged="RepositoryField_Changed" PasswordRevealMode="Peek" />
+                                        <PasswordBox x:Name="B2AccountKeyBox" Header="Backblaze B2 account key" PasswordChanged="RepositoryField_Changed" PasswordRevealMode="Peek" />
+                                        <TextBox x:Name="GoogleCredentialsBox" Header="Google application credentials path" IsSpellCheckEnabled="False" TextChanged="RepositoryField_Changed" />
+                                        <PasswordBox x:Name="RcloneConfigPasswordBox" Header="rclone configuration password" PasswordChanged="RepositoryField_Changed" PasswordRevealMode="Peek" />
                                     </StackPanel>
                                 </Expander>
                                 <CheckBox
                                     x:Name="RemoveStoredCredentialsCheckBox"
+                                    Checked="RepositoryField_Changed"
                                     Content="Remove all currently stored repository credentials when saving" />
                             </StackPanel>
                         </Border>
@@ -301,6 +320,14 @@
                                 Click="SaveRepositoryButton_Click"
                                 Content="Save repository"
                                 Style="{StaticResource AccentButtonStyle}" />
+                            <Button
+                                x:Name="ValidateRepositoryButton"
+                                Click="ValidateRepositoryButton_Click"
+                                Content="Test connection" />
+                            <Button
+                                x:Name="CreateRepositoryButton"
+                                Click="CreateRepositoryButton_Click"
+                                Content="Create new repository" />
                             <ProgressRing x:Name="RepositoryProgress" IsActive="False" Width="24" Height="24" />
                         </StackPanel>
                     </Grid>

@@ -8,7 +8,7 @@ namespace ResticPal.UI.Services;
 
 internal sealed class ResticPalServiceClient
 {
-    private const int ProtocolVersion = 1;
+    private const int ProtocolVersion = 2;
     private const int MaxFrameBytes = 1024 * 1024;
     private static long _nextRequestId;
 
@@ -23,6 +23,9 @@ internal sealed class ResticPalServiceClient
         JsonElement status = payload.GetProperty("status");
         JsonElement state = status.GetProperty("state");
         string stateName = state.GetProperty("state").GetString() ?? "unknown";
+        string? waitingReason = state.TryGetProperty("reason", out JsonElement reasonElement)
+            ? reasonElement.GetString()
+            : null;
         string repositoryMode = status.GetProperty("repository_mode").GetString() ?? "standard";
         string? repositoryName = status.GetProperty("repository_display_name").GetString();
 
@@ -37,6 +40,11 @@ internal sealed class ResticPalServiceClient
                 "Protected",
                 DescribeRepository(repositoryName, repositoryMode),
                 true,
+                false),
+            "waiting" when waitingReason == "repository_validation" => (
+                "Repository setup required",
+                "Test the saved repository connection before backups can continue.",
+                false,
                 false),
             "waiting" => (
                 "Backup waiting",
@@ -145,6 +153,7 @@ internal sealed class ResticPalServiceClient
             configuration.GetProperty("mode").GetString() ?? "standard",
             options,
             ReadStrings(configuration.GetProperty("configured_secrets")).ToHashSet(StringComparer.Ordinal),
+            ReadRepositoryOperationStatus(configuration.GetProperty("operation_status")),
             configuration.GetProperty("display_name_locked").GetBoolean(),
             configuration.GetProperty("url_locked").GetBoolean(),
             configuration.GetProperty("mode_locked").GetBoolean(),
@@ -171,6 +180,18 @@ internal sealed class ResticPalServiceClient
                 secret_updates = secretUpdates,
             },
             cancellationToken);
+    }
+
+    public async Task<CommandResult> ValidateRepositoryAsync(
+        CancellationToken cancellationToken = default)
+    {
+        return await SendCommandAsync(new { type = "validate_repository" }, cancellationToken);
+    }
+
+    public async Task<CommandResult> InitializeRepositoryAsync(
+        CancellationToken cancellationToken = default)
+    {
+        return await SendCommandAsync(new { type = "initialize_repository" }, cancellationToken);
     }
 
     private static async Task<CommandResult> SendCommandAsync(
@@ -219,7 +240,7 @@ internal sealed class ResticPalServiceClient
         timeout.CancelAfter(requestTimeout ?? TimeSpan.FromSeconds(2));
         await using var pipe = new NamedPipeClientStream(
             ".",
-            "ResticPal.v1",
+            "ResticPal.v2",
             PipeDirection.InOut,
             PipeOptions.Asynchronous);
         await pipe.ConnectAsync(timeout.Token);
@@ -278,6 +299,22 @@ internal sealed class ResticPalServiceClient
             .Where(value => !string.IsNullOrEmpty(value))
             .Cast<string>()
             .ToArray();
+    }
+
+    private static RepositoryOperationStatus ReadRepositoryOperationStatus(JsonElement status)
+    {
+        string state = status.GetProperty("state").GetString() ?? "not_run";
+        string? operation = status.TryGetProperty("operation", out JsonElement operationElement)
+            ? operationElement.GetString()
+            : null;
+        DateTimeOffset? completedAt = status.TryGetProperty("completed_at", out JsonElement completedElement)
+            && completedElement.TryGetDateTimeOffset(out DateTimeOffset timestamp)
+                ? timestamp
+                : null;
+        string? code = status.TryGetProperty("code", out JsonElement codeElement)
+            ? codeElement.GetString()
+            : null;
+        return new RepositoryOperationStatus(state, operation, completedAt, code);
     }
 
     private static string DescribeRepository(string? repositoryName, string repositoryMode)
@@ -342,11 +379,18 @@ internal sealed record RepositoryConfiguration(
     string Mode,
     IReadOnlyDictionary<string, string> Options,
     IReadOnlySet<string> ConfiguredSecrets,
+    RepositoryOperationStatus OperationStatus,
     bool DisplayNameLocked,
     bool UrlLocked,
     bool ModeLocked,
     bool OptionsLocked,
     bool SecretsLocked);
+
+internal sealed record RepositoryOperationStatus(
+    string State,
+    string? Operation,
+    DateTimeOffset? CompletedAt,
+    string? Code);
 
 internal sealed record RepositorySecretUpdate(
     [property: JsonPropertyName("action")] string Action,
