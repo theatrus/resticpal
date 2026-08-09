@@ -11,6 +11,7 @@ use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering, compiler_fence};
 
+use resticpal_core::config::is_valid_secret_reference;
 use thiserror::Error;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, LocalFree,
@@ -62,6 +63,13 @@ impl DpapiSecretStore {
         for entry in fs::read_dir(&root)? {
             let entry = entry?;
             let metadata = entry.path().symlink_metadata()?;
+            if metadata.is_file()
+                && !is_reparse_point(&metadata)
+                && is_internal_temporary_name(&entry.file_name())
+            {
+                fs::remove_file(entry.path())?;
+                continue;
+            }
             if is_reparse_point(&metadata) || !metadata.is_file() {
                 return Err(CredentialStoreError::UnexpectedStoreEntry);
             }
@@ -185,16 +193,27 @@ impl DpapiSecretStore {
 }
 
 fn validate_reference(reference: &str) -> Result<(), CredentialStoreError> {
-    if reference.is_empty()
-        || reference.len() > 64
-        || !reference
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
+    if !is_valid_secret_reference(reference) {
         Err(CredentialStoreError::InvalidReference)
     } else {
         Ok(())
     }
+}
+
+fn is_internal_temporary_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(suffix) = name.strip_prefix(".tmp-") else {
+        return false;
+    };
+    let Some((process, counter)) = suffix.split_once('-') else {
+        return false;
+    };
+    !process.is_empty()
+        && !counter.is_empty()
+        && process.bytes().all(|byte| byte.is_ascii_digit())
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn validate_directory(path: &Path) -> Result<(), CredentialStoreError> {
@@ -539,6 +558,32 @@ mod tests {
             store.get("repository-password").expect("secret").as_slice(),
             b"replacement-secret"
         );
+    }
+
+    #[test]
+    fn open_removes_a_stale_internal_temporary_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("credentials");
+        fs::create_dir_all(&root).expect("credential directory");
+        let temporary = root.join(".tmp-1234-9");
+        fs::write(&temporary, b"incomplete").expect("stale temporary file");
+
+        DpapiSecretStore::open(&root).expect("store should recover");
+
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn similarly_named_unexpected_files_are_not_deleted() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("credentials");
+        fs::create_dir_all(&root).expect("credential directory");
+        let unexpected = root.join(".tmp-not-ours");
+        fs::write(&unexpected, b"keep").expect("unexpected file");
+
+        DpapiSecretStore::open(&root).expect("regular files remain supported");
+
+        assert!(unexpected.exists());
     }
 
     #[test]

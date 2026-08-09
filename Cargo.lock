@@ -364,6 +364,7 @@ dependencies = [
 name = "resticpal-windows"
 version = "0.1.0"
 dependencies = [
+ "resticpal-core",
  "resticpal-protocol",
  "tempfile",
  "thiserror",

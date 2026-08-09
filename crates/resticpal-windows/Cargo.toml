@@ -8,6 +8,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+resticpal-core.workspace = true
 resticpal-protocol.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true

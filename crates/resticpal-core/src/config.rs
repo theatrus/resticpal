@@ -13,6 +13,7 @@ pub const MAX_REPOSITORY_URL_CHARACTERS: usize = 8 * 1_024;
 pub const MAX_REPOSITORY_DISPLAY_NAME_CHARACTERS: usize = 256;
 pub const MAX_REPOSITORY_OPTIONS: usize = 64;
 pub const MAX_REPOSITORY_OPTION_VALUE_CHARACTERS: usize = 4 * 1_024;
+pub const MAX_SECRET_REFERENCE_BYTES: usize = 64;
 pub const MAX_SCHEDULE_INTERVAL_HOURS: u32 = 24 * 365;
 
 const DEFAULT_INTERVAL_HOURS: u32 = 24;
@@ -205,6 +206,7 @@ impl EffectiveConfig {
             if path.as_os_str().is_empty()
                 || !path.is_absolute()
                 || path.to_string_lossy().encode_utf16().count() > MAX_PATH_CHARACTERS
+                || path.to_string_lossy().contains('\0')
             {
                 return Err(ConfigValidationError::InvalidBackupPath(path.clone()));
             }
@@ -238,8 +240,8 @@ impl EffectiveConfig {
         }
 
         for secret_id in self.repository.secret_refs.values() {
-            if secret_id.trim().is_empty() {
-                return Err(ConfigValidationError::EmptySecretReference);
+            if !is_valid_secret_reference(secret_id) {
+                return Err(ConfigValidationError::InvalidSecretReference);
             }
         }
 
@@ -319,6 +321,15 @@ fn is_valid_option_name(value: &str) -> bool {
         })
 }
 
+#[must_use]
+pub fn is_valid_secret_reference(reference: &str) -> bool {
+    !reference.is_empty()
+        && reference.len() <= MAX_SECRET_REFERENCE_BYTES
+        && reference
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 #[derive(Debug, Error)]
 pub enum LocalConfigError {
     #[error("could not parse local TOML configuration: {0}")]
@@ -357,8 +368,8 @@ pub enum ConfigValidationError {
     InvalidRepositoryOptionValue(String),
     #[error("repository configuration exceeds the maximum of {MAX_REPOSITORY_OPTIONS} options")]
     TooManyRepositoryOptions,
-    #[error("secret reference IDs cannot be empty")]
-    EmptySecretReference,
+    #[error("secret reference IDs must contain 1-64 lowercase letters, digits, or hyphens")]
+    InvalidSecretReference,
 }
 
 #[cfg(test)]
@@ -485,6 +496,34 @@ mod tests {
             config.validate(),
             Err(ConfigValidationError::TooManyRepositoryOptions)
         );
+    }
+
+    #[test]
+    fn secret_references_match_the_credential_store_namespace() {
+        let mut config = EffectiveConfig::default();
+        config.repository.secret_refs.insert(
+            SecretEnvironmentVariable::ResticPassword,
+            "UPPERCASE".to_owned(),
+        );
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidSecretReference)
+        );
+
+        config.repository.secret_refs.insert(
+            SecretEnvironmentVariable::ResticPassword,
+            "a".repeat(MAX_SECRET_REFERENCE_BYTES + 1),
+        );
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidSecretReference)
+        );
+
+        config.repository.secret_refs.insert(
+            SecretEnvironmentVariable::ResticPassword,
+            "restic-password-0123456789abcdef".to_owned(),
+        );
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]

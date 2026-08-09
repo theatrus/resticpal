@@ -13,7 +13,8 @@ use resticpal_core::policy::{
 };
 use resticpal_core::restic::ResticOperation;
 use resticpal_core::schedule::{
-    BackupTrigger, ScheduleBlocker, ScheduleDecision, SchedulerSnapshot, decide,
+    BackupTrigger, ScheduleBlocker, ScheduleDecision, SchedulerSnapshot, completion_deadline,
+    decide,
 };
 use resticpal_core::status::{
     BackupPhase, BackupProgress, BackupRunOutcome, BackupState, ServiceStatus, WaitingReason,
@@ -137,11 +138,15 @@ impl ServiceRuntime {
 
     #[cfg(test)]
     pub fn from_resolved(resolved: ResolvedConfig, events: Sender<RuntimeEvent>) -> Self {
+        let mut service_state = ServiceStateSnapshot::default();
+        if resolved.effective.repository.url.is_some() {
+            service_state.mark_repository_verified(&resolved.effective, Utc::now());
+        }
         Self::from_resolved_with_state(
             resolved,
             LocalConfig::default(),
             events,
-            ServiceStateSnapshot::default(),
+            service_state,
             RuntimeStores::default(),
         )
     }
@@ -177,10 +182,11 @@ impl ServiceRuntime {
         };
         let repository_ready = repository_operation_allows_backup(&repository_operation);
         let next_deadline = (configured && repository_ready).then(|| {
-            last_success.map_or(now, |last_success| {
-                last_success
-                    + Duration::hours(i64::from(resolved.effective.schedule.interval_hours))
-            })
+            completion_deadline(
+                last_success,
+                now,
+                resolved.effective.schedule.interval_hours,
+            )
         });
         let status = ServiceStatus {
             state: if configured && !repository_ready {
@@ -223,14 +229,18 @@ impl ServiceRuntime {
         }
     }
 
-    pub fn configuration_error(events: Sender<RuntimeEvent>) -> Self {
+    pub fn configuration_error(
+        path: &Path,
+        events: Sender<RuntimeEvent>,
+        credential_store: Option<DpapiSecretStore>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             config: RwLock::new(EffectiveConfig::default()),
             local_config: Mutex::new(LocalConfig::default()),
             field_resolutions: BTreeMap::new(),
-            config_store: None,
-            credential_store: None,
+            config_store: Some(LocalConfigStore::new(path)),
+            credential_store,
             state: Mutex::new(RuntimeState {
                 status: ServiceStatus {
                     state: BackupState::Failed {
@@ -252,8 +262,8 @@ impl ServiceRuntime {
                 repository_operation: RepositoryOperationStatus::NotRun,
                 service_state: ServiceStateSnapshot::default(),
             }),
-            state_store: None,
-            history_store: None,
+            state_store: Some(ScheduleStateStore::next_to_config(path)),
+            history_store: Some(BackupHistoryStore::next_to_config(path)),
             events,
         }
     }
@@ -298,7 +308,7 @@ impl ServiceRuntime {
         if succeeded {
             state.status.last_success = Some(now);
             state.service_state.last_success = Some(now);
-            state.status.next_deadline = Some(now + Duration::hours(i64::from(interval_hours)));
+            state.status.next_deadline = Some(completion_deadline(Some(now), now, interval_hours));
             state.not_before = None;
             state.consecutive_failures = 0;
         } else {
@@ -599,16 +609,31 @@ impl ServiceRuntime {
                         "invalid_deferral",
                         "A deferral must be between one minute and 24 hours.",
                     )
-                } else if matches!(self.state_guard().status.state, BackupState::Running { .. }) {
-                    rejected("already_running", "A running backup cannot be deferred.")
+                } else if !self.config_read().is_configured() {
+                    rejected(
+                        "not_configured",
+                        "Configure backup sources and a repository first.",
+                    )
                 } else {
-                    let deadline = Utc::now() + Duration::minutes(i64::from(minutes));
                     let mut state = self.state_guard();
-                    state.manual_requested = false;
-                    state.not_before = Some(deadline);
-                    state.status.next_deadline = Some(deadline);
-                    drop(state);
-                    self.send_event(RuntimeEvent::Deferred, "Backup deferred.")
+                    if !repository_operation_allows_backup(&state.repository_operation) {
+                        rejected(
+                            "repository_not_ready",
+                            "Validate or initialize the repository before deferring backups.",
+                        )
+                    } else if matches!(state.status.state, BackupState::Running { .. }) {
+                        rejected("already_running", "A running backup cannot be deferred.")
+                    } else {
+                        let now = Utc::now();
+                        let deadline = now
+                            .checked_add_signed(Duration::minutes(i64::from(minutes)))
+                            .unwrap_or(now);
+                        state.manual_requested = false;
+                        state.not_before = Some(deadline);
+                        state.status.next_deadline = Some(deadline);
+                        drop(state);
+                        self.send_event(RuntimeEvent::Deferred, "Backup deferred.")
+                    }
                 }
             }
         };
@@ -1222,9 +1247,11 @@ impl ServiceRuntime {
                 state.status.next_deadline = None;
                 return;
             }
-            let scheduled_deadline = state.status.last_success.map_or(now, |last_success| {
-                last_success + Duration::hours(i64::from(config.schedule.interval_hours))
-            });
+            let scheduled_deadline = completion_deadline(
+                state.status.last_success,
+                now,
+                config.schedule.interval_hours,
+            );
             state.status.next_deadline =
                 Some(state.not_before.map_or(scheduled_deadline, |not_before| {
                     scheduled_deadline.max(not_before)
@@ -1317,10 +1344,7 @@ fn cleanup_credentials(store: &DpapiSecretStore, references: &[String]) {
 }
 
 fn repository_operation_allows_backup(status: &RepositoryOperationStatus) -> bool {
-    matches!(
-        status,
-        RepositoryOperationStatus::NotRun | RepositoryOperationStatus::Succeeded { .. }
-    )
+    matches!(status, RepositoryOperationStatus::Succeeded { .. })
 }
 
 fn transition_state(status: &mut ServiceStatus, next: BackupState, now: DateTime<Utc>) {
@@ -1347,9 +1371,9 @@ fn repository_requires_network(repository: &str) -> bool {
         .strip_prefix("local:")
         .or_else(|| repository.strip_prefix("LOCAL:"));
     if let Some(path) = local {
-        return path.starts_with(r"\\");
+        return path.starts_with(r"\\") || path.starts_with("//");
     }
-    if repository.starts_with(r"\\") {
+    if repository.starts_with(r"\\") || repository.starts_with("//") {
         return true;
     }
     if repository.len() >= 3
@@ -1486,6 +1510,48 @@ mod tests {
         assert!(matches!(
             response.payload,
             ResponsePayload::Rejected { ref code, .. } if code == "not_configured"
+        ));
+    }
+
+    #[test]
+    fn deferral_requires_a_configured_and_verified_repository() {
+        let (unconfigured, _events) = runtime(false);
+        assert!(matches!(
+            unconfigured
+                .handle_request(
+                    Request::new(30, RequestCommand::DeferBackup { minutes: 30 }),
+                    USER,
+                )
+                .payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "not_configured"
+        ));
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        LocalConfigStore::new(&config_path)
+            .save(&LocalConfig {
+                backup: LocalBackupConfig {
+                    paths: Some(vec![PathBuf::from(r"C:\Data")]),
+                    exclusions: Some(Vec::new()),
+                },
+                repository: LocalRepositoryConfig {
+                    url: Some("local:C:/backup".to_owned()),
+                    ..LocalRepositoryConfig::default()
+                },
+                ..LocalConfig::default()
+            })
+            .expect("configured local file");
+        let (events, _receiver) = mpsc::channel();
+        let unverified = ServiceRuntime::load(&config_path, events).expect("runtime");
+
+        assert!(matches!(
+            unverified
+                .handle_request(
+                    Request::new(31, RequestCommand::DeferBackup { minutes: 30 }),
+                    USER,
+                )
+                .payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "repository_not_ready"
         ));
     }
 
@@ -1743,6 +1809,7 @@ mod tests {
         assert!(!repository_requires_network(r"C:\Backups\restic"));
         assert!(!repository_requires_network("local:C:/Backups/restic"));
         assert!(repository_requires_network(r"\\server\share\restic"));
+        assert!(repository_requires_network("//server/share/restic"));
         assert!(repository_requires_network("s3:s3.example.test/bucket"));
         assert!(repository_requires_network(
             "sftp:user@example.test:/backup"
@@ -1803,12 +1870,48 @@ mod tests {
         );
         assert_eq!(runtime.config().backup.paths, [PathBuf::from(r"D:\Data")]);
         assert_eq!(runtime.config().backup.exclusions, ["**/cache/**"]);
-        assert!(matches!(runtime.status().state, BackupState::Idle));
+        assert!(matches!(
+            runtime.status().state,
+            BackupState::Waiting {
+                reason: WaitingReason::RepositoryValidation
+            }
+        ));
         let persisted = store.load().expect("updated config should load");
         assert_eq!(
             persisted.backup.paths,
             Some(vec![PathBuf::from(r"D:\Data")])
         );
+    }
+
+    #[test]
+    fn invalid_configuration_can_be_repaired_and_persisted_over_ipc() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(&config_path, "this is not valid TOML = [").expect("invalid config");
+        let (events, receiver) = mpsc::channel();
+        let runtime = ServiceRuntime::configuration_error(&config_path, events, None);
+
+        let response = runtime.handle_request(
+            Request::new(
+                32,
+                RequestCommand::UpdateBackupSources {
+                    paths: Some(vec![PathBuf::from(r"C:\Data")]),
+                    exclusions: Some(Vec::new()),
+                },
+            ),
+            ADMIN,
+        );
+
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(
+            receiver.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        let repaired = LocalConfigStore::new(&config_path)
+            .load()
+            .expect("repaired configuration");
+        assert_eq!(repaired.backup.paths, Some(vec![PathBuf::from(r"C:\Data")]));
+        assert!(matches!(runtime.status().state, BackupState::Unconfigured));
     }
 
     #[test]
@@ -2518,6 +2621,13 @@ mod tests {
                 ..LocalConfig::default()
             })
             .expect("initial config");
+        let mut verified_config = EffectiveConfig::default();
+        verified_config.repository.url = Some("local:C:/backup".to_owned());
+        let mut service_state = ServiceStateSnapshot::default();
+        service_state.mark_repository_verified(&verified_config, Utc::now());
+        ScheduleStateStore::next_to_config(&config_path)
+            .save(&service_state)
+            .expect("verified repository state");
         let (events, receiver) = mpsc::channel();
         let runtime = ServiceRuntime::load(&config_path, events).expect("runtime");
         assert!(matches!(

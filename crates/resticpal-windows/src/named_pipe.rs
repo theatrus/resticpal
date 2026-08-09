@@ -1,7 +1,8 @@
 use std::ffi::c_void;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem::size_of;
+use std::os::windows::io::AsRawHandle;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,10 @@ use resticpal_protocol::{
     FrameError, PROTOCOL_VERSION, Request, Response, read_frame, write_frame,
 };
 use thiserror::Error;
-use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
+    ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, LocalFree,
+};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
@@ -17,13 +21,11 @@ use windows::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
     SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, WinBuiltinAdministratorsSid,
 };
-use windows::Win32::Storage::FileSystem::{
-    FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
-};
+use windows::Win32::Storage::FileSystem::{PIPE_ACCESS_DUPLEX, ReadFile, WriteFile};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, ImpersonateNamedPipeClient,
+    ConnectNamedPipe, CreateNamedPipeW, ImpersonateNamedPipeClient, NAMED_PIPE_MODE, PIPE_NOWAIT,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT,
+    PIPE_WAIT, SetNamedPipeHandleState,
 };
 use windows::core::{BOOL, Error as WindowsError, HRESULT, PCWSTR, w};
 
@@ -31,6 +33,8 @@ pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\ResticPal.v2";
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(20);
+const SERVER_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const IO_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Identity properties derived by Windows from the connected pipe client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +70,7 @@ impl NamedPipeServer {
     ) -> Result<(), NamedPipeError> {
         let mut connection = self.accept()?;
         let request: Request = read_frame(&mut connection)?;
+        connection.reset_deadline();
         // Windows requires the server to read at least one byte from the pipe
         // before it can impersonate and inspect the authenticated client token.
         let identity = connection.client_identity()?;
@@ -74,7 +79,9 @@ impl NamedPipeServer {
         } else {
             Response::incompatible(request.request_id, request.protocol_version)
         };
+        connection.reset_deadline();
         write_frame(&mut connection, &response)?;
+        connection.wait_for_response_consumption()?;
         Ok(())
     }
 
@@ -98,15 +105,22 @@ impl NamedPipeServer {
             return Err(WindowsError::from_thread().into());
         }
 
-        let connection = PipeConnection { handle };
+        let mut connection = PipeConnection {
+            handle,
+            io_deadline: Instant::now(),
+        };
         // SAFETY: connection owns a valid server-side named-pipe handle.
         match unsafe { ConnectNamedPipe(connection.handle, None) } {
-            Ok(()) => Ok(connection),
-            Err(error) if error.code() == HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) => {
-                Ok(connection)
-            }
-            Err(error) => Err(error.into()),
+            Ok(()) => {}
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) => {}
+            Err(error) => return Err(error.into()),
         }
+        let mode = NAMED_PIPE_MODE(PIPE_READMODE_BYTE.0 | PIPE_NOWAIT.0);
+        // SAFETY: connection owns a connected named-pipe handle and mode is
+        // live for the duration of this synchronous call.
+        unsafe { SetNamedPipeHandleState(connection.handle, Some(&raw const mode), None, None) }?;
+        connection.io_deadline = Instant::now() + SERVER_IO_TIMEOUT;
+        Ok(connection)
     }
 }
 
@@ -123,7 +137,7 @@ impl NamedPipeClient {
         timeout: Duration,
     ) -> Result<Response, NamedPipeError> {
         let deadline = Instant::now() + timeout;
-        let mut connection = loop {
+        let connection = loop {
             match OpenOptions::new().read(true).write(true).open(name) {
                 Ok(connection) => break connection,
                 Err(error) if Instant::now() < deadline => {
@@ -140,6 +154,21 @@ impl NamedPipeClient {
                 Err(error) => return Err(error.into()),
             }
         };
+        let mode = NAMED_PIPE_MODE(PIPE_READMODE_BYTE.0 | PIPE_NOWAIT.0);
+        // SAFETY: the file owns a connected named-pipe handle and mode is live
+        // for the duration of this synchronous call.
+        unsafe {
+            SetNamedPipeHandleState(
+                HANDLE(connection.as_raw_handle()),
+                Some(&raw const mode),
+                None,
+                None,
+            )
+        }?;
+        let mut connection = TimedClientConnection {
+            file: connection,
+            io_deadline: deadline,
+        };
 
         write_frame(&mut connection, request)?;
         let response: Response = read_frame(&mut connection)?;
@@ -155,91 +184,229 @@ impl NamedPipeClient {
                 actual: response.request_id,
             });
         }
+        // Acknowledging after the complete frame lets the server close without
+        // FlushFileBuffers, whose semantics otherwise permit a client to block
+        // the service thread indefinitely.
+        let _ = connection.write_all(&[0]);
         Ok(response)
+    }
+}
+
+struct TimedClientConnection {
+    file: File,
+    io_deadline: Instant,
+}
+
+impl TimedClientConnection {
+    fn wait_until_deadline(&self) -> io::Result<()> {
+        if Instant::now() >= self.io_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "named-pipe service did not complete its response in time",
+            ));
+        }
+        thread::sleep(IO_RETRY_DELAY);
+        Ok(())
+    }
+
+    fn wait_for_io(&self, error: &io::Error) -> io::Result<()> {
+        if !matches!(
+            error.raw_os_error(),
+            Some(code) if code == ERROR_NO_DATA.0 as i32 || code == ERROR_PIPE_LISTENING.0 as i32
+        ) {
+            return Err(io::Error::new(error.kind(), error.to_string()));
+        }
+        self.wait_until_deadline()
+    }
+}
+
+impl Read for TimedClientConnection {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.file.read(buffer) {
+                Ok(0) => self.wait_until_deadline()?,
+                Ok(read) => return Ok(read),
+                Err(error) => self.wait_for_io(&error)?,
+            }
+        }
+    }
+}
+
+impl Write for TimedClientConnection {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        loop {
+            match self.file.write(buffer) {
+                Ok(0) => self.wait_until_deadline()?,
+                Ok(written) => return Ok(written),
+                Err(error) => self.wait_for_io(&error)?,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
 struct PipeConnection {
     handle: HANDLE,
+    io_deadline: Instant,
 }
 
 impl PipeConnection {
+    fn reset_deadline(&mut self) {
+        self.io_deadline = Instant::now() + SERVER_IO_TIMEOUT;
+    }
+
+    fn wait_until_deadline(&self) -> io::Result<()> {
+        if Instant::now() >= self.io_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "named-pipe client did not complete its I/O in time",
+            ));
+        }
+        thread::sleep(IO_RETRY_DELAY);
+        Ok(())
+    }
+
     fn client_identity(&self) -> Result<ClientIdentity, NamedPipeError> {
         // SAFETY: handle is a connected server pipe. The guard always reverts
         // this thread before it handles another client.
         unsafe { ImpersonateNamedPipeClient(self.handle) }?;
-        let _guard = ImpersonationGuard;
+        let guard = ImpersonationGuard { active: true };
+        let identity = (|| {
+            let mut sid_buffer = [0_u8; SECURITY_MAX_SID_SIZE as usize];
+            let mut sid_size = SECURITY_MAX_SID_SIZE;
+            let administrator_sid = PSID(sid_buffer.as_mut_ptr().cast::<c_void>());
+            // SAFETY: sid_buffer is SECURITY_MAX_SID_SIZE bytes and remains live.
+            unsafe {
+                CreateWellKnownSid(
+                    WinBuiltinAdministratorsSid,
+                    None,
+                    Some(administrator_sid),
+                    &raw mut sid_size,
+                )
+            }?;
 
-        let mut sid_buffer = [0_u8; SECURITY_MAX_SID_SIZE as usize];
-        let mut sid_size = SECURITY_MAX_SID_SIZE;
-        let administrator_sid = PSID(sid_buffer.as_mut_ptr().cast::<c_void>());
-        // SAFETY: sid_buffer is SECURITY_MAX_SID_SIZE bytes and remains live.
-        unsafe {
-            CreateWellKnownSid(
-                WinBuiltinAdministratorsSid,
-                None,
-                Some(administrator_sid),
-                &raw mut sid_size,
-            )
-        }?;
+            let mut is_member = BOOL::default();
+            // SAFETY: None checks the current impersonation token. SID and output
+            // pointers remain valid through the call.
+            unsafe { CheckTokenMembership(None, administrator_sid, &raw mut is_member) }?;
+            Ok(ClientIdentity {
+                is_elevated_administrator: is_member.as_bool(),
+            })
+        })();
+        guard.revert()?;
+        identity
+    }
 
-        let mut is_member = BOOL::default();
-        // SAFETY: None checks the current impersonation token. SID and output
-        // pointers remain valid through the call.
-        unsafe { CheckTokenMembership(None, administrator_sid, &raw mut is_member) }?;
-        Ok(ClientIdentity {
-            is_elevated_administrator: is_member.as_bool(),
-        })
+    fn wait_for_io(&self, error: &WindowsError) -> io::Result<()> {
+        let code = error.code();
+        if code != HRESULT::from_win32(ERROR_NO_DATA.0)
+            && code != HRESULT::from_win32(ERROR_PIPE_LISTENING.0)
+        {
+            return Err(io::Error::other(error.clone()));
+        }
+        self.wait_until_deadline()
+    }
+
+    fn wait_for_response_consumption(&mut self) -> io::Result<()> {
+        let mut acknowledgement = [0_u8; 1];
+        loop {
+            let mut bytes_read = 0_u32;
+            // SAFETY: handle is live and acknowledgement is writable.
+            match unsafe {
+                ReadFile(
+                    self.handle,
+                    Some(&mut acknowledgement),
+                    Some(&raw mut bytes_read),
+                    None,
+                )
+            } {
+                Ok(()) if bytes_read > 0 => return Ok(()),
+                Ok(()) => self.wait_until_deadline()?,
+                Err(error)
+                    if error.code() == HRESULT::from_win32(ERROR_BROKEN_PIPE.0)
+                        || error.code() == HRESULT::from_win32(ERROR_PIPE_NOT_CONNECTED.0) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => self.wait_for_io(&error)?,
+            }
+        }
     }
 }
 
 impl Read for PipeConnection {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let mut bytes_read = 0_u32;
-        // SAFETY: handle is live and buffer is writable for its full length.
-        unsafe { ReadFile(self.handle, Some(buffer), Some(&raw mut bytes_read), None) }
-            .map_err(io::Error::other)?;
-        Ok(bytes_read as usize)
+        loop {
+            // SAFETY: handle is live and buffer is writable for its full length.
+            match unsafe { ReadFile(self.handle, Some(buffer), Some(&raw mut bytes_read), None) } {
+                Ok(()) if bytes_read == 0 => self.wait_until_deadline()?,
+                Ok(()) => return Ok(bytes_read as usize),
+                Err(error) => self.wait_for_io(&error)?,
+            }
+        }
     }
 }
 
 impl Write for PipeConnection {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let mut bytes_written = 0_u32;
-        // SAFETY: handle is live and buffer is readable for its full length.
-        unsafe {
-            WriteFile(
-                self.handle,
-                Some(buffer),
-                Some(&raw mut bytes_written),
-                None,
-            )
+        loop {
+            // SAFETY: handle is live and buffer is readable for its full length.
+            match unsafe {
+                WriteFile(
+                    self.handle,
+                    Some(buffer),
+                    Some(&raw mut bytes_written),
+                    None,
+                )
+            } {
+                Ok(()) if bytes_written == 0 => self.wait_until_deadline()?,
+                Ok(()) => return Ok(bytes_written as usize),
+                Err(error) => self.wait_for_io(&error)?,
+            }
         }
-        .map_err(io::Error::other)?;
-        Ok(bytes_written as usize)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // SAFETY: handle is a live writable pipe handle.
-        unsafe { FlushFileBuffers(self.handle) }.map_err(io::Error::other)
+        // FlushFileBuffers waits indefinitely for the client to consume every
+        // response byte. Writes are already synchronous, and closing the server
+        // handle preserves buffered bytes for the client without allowing a
+        // connected client to stall the single request loop.
+        Ok(())
     }
 }
 
 impl Drop for PipeConnection {
     fn drop(&mut self) {
-        // SAFETY: this type exclusively owns the server pipe handle.
-        let _ = unsafe { DisconnectNamedPipe(self.handle) };
-        // SAFETY: the disconnected handle is no longer used after this point.
+        // SAFETY: this type exclusively owns the server pipe handle. Closing
+        // leaves already-written response bytes readable by the client.
         let _ = unsafe { CloseHandle(self.handle) };
     }
 }
 
-struct ImpersonationGuard;
+struct ImpersonationGuard {
+    active: bool,
+}
+
+impl ImpersonationGuard {
+    fn revert(mut self) -> Result<(), WindowsError> {
+        // SAFETY: the guard is constructed only after successful impersonation.
+        unsafe { RevertToSelf() }?;
+        self.active = false;
+        Ok(())
+    }
+}
 
 impl Drop for ImpersonationGuard {
     fn drop(&mut self) {
-        // SAFETY: constructed only after successful named-pipe impersonation.
-        let _ = unsafe { RevertToSelf() };
+        if self.active {
+            // SAFETY: an active guard follows successful named-pipe impersonation.
+            let _ = unsafe { RevertToSelf() };
+        }
     }
 }
 
@@ -346,5 +513,84 @@ mod tests {
                 message: "request received".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn client_response_wait_observes_the_requested_timeout() {
+        let pipe_name = format!(
+            r"\\.\pipe\ResticPal.Test.{}.{}",
+            std::process::id(),
+            NEXT_PIPE.fetch_add(1, Ordering::Relaxed)
+        );
+        let server_name = pipe_name.clone();
+        let server = thread::spawn(move || {
+            let _ = NamedPipeServer::new(&server_name)
+                .expect("server should initialize")
+                .serve_one(|request, _identity| {
+                    thread::sleep(Duration::from_millis(300));
+                    Response::new(
+                        request.request_id,
+                        ResponsePayload::Accepted {
+                            message: "late response".to_owned(),
+                        },
+                    )
+                });
+        });
+        let request = Request::new(124, RequestCommand::GetStatus);
+        let started = Instant::now();
+
+        let result = NamedPipeClient::request_at(&pipe_name, &request, Duration::from_millis(100));
+
+        assert!(matches!(
+            result,
+            Err(NamedPipeError::Frame(FrameError::Io(ref error)))
+                if error.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn server_accepts_a_request_split_across_multiple_writes() {
+        let pipe_name = format!(
+            r"\\.\pipe\ResticPal.Test.{}.{}",
+            std::process::id(),
+            NEXT_PIPE.fetch_add(1, Ordering::Relaxed)
+        );
+        let server_name = pipe_name.clone();
+        let server = thread::spawn(move || {
+            NamedPipeServer::new(&server_name)
+                .expect("server should initialize")
+                .serve_one(|request, _identity| {
+                    Response::new(
+                        request.request_id,
+                        ResponsePayload::Accepted {
+                            message: "split request received".to_owned(),
+                        },
+                    )
+                })
+                .expect("split request should complete");
+        });
+        let request = Request::new(125, RequestCommand::GetStatus);
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &request).expect("request frame");
+        let mut client = loop {
+            match OpenOptions::new().read(true).write(true).open(&pipe_name) {
+                Ok(client) => break client,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    thread::sleep(CONNECT_RETRY_DELAY);
+                }
+                Err(error) => panic!("client should connect: {error}"),
+            }
+        };
+
+        client.write_all(&frame[..4]).expect("frame header");
+        thread::sleep(Duration::from_millis(100));
+        client.write_all(&frame[4..]).expect("frame payload");
+        let response: Response = read_frame(&mut client).expect("response");
+        client.write_all(&[0]).expect("response acknowledgement");
+        server.join().expect("server thread should finish");
+
+        assert_eq!(response.request_id, request.request_id);
     }
 }

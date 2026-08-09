@@ -33,6 +33,7 @@ use crate::power_request::TimedSystemPowerRequest;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REPOSITORY_OPERATION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_PROGRESS_EVENTS: usize = 16;
 const INHERITED_ENVIRONMENT: &[&str] = &[
     "SystemRoot",
     "TEMP",
@@ -82,7 +83,9 @@ impl DpapiSecretResolver {
 impl SecretResolver for DpapiSecretResolver {
     fn resolve(&self, reference: &str) -> Result<Zeroizing<String>, SecretResolveError> {
         let bytes = self.store.get(reference).map_err(|_| SecretResolveError)?;
-        let value = String::from_utf8(bytes.to_vec()).map_err(|_| SecretResolveError)?;
+        let value = std::str::from_utf8(&bytes)
+            .map_err(|_| SecretResolveError)?
+            .to_owned();
         if value.contains('\0') {
             return Err(SecretResolveError);
         }
@@ -197,6 +200,8 @@ impl ResticExecutor {
             Ok(child) => child,
             Err(_) => return RepositoryOutcome::failed("restic_start_failed"),
         };
+        drop(command);
+        drop(secret_environment);
         if job.assign(&child).is_err() {
             let _ = child.kill();
             let _ = child.wait();
@@ -217,17 +222,18 @@ impl ResticExecutor {
         let mut cancelled = false;
         let mut timed_out = false;
         let status = loop {
-            if cancellation.is_cancelled() && !cancelled {
-                cancelled = true;
-                let _ = job.terminate();
-            } else if started.elapsed() >= timeout && !timed_out {
-                timed_out = true;
-                let _ = job.terminate();
-            }
-
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
-                Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
+                Ok(None) => {
+                    if cancellation.is_cancelled() && !cancelled {
+                        cancelled = true;
+                        let _ = job.terminate();
+                    } else if started.elapsed() >= timeout && !timed_out {
+                        timed_out = true;
+                        let _ = job.terminate();
+                    }
+                    thread::sleep(PROCESS_POLL_INTERVAL);
+                }
                 Err(_) => {
                     let _ = job.terminate();
                     break Err(());
@@ -288,6 +294,8 @@ impl ResticExecutor {
             Ok(child) => child,
             Err(_) => return BackupOutcome::failed("restic_start_failed"),
         };
+        drop(command);
+        drop(secret_environment);
         if job.assign(&child).is_err() {
             let _ = child.kill();
             let _ = child.wait();
@@ -302,22 +310,23 @@ impl ResticExecutor {
             Some(stderr) => stderr,
             None => return BackupOutcome::failed("restic_output_unavailable"),
         };
-        let (output_tx, output_rx) = mpsc::channel();
+        let (output_tx, output_rx) = mpsc::sync_channel(MAX_PENDING_PROGRESS_EVENTS);
         let stdout_thread = thread::spawn(move || read_json_output(stdout, &output_tx));
         let stderr_thread = thread::spawn(move || drain(stderr));
 
         let mut cancelled = false;
-        let mut parsed = ParsedOutput::default();
         let status = loop {
-            collect_output_events(&output_rx, &mut on_progress, &mut parsed);
-            if cancellation.is_cancelled() && !cancelled {
-                cancelled = true;
-                let _ = job.terminate();
-            }
+            collect_progress_events(&output_rx, &mut on_progress);
 
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
-                Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
+                Ok(None) => {
+                    if cancellation.is_cancelled() && !cancelled {
+                        cancelled = true;
+                        let _ = job.terminate();
+                    }
+                    thread::sleep(PROCESS_POLL_INTERVAL);
+                }
                 Err(_) => {
                     let _ = job.terminate();
                     break Err(());
@@ -327,7 +336,7 @@ impl ResticExecutor {
 
         let output_result = stdout_thread.join().unwrap_or(Err(OutputReadError));
         let _ = stderr_thread.join();
-        collect_output_events(&output_rx, &mut on_progress, &mut parsed);
+        collect_progress_events(&output_rx, &mut on_progress);
         if cancelled {
             return BackupOutcome::cancelled();
         }
@@ -335,7 +344,7 @@ impl ResticExecutor {
             Ok(status) => status,
             Err(()) => return BackupOutcome::failed("restic_wait_failed"),
         };
-        finish_outcome(status, output_result, parsed)
+        finish_outcome(status, output_result)
     }
 
     fn resolve_secrets(
@@ -408,11 +417,9 @@ impl BackupOutcome {
         }
     }
 
-    pub(crate) fn failed(code: &str) -> Self {
+    pub(crate) fn failed(code: impl Into<String>) -> Self {
         Self {
-            kind: BackupOutcomeKind::Failed {
-                code: code.to_owned(),
-            },
+            kind: BackupOutcomeKind::Failed { code: code.into() },
             summary: None,
         }
     }
@@ -469,27 +476,29 @@ pub enum RepositoryOutcomeKind {
 
 fn finish_outcome(
     status: ExitStatus,
-    output_result: Result<(), OutputReadError>,
-    parsed: ParsedOutput,
+    output_result: Result<ParsedOutput, OutputReadError>,
 ) -> BackupOutcome {
     if status.code() == Some(130) {
         return BackupOutcome::cancelled();
     }
-    if output_result.is_err() || parsed.invalid_message {
+    let Ok(parsed) = output_result else {
+        return BackupOutcome::failed("restic_output_invalid");
+    };
+    if parsed.invalid_message {
         return BackupOutcome::failed("restic_output_invalid");
     }
 
     let Some(summary) = parsed.summary else {
-        return BackupOutcome::failed(if status.success() {
-            "restic_summary_missing"
-        } else {
-            "restic_failed"
-        });
+        return match status.code() {
+            Some(0) => BackupOutcome::failed("restic_summary_missing"),
+            Some(code) => BackupOutcome::failed(format!("restic_exit_{code}")),
+            None => BackupOutcome::failed("restic_terminated"),
+        };
     };
     match status.code() {
         Some(0) => BackupOutcome::succeeded(summary),
         Some(3) => BackupOutcome::warnings(summary),
-        Some(code) => BackupOutcome::failed(&format!("restic_exit_{code}")),
+        Some(code) => BackupOutcome::failed(format!("restic_exit_{code}")),
         None => BackupOutcome::failed("restic_terminated"),
     }
 }
@@ -498,7 +507,6 @@ fn finish_outcome(
 enum OutputEvent {
     Progress(BackupProgress),
     Summary(BackupSummary),
-    Invalid,
 }
 
 #[derive(Debug, Default)]
@@ -507,44 +515,39 @@ struct ParsedOutput {
     invalid_message: bool,
 }
 
-fn collect_output_events(
-    events: &mpsc::Receiver<OutputEvent>,
+fn collect_progress_events(
+    events: &mpsc::Receiver<BackupProgress>,
     on_progress: &mut impl FnMut(BackupProgress),
-    parsed: &mut ParsedOutput,
 ) {
-    for event in events.try_iter() {
-        match event {
-            OutputEvent::Progress(progress) => on_progress(progress),
-            OutputEvent::Summary(summary) => parsed.summary = Some(summary),
-            OutputEvent::Invalid => parsed.invalid_message = true,
-        }
+    for progress in events.try_iter() {
+        on_progress(progress);
     }
 }
 
 fn read_json_output(
     stdout: impl Read,
-    events: &mpsc::Sender<OutputEvent>,
-) -> Result<(), OutputReadError> {
+    progress: &mpsc::SyncSender<BackupProgress>,
+) -> Result<ParsedOutput, OutputReadError> {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
+    let mut parsed = ParsedOutput::default();
     while let Some(valid) =
         read_bounded_line(&mut reader, &mut line).map_err(|_| OutputReadError)?
     {
         if !valid {
-            let _ = events.send(OutputEvent::Invalid);
+            parsed.invalid_message = true;
             continue;
         }
         match parse_output_event(&line) {
-            Ok(Some(event)) => {
-                let _ = events.send(event);
+            Ok(Some(OutputEvent::Progress(update))) => {
+                let _ = progress.try_send(update);
             }
+            Ok(Some(OutputEvent::Summary(summary))) => parsed.summary = Some(summary),
             Ok(None) => {}
-            Err(()) => {
-                let _ = events.send(OutputEvent::Invalid);
-            }
+            Err(()) => parsed.invalid_message = true,
         }
     }
-    Ok(())
+    Ok(parsed)
 }
 
 fn read_bounded_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<Option<bool>> {
@@ -642,7 +645,7 @@ impl KillOnDropJob {
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: limits points to the correctly sized structure for this
         // information class, and handle is owned by this object.
-        unsafe {
+        if let Err(error) = unsafe {
             SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
@@ -650,7 +653,11 @@ impl KillOnDropJob {
                 u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
                     .expect("job information size fits in u32"),
             )
-        }?;
+        } {
+            // SAFETY: handle was created above and has not been transferred.
+            let _ = unsafe { CloseHandle(handle) };
+            return Err(error);
+        }
         Ok(Self { handle })
     }
 
@@ -759,6 +766,28 @@ mod tests {
                 snapshot_id: Some(id),
             }))) if id == "abc123"
         ));
+    }
+
+    #[test]
+    fn progress_floods_are_dropped_without_losing_the_summary() {
+        let mut output = Vec::new();
+        for _ in 0..1_000 {
+            output.extend_from_slice(br#"{"message_type":"status","files_done":1,"bytes_done":2}"#);
+            output.push(b'\n');
+        }
+        output.extend_from_slice(
+            br#"{"message_type":"summary","total_files_processed":3,"total_bytes_processed":4,"data_added":5,"snapshot_id":"bounded"}"#,
+        );
+        output.push(b'\n');
+        let (progress_tx, progress_rx) = mpsc::sync_channel(1);
+
+        let parsed = read_json_output(output.as_slice(), &progress_tx).expect("valid output");
+
+        assert_eq!(progress_rx.try_iter().count(), 1);
+        assert_eq!(
+            parsed.summary.expect("summary").snapshot_id.as_deref(),
+            Some("bounded")
+        );
     }
 
     #[test]

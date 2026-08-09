@@ -52,14 +52,26 @@ pub enum ScheduleBlocker {
 }
 
 #[must_use]
+pub fn completion_deadline(
+    last_success: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    interval_hours: u32,
+) -> DateTime<Utc> {
+    last_success
+        .and_then(|completed| {
+            completed.checked_add_signed(Duration::hours(i64::from(interval_hours)))
+        })
+        .unwrap_or(now)
+}
+
+#[must_use]
 pub fn decide(config: &ScheduleConfig, snapshot: &SchedulerSnapshot) -> ScheduleDecision {
     if snapshot.backup_running {
         return ScheduleDecision::AlreadyRunning;
     }
 
-    let scheduled_deadline = snapshot.last_success.map_or(snapshot.now, |last_success| {
-        last_success + Duration::hours(i64::from(config.interval_hours))
-    });
+    let scheduled_deadline =
+        completion_deadline(snapshot.last_success, snapshot.now, config.interval_hours);
     let next_deadline = if snapshot.manual_requested {
         scheduled_deadline
     } else {
@@ -90,7 +102,10 @@ pub fn decide(config: &ScheduleConfig, snapshot: &SchedulerSnapshot) -> Schedule
         && let Some(resumed_at) = snapshot.resumed_at
     {
         let grace_end = resumed_at
-            + Duration::seconds(i64::try_from(config.wake_grace_seconds).unwrap_or(i64::MAX));
+            .checked_add_signed(Duration::seconds(
+                i64::try_from(config.wake_grace_seconds).unwrap_or(i64::MAX),
+            ))
+            .unwrap_or(snapshot.now);
         if snapshot.now < grace_end {
             blockers.push(ScheduleBlocker::WakeGrace);
             retry_at = Some(grace_end);
@@ -256,6 +271,19 @@ mod tests {
         state.last_success = None;
         state.network_available = false;
         state.network_required = false;
+
+        assert_eq!(
+            decide(&ScheduleConfig::default(), &state),
+            ScheduleDecision::Start {
+                trigger: BackupTrigger::Scheduled
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_extreme_timestamps_cannot_panic_the_scheduler() {
+        let mut state = snapshot(timestamp(9, 0));
+        state.last_success = Some(DateTime::<Utc>::MAX_UTC);
 
         assert_eq!(
             decide(&ScheduleConfig::default(), &state),

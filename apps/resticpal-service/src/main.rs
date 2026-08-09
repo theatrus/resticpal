@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use chrono::Utc;
 use conditions::{SystemConditions, WinRtApartment};
@@ -33,11 +34,14 @@ use windows_service::service::{
     PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
     ServiceStatus as ScmServiceStatus, ServiceType,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service_control_handler::{
+    self, ServiceControlHandlerResult, ServiceStatusHandle,
+};
 use windows_service::{Result as ServiceResult, service_dispatcher};
 
 const SERVICE_NAME: &str = "ResticPal";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() -> ExitCode {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
@@ -130,7 +134,11 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
                 "could not load configuration from {}: {error}",
                 config_path.display()
             );
-            Arc::new(ServiceRuntime::configuration_error(event_tx.clone()))
+            Arc::new(ServiceRuntime::configuration_error(
+                &config_path,
+                event_tx.clone(),
+                credential_store.clone(),
+            ))
         }
     };
     start_ipc_server(Arc::clone(&runtime));
@@ -153,7 +161,13 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
         process_id: None,
     })?;
 
-    run_event_loop(&event_rx, Arc::clone(&runtime), executor, event_tx);
+    run_event_loop(
+        &event_rx,
+        Arc::clone(&runtime),
+        executor,
+        event_tx,
+        &status_handle,
+    );
 
     status_handle.set_service_status(ScmServiceStatus {
         service_type: SERVICE_TYPE,
@@ -197,6 +211,7 @@ fn run_event_loop(
     runtime: Arc<ServiceRuntime>,
     executor: ResticExecutor,
     event_sender: mpsc::Sender<RuntimeEvent>,
+    status_handle: &ServiceStatusHandle,
 ) {
     let mut active_backup: Option<CancellationToken> = None;
     let mut active_repository_operation: Option<CancellationToken> = None;
@@ -205,12 +220,29 @@ fn run_event_loop(
         let delay = runtime.next_evaluation_delay(Utc::now());
         match events.recv_timeout(delay) {
             Ok(RuntimeEvent::Stop) | Err(RecvTimeoutError::Disconnected) => {
+                if let Err(error) = status_handle.set_service_status(ScmServiceStatus {
+                    service_type: SERVICE_TYPE,
+                    current_state: ServiceState::StopPending,
+                    controls_accepted: ServiceControlAccept::empty(),
+                    exit_code: ServiceExitCode::Win32(0),
+                    checkpoint: 1,
+                    wait_hint: SHUTDOWN_DRAIN_TIMEOUT,
+                    process_id: None,
+                }) {
+                    eprintln!("could not report pending service shutdown: {error}");
+                }
                 if let Some(cancellation) = &active_backup {
                     cancellation.cancel();
                 }
                 if let Some(cancellation) = &active_repository_operation {
                     cancellation.cancel();
                 }
+                drain_cancelled_operations(
+                    events,
+                    &runtime,
+                    &mut active_backup,
+                    &mut active_repository_operation,
+                );
                 break;
             }
             Ok(RuntimeEvent::RunNow) => {
@@ -269,6 +301,32 @@ fn run_event_loop(
             | Err(RecvTimeoutError::Timeout) => {
                 evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
             }
+        }
+    }
+}
+
+fn drain_cancelled_operations(
+    events: &Receiver<RuntimeEvent>,
+    runtime: &ServiceRuntime,
+    active_backup: &mut Option<CancellationToken>,
+    active_repository_operation: &mut Option<CancellationToken>,
+) {
+    let deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    while (active_backup.is_some() || active_repository_operation.is_some())
+        && Instant::now() < deadline
+    {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match events.recv_timeout(remaining) {
+            Ok(RuntimeEvent::BackupFinished(outcome)) => {
+                runtime.finish_backup(&outcome);
+                *active_backup = None;
+            }
+            Ok(RuntimeEvent::RepositoryOperationFinished { operation, outcome }) => {
+                runtime.finish_repository_operation(operation, &outcome);
+                *active_repository_operation = None;
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
         }
     }
 }

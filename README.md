@@ -27,7 +27,7 @@ The first slice establishes:
 - service control handling for stop, shutdown, resume, power, and time changes;
 - an RAII Windows system-required power request;
 - machine configuration loading with a friendly invalid/unconfigured state;
-- authenticated local IPC using client token impersonation and a protected DACL;
+- authenticated, size- and time-bounded local IPC using client token impersonation and a protected DACL;
 - a native tray icon whose status and run-now command come from the service;
 - an on-demand WinUI application that reads service status and sends run-now requests;
 - direct restic process execution in a kill-on-close Windows Job Object;
@@ -45,7 +45,7 @@ The first slice establishes:
 - transactional DPAPI credential provisioning and rotation with opaque, collision-resistant references and redacted status responses;
 - a policy-aware WinUI repository page for local/network, S3-compatible, and advanced restic backends;
 - asynchronous create/connect repository flows with a hard timeout, service-owned restic execution, and append-only initialization enforcement;
-- a durable repository-validation gate tied to connection fields and credential references, preventing backups after unverified changes;
+- a durable repository-validation gate tied to connection fields and credential references, preventing first use and later backups after unverified changes;
 - elevated, per-field policy-aware schedule configuration with atomic persistence and immediate scheduler reevaluation;
 - a WinUI Schedule page for interval, wake grace, wake-lock timeout, battery, and metered-network behavior;
 - bounded SQLite run history containing only timestamps, outcomes, aggregate counts, sanitized codes, and snapshot identifiers;

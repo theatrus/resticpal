@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::fs;
 
+use resticpal_core::config::{MAX_BACKUP_PATHS, MAX_PATH_CHARACTERS};
 use resticpal_protocol::{DiscoveredBackupSource, DiscoveredSourceKind};
 use thiserror::Error;
 use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
@@ -138,7 +139,7 @@ fn discover_from_profiles(
     let mut seen = BTreeSet::new();
     let mut sources = Vec::new();
 
-    for profile in profiles {
+    'profiles: for profile in profiles {
         if !is_candidate_profile(&profile) || !profile.is_dir() {
             continue;
         }
@@ -148,12 +149,18 @@ fn discover_from_profiles(
         for (kind, folder_name) in standard_folders() {
             let path = profile.join(folder_name);
             let key = path.to_string_lossy().to_lowercase();
-            if path.is_dir() && seen.insert(key) {
+            if path.is_dir()
+                && path.to_string_lossy().encode_utf16().count() <= MAX_PATH_CHARACTERS
+                && seen.insert(key)
+            {
                 sources.push(DiscoveredBackupSource {
                     profile_name: profile_name.clone(),
                     kind,
                     path,
                 });
+                if sources.len() == MAX_BACKUP_PATHS {
+                    break 'profiles;
+                }
             }
         }
     }
@@ -176,7 +183,8 @@ fn is_candidate_profile(path: &Path) -> bool {
         return false;
     }
     let value = path.to_string_lossy().replace('/', r"\").to_lowercase();
-    !value.contains(r"\windows\system32\config\systemprofile")
+    !value.starts_with(r"\\")
+        && !value.contains(r"\windows\system32\config\systemprofile")
         && !value.contains(r"\windows\serviceprofiles\")
         && !matches!(
             path.file_name()
@@ -240,11 +248,29 @@ mod tests {
             r"C:\Windows\System32\config\systemprofile"
         )));
         assert!(!is_candidate_profile(Path::new(r"C:\Users\Public")));
+        assert!(!is_candidate_profile(Path::new(
+            r"\\server\profiles\Example"
+        )));
         assert!(is_candidate_profile(Path::new(r"D:\Profiles\Yann")));
     }
 
     #[test]
     fn trims_registry_string_terminators() {
         assert_eq!(trim_null(&[b'a' as u16, b'b' as u16, 0, 0]), &[97, 98]);
+    }
+
+    #[test]
+    fn discovery_is_bounded_to_the_configuration_limit() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut profiles = Vec::new();
+        for index in 0..=MAX_BACKUP_PATHS {
+            let profile = directory.path().join(format!("User{index:03}"));
+            fs::create_dir_all(profile.join("Desktop")).expect("desktop");
+            profiles.push(profile);
+        }
+
+        let sources = discover_from_profiles(profiles).expect("discovery");
+
+        assert_eq!(sources.len(), MAX_BACKUP_PATHS);
     }
 }

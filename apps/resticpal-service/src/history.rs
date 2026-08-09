@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use resticpal_core::status::{BackupRunOutcome, BackupRunRecord};
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OpenFlags, Transaction, params};
 use thiserror::Error;
 
 const HISTORY_SCHEMA_VERSION: i64 = 1;
@@ -28,6 +28,9 @@ impl BackupHistoryStore {
         let transaction = connection.transaction()?;
         let error_code = run.error_code.as_deref().and_then(sanitize_identifier);
         let snapshot_id = run.snapshot_id.as_deref().and_then(sanitize_identifier);
+        let files_processed = run.files_processed.map(normalize_sql_unsigned);
+        let bytes_processed = run.bytes_processed.map(normalize_sql_unsigned);
+        let data_added = run.data_added.map(normalize_sql_unsigned);
         transaction.execute(
             "INSERT INTO backup_runs (
                 started_at_ms, completed_at_ms, outcome, error_code,
@@ -38,9 +41,9 @@ impl BackupHistoryStore {
                 run.completed_at.timestamp_millis(),
                 outcome_name(run.outcome),
                 error_code,
-                run.files_processed.map(to_sql_integer),
-                run.bytes_processed.map(to_sql_integer),
-                run.data_added.map(to_sql_integer),
+                files_processed.map(to_sql_integer),
+                bytes_processed.map(to_sql_integer),
+                data_added.map(to_sql_integer),
                 snapshot_id,
             ],
         )?;
@@ -55,9 +58,9 @@ impl BackupHistoryStore {
             completed_at: timestamp(run.completed_at.timestamp_millis())?,
             outcome: run.outcome,
             error_code,
-            files_processed: run.files_processed,
-            bytes_processed: run.bytes_processed,
-            data_added: run.data_added,
+            files_processed,
+            bytes_processed,
+            data_added,
             snapshot_id,
         })
     }
@@ -102,7 +105,13 @@ impl BackupHistoryStore {
     }
 
     fn connection(&self) -> Result<Connection, HistoryError> {
-        let connection = Connection::open(&self.path)?;
+        let connection = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         connection.busy_timeout(Duration::from_secs(2))?;
         Ok(connection)
     }
@@ -248,6 +257,10 @@ fn to_sql_integer(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn normalize_sql_unsigned(value: u64) -> u64 {
+    value.min(i64::MAX as u64)
+}
+
 fn from_sql_integer(value: i64, field: &'static str) -> Result<u64, HistoryError> {
     u64::try_from(value).map_err(|_| HistoryError::InvalidUnsignedValue(field))
 }
@@ -343,6 +356,20 @@ mod tests {
         let reloaded = store.recent(1).expect("reloaded history");
         assert_eq!(reloaded[0].error_code, None);
         assert_eq!(reloaded[0].snapshot_id, None);
+    }
+
+    #[test]
+    fn counters_are_normalized_consistently_with_sqlite_storage() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = BackupHistoryStore::next_to_config(&directory.path().join("config.toml"));
+        let mut oversized = run(Utc::now(), BackupRunOutcome::Succeeded);
+        oversized.files_processed = Some(u64::MAX);
+
+        let stored = store.append(oversized).expect("stored run");
+        let reloaded = store.recent(1).expect("reloaded run");
+
+        assert_eq!(stored.files_processed, Some(i64::MAX as u64));
+        assert_eq!(reloaded[0].files_processed, stored.files_processed);
     }
 
     #[test]

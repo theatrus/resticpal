@@ -9,6 +9,8 @@ use crate::config::{
     RepositoryConfig, RepositoryMode, RetentionConfig, ScheduleConfig, SecretEnvironmentVariable,
 };
 
+pub const MAX_POLICY_REVISION_CHARACTERS: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ManagedPolicy {
@@ -143,6 +145,13 @@ pub fn resolve_config(
         && policy.schema_version != CONFIG_SCHEMA_VERSION
     {
         return Err(PolicyError::UnsupportedManagedSchema(policy.schema_version));
+    }
+    if let Some(policy) = managed
+        && (policy.revision.trim().is_empty()
+            || policy.revision.chars().count() > MAX_POLICY_REVISION_CHARACTERS
+            || policy.revision.contains(['\0', '\r', '\n']))
+    {
+        return Err(PolicyError::InvalidManagedRevision);
     }
 
     let mut fields = BTreeMap::new();
@@ -320,6 +329,8 @@ pub enum PolicyError {
     UnsupportedLocalSchema(u32),
     #[error("unsupported managed policy schema {0}")]
     UnsupportedManagedSchema(u32),
+    #[error("managed policy revision must be a non-empty single-line value within the size limit")]
+    InvalidManagedRevision,
     #[error(transparent)]
     InvalidEffectiveConfig(#[from] ConfigValidationError),
 }
@@ -364,6 +375,21 @@ mod tests {
     }
 
     #[test]
+    fn managed_policy_requires_a_bounded_revision() {
+        let local = LocalConfig::default();
+        for revision in [String::new(), "bad\nrevision".to_owned(), "x".repeat(257)] {
+            let policy = ManagedPolicy {
+                revision,
+                ..ManagedPolicy::default()
+            };
+            assert_eq!(
+                resolve_config(&EffectiveConfig::default(), &local, Some(&policy)),
+                Err(PolicyError::InvalidManagedRevision)
+            );
+        }
+    }
+
+    #[test]
     fn local_value_wins_over_unlocked_managed_recommendation() {
         let local = LocalConfig {
             schedule: LocalScheduleConfig {
@@ -373,6 +399,7 @@ mod tests {
             ..LocalConfig::default()
         };
         let policy = ManagedPolicy {
+            revision: "policy-1".to_owned(),
             schedule: ManagedSchedulePolicy {
                 allow_on_battery: managed(true, false),
                 ..ManagedSchedulePolicy::default()
@@ -393,6 +420,7 @@ mod tests {
     #[test]
     fn unlocked_managed_value_fills_an_absent_local_value() {
         let policy = ManagedPolicy {
+            revision: "policy-1".to_owned(),
             repository: ManagedRepositoryPolicy {
                 mode: managed(RepositoryMode::AppendOnly, false),
                 ..ManagedRepositoryPolicy::default()
@@ -424,6 +452,7 @@ mod tests {
             ..LocalConfig::default()
         };
         let policy = ManagedPolicy {
+            revision: "policy-1".to_owned(),
             repository: ManagedRepositoryPolicy {
                 url: managed(None, true),
                 ..ManagedRepositoryPolicy::default()

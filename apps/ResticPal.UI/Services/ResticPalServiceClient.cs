@@ -338,6 +338,22 @@ internal sealed class ResticPalServiceClient
                 $"Service response ID {responseId} did not match request ID {requestId}.");
         }
 
+        // The service uses this one-byte transport acknowledgement instead of
+        // FlushFileBuffers, which would let a connected client stall its IPC
+        // request loop indefinitely. A complete response remains valid if the
+        // peer closes before the best-effort acknowledgement is written.
+        header[0] = 0;
+        try
+        {
+            await pipe.WriteAsync(header.AsMemory(0, 1), timeout.Token);
+        }
+        catch (IOException)
+        {
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
         return root.GetProperty("payload").Clone();
     }
 

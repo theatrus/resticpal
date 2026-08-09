@@ -19,6 +19,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     pub protocol_version: u32,
     pub request_id: u64,
@@ -37,7 +38,7 @@ impl Request {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequestCommand {
     GetStatus,
     GetRunHistory {
@@ -75,6 +76,7 @@ pub enum RequestCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Response {
     pub protocol_version: u32,
     pub request_id: u64,
@@ -106,7 +108,7 @@ impl Response {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResponsePayload {
     Status {
         status: ServiceStatus,
@@ -136,6 +138,7 @@ pub enum ResponsePayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupSourcesView {
     pub paths: Vec<PathBuf>,
     pub exclusions: Vec<String>,
@@ -144,6 +147,7 @@ pub struct BackupSourcesView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoveredBackupSource {
     pub profile_name: String,
     pub kind: DiscoveredSourceKind,
@@ -161,6 +165,7 @@ pub enum DiscoveredSourceKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryView {
     pub display_name: Option<String>,
     pub url: Option<String>,
@@ -183,7 +188,7 @@ pub enum RepositoryOperationKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RepositoryOperationStatus {
     NotRun,
     ValidationRequired,
@@ -202,6 +207,7 @@ pub enum RepositoryOperationStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScheduleView {
     pub interval_hours: u32,
     pub wake_grace_seconds: u64,
@@ -216,7 +222,7 @@ pub struct ScheduleView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RepositorySecretUpdate {
     Set {
         variable: SecretEnvironmentVariable,
@@ -492,5 +498,23 @@ mod tests {
         let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn exact_protocol_rejects_unknown_fields() {
+        let top_level = r#"{
+            "protocol_version": 2,
+            "request_id": 1,
+            "command": { "type": "get_status" },
+            "future_field": true
+        }"#;
+        assert!(serde_json::from_str::<Request>(top_level).is_err());
+
+        let command = r#"{
+            "protocol_version": 2,
+            "request_id": 1,
+            "command": { "type": "defer_backup", "minutes": 30, "future_field": true }
+        }"#;
+        assert!(serde_json::from_str::<Request>(command).is_err());
     }
 }

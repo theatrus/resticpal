@@ -61,6 +61,9 @@ impl ScheduleStateStore {
             repository_verified_at: state.repository_verified_at,
         })?;
         contents.push(b'\n');
+        if contents.len() as u64 > MAX_STATE_BYTES {
+            return Err(StateStoreError::TooLarge);
+        }
         atomic_file::replace(&self.path, &contents, "state")?;
         Ok(())
     }
@@ -76,11 +79,12 @@ pub struct ServiceStateSnapshot {
 
 impl ServiceStateSnapshot {
     pub fn repository_requires_validation(&self, config: &EffectiveConfig) -> bool {
-        self.repository_validation_required
-            || self
-                .verified_repository
-                .as_ref()
-                .is_some_and(|verified| verified != &RepositoryIdentity::from_config(config))
+        config.repository.url.is_some()
+            && (self.repository_validation_required
+                || self
+                    .verified_repository
+                    .as_ref()
+                    .is_none_or(|verified| verified != &RepositoryIdentity::from_config(config)))
     }
 
     pub fn require_repository_validation(&mut self) {
@@ -224,5 +228,27 @@ mod tests {
 
         config.repository.url = Some("local:D:/replacement".to_owned());
         assert!(loaded.repository_requires_validation(&config));
+    }
+
+    #[test]
+    fn a_configured_repository_is_unverified_without_durable_evidence() {
+        let mut config = EffectiveConfig::default();
+        assert!(!ServiceStateSnapshot::default().repository_requires_validation(&config));
+
+        config.repository.url = Some("local:C:/backup".to_owned());
+        assert!(ServiceStateSnapshot::default().repository_requires_validation(&config));
+    }
+
+    #[test]
+    fn oversized_state_is_rejected_before_replacement() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ScheduleStateStore::next_to_config(&directory.path().join("config.toml"));
+        let mut config = EffectiveConfig::default();
+        config.repository.url = Some("x".repeat(MAX_STATE_BYTES as usize));
+        let mut state = ServiceStateSnapshot::default();
+        state.mark_repository_verified(&config, Utc::now());
+
+        assert!(matches!(store.save(&state), Err(StateStoreError::TooLarge)));
+        assert!(!directory.path().join("state.json").exists());
     }
 }

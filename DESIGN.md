@@ -6,13 +6,13 @@ This document records the product requirements, architecture decisions, and curr
 
 ## Implementation status
 
-The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10. The automated baseline is 94 Rust tests plus a warning-free WinUI build. It is a development build, not an installable or production-qualified release.
+The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10. The automated baseline is 109 Rust tests plus a warning-free WinUI build. It is a development build, not an installable or production-qualified release.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
 | Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, and append-only command authorization | Signed managed-policy ingestion, policy freshness/replay handling, and standard-mode retention execution |
-| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository credentials, atomic UI-driven configuration, repository create/validate, scheduler checkpoint, and bounded SQLite history | Installer-created service identity/ACL validation, direct-file watching, structured logs/audit, graceful cancellation before escalation, and production VSS testing |
-| Local IPC | Protocol v2, 1 MiB bounded frames, protected named pipe, client-token authorization, ordinary-user status/history/run/cancel/defer, and elevated configuration operations | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v2 |
+| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler checkpoint, bounded SQLite history, and bounded shutdown outcome draining | Installer-created service identity/ACL validation, direct-file watching, structured logs/audit, graceful cancellation before escalation, and production VSS testing |
+| Local IPC | Protocol v2, 1 MiB bounded frames, bounded per-connection I/O, protected named pipe, client-token authorization, ordinary-user status/history/run/cancel/defer, and elevated configuration operations | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v2 |
 | Tray | Native Win32 notification icon, current status tooltip, run/cancel action, and elevated UI launch | Push-driven live icon updates, deferral UI, notifications, richer health icons, and startup registration |
 | WinUI application | Overview, backup sources, repository, schedule/power/network, and bounded backup-history pages | Diagnostics/logs, enrollment/managed-policy, updates/settings, accessibility and Windows 10 qualification |
 | Remote management | Typed managed-policy data model and lock-aware service/UI paths | Enrollment, device keys, signed policy cache, credential bootstrap, metadata/API schemas, and status delivery |
@@ -146,7 +146,7 @@ Service-to-client communication uses a versioned protocol over Windows named pip
 - Ordinary users may request `run now`, defer one run, or cancel one run unless the applicable action is locked by managed policy.
 - The protocol exposes typed operations, not arbitrary executable paths, environment variables, or restic arguments.
 - Progress is currently returned in status snapshots. A future subscription channel will push rate-limited status/progress changes without continuous polling.
-- Messages have explicit protocol versions and bounded sizes.
+- Messages have explicit protocol versions, reject unknown fields within a version, and have bounded sizes and per-connection I/O time.
 
 The pipe DACL, connecting-token impersonation, elevated-administrator checks, frame bounds, request IDs, and exact protocol-version checks are implemented and covered by Windows tests. Configuration reads are currently administrator-only because they expose machine configuration such as source paths and repository URLs; ordinary users receive only the redacted canonical status and sanitized history.
 
@@ -205,7 +205,7 @@ The implemented UI offers friendly local/network and S3-compatible choices plus 
 - Azure, Google Cloud Storage, Backblaze B2, and other native restic backends;
 - rclone-backed repositories.
 
-Repository changes that affect connectivity invalidate a durable verification gate. Backups remain blocked until the service successfully runs the allowlisted connection test or repository initialization. Initialization has a hard timeout and is prohibited in append-only mode.
+The first use of a configured repository, and any later change that affects connectivity, requires durable verification. Backups remain blocked until the service successfully runs the allowlisted connection test or repository initialization. Initialization has a hard timeout and is prohibited in append-only mode.
 
 Repository URLs and non-secret options may live in policy. Passwords, access keys, secret keys, tokens, and private key material live only in the protected credential store and are referenced by opaque secret IDs.
 
