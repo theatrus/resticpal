@@ -1,4 +1,6 @@
+mod atomic_file;
 mod conditions;
+mod config_store;
 mod executor;
 mod power_request;
 mod runtime;
@@ -218,7 +220,8 @@ fn run_event_loop(
             Ok(
                 RuntimeEvent::PowerStatusChanged
                 | RuntimeEvent::TimeChanged
-                | RuntimeEvent::Deferred,
+                | RuntimeEvent::Deferred
+                | RuntimeEvent::ConfigurationChanged,
             )
             | Err(RecvTimeoutError::Timeout) => {
                 evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);

@@ -11,6 +11,7 @@
         Loaded="NavigationView_Loaded"
         PaneDisplayMode="Left"
         PaneTitle="resticpal"
+        SelectionChanged="NavigationView_SelectionChanged"
         SelectedItem="{x:Bind OverviewItem}">
         <NavigationView.MenuItems>
             <NavigationViewItem x:Name="OverviewItem" Content="Overview" Tag="overview">
@@ -18,7 +19,7 @@
                     <SymbolIcon Symbol="Home" />
                 </NavigationViewItem.Icon>
             </NavigationViewItem>
-            <NavigationViewItem Content="Backup sources" Tag="sources">
+            <NavigationViewItem x:Name="SourcesItem" Content="Backup sources" Tag="sources">
                 <NavigationViewItem.Icon>
                     <SymbolIcon Symbol="Folder" />
                 </NavigationViewItem.Icon>
@@ -40,61 +41,146 @@
             </NavigationViewItem>
         </NavigationView.MenuItems>
 
-        <ScrollViewer>
-            <Grid Padding="32" RowSpacing="20">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                </Grid.RowDefinitions>
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
 
-                <StackPanel Spacing="6">
-                    <TextBlock x:Name="StatusTitle" Style="{StaticResource TitleTextBlockStyle}" Text="Connecting" />
-                    <TextBlock x:Name="StatusDescription"
-                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                        Text="Waiting for the resticpal service"
-                        TextWrapping="Wrap" />
-                </StackPanel>
+            <Grid>
+                <ScrollViewer x:Name="OverviewPanel">
+                    <Grid Padding="32" RowSpacing="20">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
 
-                <Border
-                    Grid.Row="1"
-                    Padding="24"
-                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                    BorderThickness="1"
-                    CornerRadius="8">
-                    <Grid ColumnSpacing="24">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-                        <FontIcon
-                            FontSize="32"
-                            Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
-                            Glyph="&#xE753;" />
-                        <StackPanel Grid.Column="1" Spacing="4">
-                            <TextBlock x:Name="StatusCardTitle" FontSize="18" FontWeight="SemiBold" Text="Service connection pending" />
-                            <TextBlock x:Name="StatusCardDescription"
+                        <StackPanel Spacing="6">
+                            <TextBlock x:Name="StatusTitle" Style="{StaticResource TitleTextBlockStyle}" Text="Connecting" />
+                            <TextBlock x:Name="StatusDescription"
                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="The first implementation slice is ready for named-pipe status wiring."
+                                Text="Waiting for the resticpal service"
                                 TextWrapping="Wrap" />
                         </StackPanel>
+
+                        <Border
+                            Grid.Row="1"
+                            Padding="24"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                            <Grid ColumnSpacing="24">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <FontIcon
+                                    FontSize="32"
+                                    Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
+                                    Glyph="&#xE753;" />
+                                <StackPanel Grid.Column="1" Spacing="4">
+                                    <TextBlock x:Name="StatusCardTitle" FontSize="18" FontWeight="SemiBold" Text="Service connection pending" />
+                                    <TextBlock x:Name="StatusCardDescription"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        Text="Waiting for current protection status."
+                                        TextWrapping="Wrap" />
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="12">
+                            <Button x:Name="RunBackupButton" Click="RunBackupButton_Click" Content="Run backup now" IsEnabled="False" />
+                            <Button x:Name="CancelBackupButton" Click="CancelBackupButton_Click" Content="Cancel backup" IsEnabled="False" />
+                        </StackPanel>
                     </Grid>
-                </Border>
+                </ScrollViewer>
 
-                <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="12">
-                    <Button x:Name="RunBackupButton" Click="RunBackupButton_Click" Content="Run backup now" IsEnabled="False" />
-                    <Button x:Name="CancelBackupButton" Click="CancelBackupButton_Click" Content="Cancel backup" IsEnabled="False" />
-                    <Button Content="Open settings" IsEnabled="False" />
+                <ScrollViewer x:Name="SourcesPanel" Visibility="Collapsed">
+                    <Grid MaxWidth="900" Padding="32" HorizontalAlignment="Left" RowSpacing="20">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Backup sources" />
+                            <TextBlock
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="Choose the folders resticpal protects for this PC. Downloads and cloud-only placeholders are not added automatically."
+                                TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <InfoBar
+                            x:Name="SourcesPolicyMessage"
+                            Grid.Row="1"
+                            IsClosable="False"
+                            IsOpen="False"
+                            Severity="Informational" />
+
+                        <Border
+                            Grid.Row="2"
+                            Padding="16"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                            <ListView
+                                x:Name="BackupPathsList"
+                                MinHeight="180"
+                                ItemsSource="{x:Bind BackupPaths, Mode=OneWay}"
+                                SelectionMode="Single" />
+                        </Border>
+
+                        <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="12">
+                            <Button x:Name="DiscoverSourcesButton" Click="DiscoverSourcesButton_Click" Content="Add standard folders" />
+                            <Button x:Name="AddSourceButton" Click="AddSourceButton_Click" Content="Add folder…" />
+                            <Button x:Name="RemoveSourceButton" Click="RemoveSourceButton_Click" Content="Remove selected" />
+                        </StackPanel>
+
+                        <StackPanel Grid.Row="4" Spacing="8">
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="Exclusions" />
+                            <TextBlock
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="Enter one restic exclusion pattern per line."
+                                TextWrapping="Wrap" />
+                            <TextBox
+                                x:Name="ExclusionsBox"
+                                AcceptsReturn="True"
+                                IsSpellCheckEnabled="False"
+                                MinHeight="120"
+                                PlaceholderText="**/node_modules/**"
+                                TextWrapping="NoWrap" />
+                        </StackPanel>
+
+                        <StackPanel Grid.Row="5" Orientation="Horizontal" Spacing="12">
+                            <Button x:Name="SaveSourcesButton" Click="SaveSourcesButton_Click" Content="Save backup sources" Style="{StaticResource AccentButtonStyle}" />
+                            <ProgressRing x:Name="SourcesProgress" IsActive="False" Width="24" Height="24" />
+                        </StackPanel>
+                    </Grid>
+                </ScrollViewer>
+
+                <StackPanel
+                    x:Name="ComingSoonPanel"
+                    Margin="32"
+                    Spacing="8"
+                    Visibility="Collapsed">
+                    <TextBlock x:Name="ComingSoonTitle" Style="{StaticResource TitleTextBlockStyle}" Text="Coming soon" />
+                    <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="This settings page will arrive in a later implementation slice." />
                 </StackPanel>
-
-                <InfoBar
-                    x:Name="MessageBar"
-                    Grid.Row="3"
-                    IsClosable="True"
-                    IsOpen="False" />
             </Grid>
-        </ScrollViewer>
+
+            <InfoBar
+                x:Name="MessageBar"
+                Grid.Row="1"
+                Margin="32,0,32,20"
+                IsClosable="True"
+                IsOpen="False" />
+        </Grid>
     </NavigationView>
 </Window>

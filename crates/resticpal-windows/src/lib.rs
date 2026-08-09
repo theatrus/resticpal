@@ -2,3 +2,4 @@
 
 pub mod credentials;
 pub mod named_pipe;
+pub mod user_profiles;

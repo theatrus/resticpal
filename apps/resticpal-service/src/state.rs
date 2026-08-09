@@ -1,21 +1,15 @@
-use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::windows::ffi::OsStrExt;
+use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use windows::Win32::Storage::FileSystem::{
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-};
-use windows::core::PCWSTR;
+
+use crate::atomic_file::{self, AtomicFileError};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 16 * 1024;
-static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct ScheduleStateStore {
@@ -50,28 +44,12 @@ impl ScheduleStateStore {
     }
 
     pub fn save_last_success(&self, last_success: DateTime<Utc>) -> Result<(), StateStoreError> {
-        let parent = self.path.parent().ok_or(StateStoreError::MissingParent)?;
-        fs::create_dir_all(parent)?;
-        let contents = serde_json::to_vec_pretty(&PersistedScheduleState {
+        let mut contents = serde_json::to_vec_pretty(&PersistedScheduleState {
             schema_version: STATE_SCHEMA_VERSION,
             last_success: Some(last_success),
         })?;
-        let temporary = parent.join(format!(
-            ".state-{}-{}.tmp",
-            std::process::id(),
-            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let cleanup = TemporaryFile(temporary.clone());
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(&contents)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        replace_file(&temporary, &self.path)?;
-        cleanup.disarm();
+        contents.push(b'\n');
+        atomic_file::replace(&self.path, &contents, "state")?;
         Ok(())
     }
 }
@@ -83,44 +61,8 @@ struct PersistedScheduleState {
     last_success: Option<DateTime<Utc>>,
 }
 
-fn replace_file(source: &Path, target: &Path) -> Result<(), windows::core::Error> {
-    let source = wide_null(source.as_os_str());
-    let target = wide_null(target.as_os_str());
-    // SAFETY: both buffers are live null-terminated paths, and the source is a
-    // newly created file in the same directory as the target.
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    }
-}
-
-fn wide_null(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(std::iter::once(0)).collect()
-}
-
-struct TemporaryFile(PathBuf);
-
-impl TemporaryFile {
-    fn disarm(mut self) {
-        self.0 = PathBuf::new();
-    }
-}
-
-impl Drop for TemporaryFile {
-    fn drop(&mut self) {
-        if !self.0.as_os_str().is_empty() {
-            let _ = fs::remove_file(&self.0);
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum StateStoreError {
-    #[error("schedule state has no parent directory")]
-    MissingParent,
     #[error("schedule state exceeds its size limit")]
     TooLarge,
     #[error("unsupported schedule-state schema {0}")]
@@ -129,8 +71,8 @@ pub enum StateStoreError {
     Io(#[from] io::Error),
     #[error("schedule state is not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("could not atomically replace schedule state: {0}")]
-    Windows(#[from] windows::core::Error),
+    #[error(transparent)]
+    AtomicFile(#[from] AtomicFileError),
 }
 
 #[cfg(test)]

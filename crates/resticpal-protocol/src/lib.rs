@@ -3,6 +3,7 @@
 //! Versioned messages and bounded JSON framing for local resticpal IPC.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 
 use resticpal_core::status::ServiceStatus;
 use serde::de::DeserializeOwned;
@@ -34,9 +35,17 @@ impl Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestCommand {
     GetStatus,
+    GetBackupSources,
+    DiscoverBackupSources,
+    UpdateBackupSources {
+        paths: Option<Vec<PathBuf>>,
+        exclusions: Option<Vec<String>>,
+    },
     RunBackupNow,
     CancelBackup,
-    DeferBackup { minutes: u32 },
+    DeferBackup {
+        minutes: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,9 +82,47 @@ impl Response {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsePayload {
-    Status { status: ServiceStatus },
-    Accepted { message: String },
-    Rejected { code: String, message: String },
+    Status {
+        status: ServiceStatus,
+    },
+    BackupSources {
+        configuration: BackupSourcesView,
+    },
+    DiscoveredBackupSources {
+        sources: Vec<DiscoveredBackupSource>,
+    },
+    Accepted {
+        message: String,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupSourcesView {
+    pub paths: Vec<PathBuf>,
+    pub exclusions: Vec<String>,
+    pub paths_locked: bool,
+    pub exclusions_locked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredBackupSource {
+    pub profile_name: String,
+    pub kind: DiscoveredSourceKind,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveredSourceKind {
+    Desktop,
+    Documents,
+    Pictures,
+    Videos,
+    Music,
 }
 
 pub fn write_frame<T: Serialize>(mut writer: impl Write, value: &T) -> Result<(), FrameError> {
@@ -193,5 +240,22 @@ mod tests {
             response.payload,
             ResponsePayload::Rejected { ref code, .. } if code == "incompatible_protocol"
         ));
+    }
+
+    #[test]
+    fn backup_source_update_round_trips_without_untyped_arguments() {
+        let request = Request::new(
+            100,
+            RequestCommand::UpdateBackupSources {
+                paths: Some(vec![PathBuf::from(r"C:\Users\Example\Documents")]),
+                exclusions: Some(vec!["**/node_modules/**".to_owned()]),
+            },
+        );
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &request).expect("request should serialize");
+        let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
+
+        assert_eq!(decoded, request);
     }
 }

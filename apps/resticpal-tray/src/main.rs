@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::mem::size_of;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use resticpal_core::status::BackupState;
@@ -11,14 +10,14 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW,
+    Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, IDC_ARROW, IDI_APPLICATION,
     LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MENU_ITEM_FLAGS, MSG,
-    MessageBoxW, PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY,
+    MessageBoxW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, TPM_NONOTIFY,
+    TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY,
     WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{Error, Result, w};
@@ -233,15 +232,34 @@ fn show_context_menu(window: HWND) -> Result<()> {
 }
 
 fn launch_ui(window: HWND) {
-    let result = std::env::current_exe().and_then(|mut executable| {
-        executable.set_file_name("resticpal-ui.exe");
-        Command::new(executable).spawn().map(|_| ())
-    });
-
-    if let Err(error) = result {
+    let Ok(mut executable) = std::env::current_exe() else {
         show_error(
             window,
-            &format!("The resticpal settings application could not be opened.\n\n{error}"),
+            "The resticpal installation path could not be found.",
+        );
+        return;
+    };
+    executable.set_file_name("resticpal-ui.exe");
+    let executable = wide_null(&executable.to_string_lossy());
+    // SAFETY: the executable path is live and null terminated. ShellExecute
+    // handles the UAC consent flow required by the settings application.
+    let result = unsafe {
+        ShellExecuteW(
+            Some(window),
+            w!("runas"),
+            windows::core::PCWSTR(executable.as_ptr()),
+            w!(""),
+            w!(""),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        show_error(
+            window,
+            &format!(
+                "The resticpal settings application could not be opened.\n\nShell error {}",
+                result.0 as isize
+            ),
         );
     }
 }
@@ -295,6 +313,9 @@ fn fetch_status_tooltip() -> std::result::Result<String, NamedPipeError> {
         },
         ResponsePayload::Rejected { message, .. } => format!("resticpal: {message}"),
         ResponsePayload::Accepted { .. } => "resticpal: connected".to_owned(),
+        ResponsePayload::BackupSources { .. } | ResponsePayload::DiscoveredBackupSources { .. } => {
+            "resticpal: unexpected service response".to_owned()
+        }
     })
 }
 

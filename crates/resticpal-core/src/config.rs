@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const MAX_BACKUP_PATHS: usize = 128;
+pub const MAX_EXCLUSIONS: usize = 512;
+pub const MAX_PATH_CHARACTERS: usize = 32_767;
+pub const MAX_EXCLUSION_CHARACTERS: usize = 1_024;
 
 const DEFAULT_INTERVAL_HOURS: u32 = 24;
 const DEFAULT_WAKE_GRACE_SECONDS: u64 = 5 * 60;
@@ -46,6 +50,10 @@ impl LocalConfig {
             });
         }
         Ok(config)
+    }
+
+    pub fn to_toml_pretty(&self) -> Result<String, LocalConfigError> {
+        Ok(toml::to_string_pretty(self)?)
     }
 }
 
@@ -159,6 +167,29 @@ impl EffectiveConfig {
             return Err(ConfigValidationError::InvalidWakeLockTimeout);
         }
 
+        if self.backup.paths.len() > MAX_BACKUP_PATHS {
+            return Err(ConfigValidationError::TooManyBackupPaths);
+        }
+        for path in &self.backup.paths {
+            if path.as_os_str().is_empty()
+                || !path.is_absolute()
+                || path.to_string_lossy().encode_utf16().count() > MAX_PATH_CHARACTERS
+            {
+                return Err(ConfigValidationError::InvalidBackupPath(path.clone()));
+            }
+        }
+        if self.backup.exclusions.len() > MAX_EXCLUSIONS {
+            return Err(ConfigValidationError::TooManyExclusions);
+        }
+        for exclusion in &self.backup.exclusions {
+            if exclusion.is_empty()
+                || exclusion.chars().count() > MAX_EXCLUSION_CHARACTERS
+                || exclusion.contains(['\0', '\r', '\n'])
+            {
+                return Err(ConfigValidationError::InvalidExclusion);
+            }
+        }
+
         for key in self.repository.options.keys() {
             if !is_valid_option_name(key) {
                 return Err(ConfigValidationError::InvalidRepositoryOption(key.clone()));
@@ -251,6 +282,8 @@ fn is_valid_option_name(value: &str) -> bool {
 pub enum LocalConfigError {
     #[error("could not parse local TOML configuration: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("could not serialize local TOML configuration: {0}")]
+    Serialize(#[from] toml::ser::Error),
     #[error("unsupported configuration schema {actual}; expected {expected}")]
     UnsupportedSchema { expected: u32, actual: u32 },
 }
@@ -265,6 +298,14 @@ pub enum ConfigValidationError {
     WakeGraceTooLong,
     #[error("wake-lock timeout must be between one second and 24 hours")]
     InvalidWakeLockTimeout,
+    #[error("backup configuration exceeds the maximum of {MAX_BACKUP_PATHS} paths")]
+    TooManyBackupPaths,
+    #[error("backup path must be an absolute path within the Windows path-length limit: {0}")]
+    InvalidBackupPath(PathBuf),
+    #[error("backup configuration exceeds the maximum of {MAX_EXCLUSIONS} exclusions")]
+    TooManyExclusions,
+    #[error("backup exclusions must be non-empty, single-line patterns within the size limit")]
+    InvalidExclusion,
     #[error("invalid repository option name: {0}")]
     InvalidRepositoryOption(String),
     #[error("secret reference IDs cannot be empty")]
@@ -339,6 +380,36 @@ mod tests {
                 .expect("example has secret references")
                 [&SecretEnvironmentVariable::AwsSecretAccessKey],
             "s3-secret-access-key"
+        );
+    }
+
+    #[test]
+    fn local_configuration_round_trips_through_pretty_toml() {
+        let original =
+            LocalConfig::from_toml(include_str!("../../../config/resticpal.example.toml"))
+                .expect("example should parse");
+        let serialized = original.to_toml_pretty().expect("config should serialize");
+
+        assert_eq!(
+            LocalConfig::from_toml(&serialized).expect("serialized config should parse"),
+            original
+        );
+    }
+
+    #[test]
+    fn effective_configuration_rejects_relative_paths_and_multiline_exclusions() {
+        let mut config = EffectiveConfig::default();
+        config.backup.paths = vec![PathBuf::from("relative")];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidBackupPath(_))
+        ));
+
+        config.backup.paths = vec![PathBuf::from(r"C:\Users\Example\Documents")];
+        config.backup.exclusions = vec!["valid".to_owned(), "bad\npattern".to_owned()];
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidExclusion)
         );
     }
 }

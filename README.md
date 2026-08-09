@@ -8,7 +8,7 @@ The agreed product and architecture direction is recorded in [DESIGN.md](DESIGN.
 
 - `crates/resticpal-core`: testable policy, scheduling, status, and restic invocation logic
 - `crates/resticpal-protocol`: versioned and length-bounded local IPC messages
-- `crates/resticpal-windows`: ACL-protected Windows named-pipe integration
+- `crates/resticpal-windows`: named-pipe, DPAPI, and user-profile Windows integrations
 - `apps/resticpal-service`: Rust Windows service host
 - `apps/resticpal-tray`: low-resource native Rust/Win32 tray host
 - `apps/ResticPal.UI`: on-demand .NET 10 / WinUI 3 application
@@ -37,8 +37,12 @@ The first slice establishes:
 - deadline-driven startup and resume catch-up execution through the same service scheduler used by manual runs;
 - Windows power, network-availability, and metered-network gates, with local repositories exempt from network checks;
 - bounded exponential retry after failures and durable last-success state for restart-safe daily deadlines.
+- elevated, typed backup-source configuration over the protected service IPC, with per-field managed-policy locks;
+- atomic local TOML replacement and live scheduler updates after accepted configuration changes;
+- Windows profile discovery for existing Desktop, Documents, Pictures, Videos, and Music folders;
+- a WinUI backup-sources page for discovery, folder picking, removal, and exclusion editing.
 
-Credential provisioning through setup/enrollment, source discovery, installation, run-history persistence, and enrollment are not wired up yet. The executor fails closed when a referenced credential is absent, corrupt, or not a valid environment value, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
+Credential provisioning through setup/enrollment, automatic discovery for newly created profiles, direct-file configuration watching, installation, run-history persistence, and enrollment are not wired up yet. The executor fails closed when a referenced credential is absent, corrupt, or not a valid environment value, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
 
 ## Build and test
 

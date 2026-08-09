@@ -12,7 +12,7 @@ internal sealed class ResticPalServiceClient
 
     public async Task<ServiceSnapshot> GetStatusAsync(CancellationToken cancellationToken = default)
     {
-        JsonElement payload = await SendAsync("get_status", cancellationToken);
+        JsonElement payload = await SendAsync(new { type = "get_status" }, cancellationToken);
         if (payload.GetProperty("type").GetString() != "status")
         {
             throw new InvalidDataException("The service did not return a status response.");
@@ -75,17 +75,58 @@ internal sealed class ResticPalServiceClient
     public async Task<CommandResult> RunBackupNowAsync(
         CancellationToken cancellationToken = default)
     {
-        return await SendCommandAsync("run_backup_now", cancellationToken);
+        return await SendCommandAsync(new { type = "run_backup_now" }, cancellationToken);
     }
 
     public async Task<CommandResult> CancelBackupAsync(
         CancellationToken cancellationToken = default)
     {
-        return await SendCommandAsync("cancel_backup", cancellationToken);
+        return await SendCommandAsync(new { type = "cancel_backup" }, cancellationToken);
+    }
+
+    public async Task<BackupSourcesConfiguration> GetBackupSourcesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(new { type = "get_backup_sources" }, cancellationToken);
+        RequirePayloadType(payload, "backup_sources");
+        JsonElement configuration = payload.GetProperty("configuration");
+        return new BackupSourcesConfiguration(
+            ReadStrings(configuration.GetProperty("paths")),
+            ReadStrings(configuration.GetProperty("exclusions")),
+            configuration.GetProperty("paths_locked").GetBoolean(),
+            configuration.GetProperty("exclusions_locked").GetBoolean());
+    }
+
+    public async Task<IReadOnlyList<DiscoveredBackupSource>> DiscoverBackupSourcesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(
+            new { type = "discover_backup_sources" },
+            cancellationToken,
+            TimeSpan.FromSeconds(10));
+        RequirePayloadType(payload, "discovered_backup_sources");
+        return payload.GetProperty("sources")
+            .EnumerateArray()
+            .Select(source => new DiscoveredBackupSource(
+                source.GetProperty("profile_name").GetString() ?? "User",
+                source.GetProperty("kind").GetString() ?? "folder",
+                source.GetProperty("path").GetString() ?? string.Empty))
+            .Where(source => !string.IsNullOrWhiteSpace(source.Path))
+            .ToArray();
+    }
+
+    public async Task<CommandResult> UpdateBackupSourcesAsync(
+        IReadOnlyCollection<string>? paths,
+        IReadOnlyCollection<string>? exclusions,
+        CancellationToken cancellationToken = default)
+    {
+        return await SendCommandAsync(
+            new { type = "update_backup_sources", paths, exclusions },
+            cancellationToken);
     }
 
     private static async Task<CommandResult> SendCommandAsync(
-        string command,
+        object command,
         CancellationToken cancellationToken)
     {
         JsonElement payload = await SendAsync(command, cancellationToken);
@@ -95,15 +136,16 @@ internal sealed class ResticPalServiceClient
     }
 
     private static async Task<JsonElement> SendAsync(
-        string command,
-        CancellationToken cancellationToken)
+        object command,
+        CancellationToken cancellationToken,
+        TimeSpan? requestTimeout = null)
     {
         long requestId = Interlocked.Increment(ref _nextRequestId);
         byte[] payload = JsonSerializer.SerializeToUtf8Bytes(new
         {
             protocol_version = ProtocolVersion,
             request_id = requestId,
-            command = new { type = command },
+            command,
         });
         if (payload.Length > MaxFrameBytes)
         {
@@ -111,7 +153,7 @@ internal sealed class ResticPalServiceClient
         }
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(2));
+        timeout.CancelAfter(requestTimeout ?? TimeSpan.FromSeconds(2));
         await using var pipe = new NamedPipeClientStream(
             ".",
             "ResticPal.v1",
@@ -150,6 +192,29 @@ internal sealed class ResticPalServiceClient
         }
 
         return root.GetProperty("payload").Clone();
+    }
+
+    private static void RequirePayloadType(JsonElement payload, string expected)
+    {
+        string actual = payload.GetProperty("type").GetString() ?? "rejected";
+        if (actual == expected)
+        {
+            return;
+        }
+
+        string message = payload.TryGetProperty("message", out JsonElement messageElement)
+            ? messageElement.GetString() ?? "The service rejected the request."
+            : $"The service returned '{actual}' instead of '{expected}'.";
+        throw new InvalidOperationException(message);
+    }
+
+    private static IReadOnlyList<string> ReadStrings(JsonElement array)
+    {
+        return array.EnumerateArray()
+            .Select(value => value.GetString())
+            .Where(value => !string.IsNullOrEmpty(value))
+            .Cast<string>()
+            .ToArray();
     }
 
     private static string DescribeRepository(string? repositoryName, string repositoryMode)
@@ -201,3 +266,14 @@ internal sealed record ServiceSnapshot(
     bool CanCancelBackup);
 
 internal sealed record CommandResult(bool Accepted, string Message);
+
+internal sealed record BackupSourcesConfiguration(
+    IReadOnlyList<string> Paths,
+    IReadOnlyList<string> Exclusions,
+    bool PathsLocked,
+    bool ExclusionsLocked);
+
+internal sealed record DiscoveredBackupSource(string ProfileName, string Kind, string Path)
+{
+    public string DisplayName => $"{ProfileName} · {Kind.Replace('_', ' ')}";
+}

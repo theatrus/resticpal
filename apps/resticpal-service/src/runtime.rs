@@ -1,21 +1,25 @@
-use std::fs;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use resticpal_core::config::{EffectiveConfig, LocalConfig, LocalConfigError};
-use resticpal_core::policy::{PolicyError, ResolvedConfig, resolve_config};
+use resticpal_core::config::{EffectiveConfig, LocalConfig};
+use resticpal_core::policy::{
+    FieldResolution, PolicyError, PolicyField, ResolvedConfig, resolve_config,
+};
 use resticpal_core::schedule::{
     BackupTrigger, ScheduleBlocker, ScheduleDecision, SchedulerSnapshot, decide,
 };
 use resticpal_core::status::{BackupPhase, BackupProgress, BackupState, ServiceStatus};
-use resticpal_protocol::{Request, RequestCommand, Response, ResponsePayload};
+use resticpal_protocol::{BackupSourcesView, Request, RequestCommand, Response, ResponsePayload};
 use resticpal_windows::named_pipe::ClientIdentity;
+use resticpal_windows::user_profiles::discover_backup_sources;
 use thiserror::Error;
 
 use crate::conditions::SystemConditions;
+use crate::config_store::{ConfigStoreError, LocalConfigStore};
 use crate::executor::{BackupOutcome, BackupOutcomeKind};
 use crate::state::ScheduleStateStore;
 
@@ -32,6 +36,7 @@ pub enum RuntimeEvent {
     RunNow,
     Cancel,
     Deferred,
+    ConfigurationChanged,
     BackupFinished(BackupOutcome),
 }
 
@@ -50,7 +55,10 @@ struct RuntimeState {
 }
 
 pub struct ServiceRuntime {
-    config: EffectiveConfig,
+    config: RwLock<EffectiveConfig>,
+    local_config: Mutex<LocalConfig>,
+    field_resolutions: BTreeMap<PolicyField, FieldResolution>,
+    config_store: Option<LocalConfigStore>,
     state: Mutex<RuntimeState>,
     state_store: Option<ScheduleStateStore>,
     events: Sender<RuntimeEvent>,
@@ -58,11 +66,8 @@ pub struct ServiceRuntime {
 
 impl ServiceRuntime {
     pub fn load(path: &Path, events: Sender<RuntimeEvent>) -> Result<Self, RuntimeInitError> {
-        let local = match fs::read_to_string(path) {
-            Ok(contents) => LocalConfig::from_toml(&contents)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => LocalConfig::default(),
-            Err(error) => return Err(error.into()),
-        };
+        let config_store = LocalConfigStore::new(path);
+        let local = config_store.load()?;
         let resolved = resolve_config(&EffectiveConfig::default(), &local, None)?;
         let state_store = ScheduleStateStore::next_to_config(path);
         let last_success = match state_store.load_last_success() {
@@ -77,22 +82,26 @@ impl ServiceRuntime {
         };
         Ok(Self::from_resolved_with_state(
             resolved,
+            local,
             events,
             last_success,
             Some(state_store),
+            Some(config_store),
         ))
     }
 
     #[cfg(test)]
     pub fn from_resolved(resolved: ResolvedConfig, events: Sender<RuntimeEvent>) -> Self {
-        Self::from_resolved_with_state(resolved, events, None, None)
+        Self::from_resolved_with_state(resolved, LocalConfig::default(), events, None, None, None)
     }
 
     fn from_resolved_with_state(
         resolved: ResolvedConfig,
+        local_config: LocalConfig,
         events: Sender<RuntimeEvent>,
         last_success: Option<DateTime<Utc>>,
         state_store: Option<ScheduleStateStore>,
+        config_store: Option<LocalConfigStore>,
     ) -> Self {
         let now = Utc::now();
         let configured = resolved.effective.is_configured();
@@ -119,7 +128,10 @@ impl ServiceRuntime {
         };
 
         Self {
-            config: resolved.effective,
+            config: RwLock::new(resolved.effective),
+            local_config: Mutex::new(local_config),
+            field_resolutions: resolved.fields,
+            config_store,
             state: Mutex::new(RuntimeState {
                 status,
                 resumed_at: None,
@@ -135,7 +147,10 @@ impl ServiceRuntime {
     pub fn configuration_error(events: Sender<RuntimeEvent>) -> Self {
         let now = Utc::now();
         Self {
-            config: EffectiveConfig::default(),
+            config: RwLock::new(EffectiveConfig::default()),
+            local_config: Mutex::new(LocalConfig::default()),
+            field_resolutions: BTreeMap::new(),
+            config_store: None,
             state: Mutex::new(RuntimeState {
                 status: ServiceStatus {
                     state: BackupState::Failed {
@@ -165,7 +180,7 @@ impl ServiceRuntime {
     }
 
     pub fn config(&self) -> EffectiveConfig {
-        self.config.clone()
+        self.config_read().clone()
     }
 
     pub fn update_progress(&self, progress: BackupProgress) {
@@ -184,6 +199,7 @@ impl ServiceRuntime {
     }
 
     fn finish_backup_at(&self, now: DateTime<Utc>, outcome: &BackupOutcome) {
+        let interval_hours = self.config_read().schedule.interval_hours;
         let mut state = self.state_guard();
         let succeeded = matches!(
             outcome.kind,
@@ -197,8 +213,7 @@ impl ServiceRuntime {
         };
         if succeeded {
             state.status.last_success = Some(now);
-            state.status.next_deadline =
-                Some(now + Duration::hours(i64::from(self.config.schedule.interval_hours)));
+            state.status.next_deadline = Some(now + Duration::hours(i64::from(interval_hours)));
             state.not_before = None;
             state.consecutive_failures = 0;
         } else {
@@ -236,13 +251,14 @@ impl ServiceRuntime {
         now: DateTime<Utc>,
         conditions: SystemConditions,
     ) -> ScheduleAction {
-        if !self.config.is_configured() {
+        let config = self.config();
+        if !config.is_configured() {
             return ScheduleAction::None;
         }
 
         let mut state = self.state_guard();
         let decision = decide(
-            &self.config.schedule,
+            &config.schedule,
             &SchedulerSnapshot {
                 now,
                 last_success: state.status.last_success,
@@ -251,7 +267,7 @@ impl ServiceRuntime {
                 manual_requested: state.manual_requested,
                 backup_running: matches!(state.status.state, BackupState::Running { .. }),
                 network_required: repository_requires_network(
-                    self.config.repository.url.as_deref().unwrap_or_default(),
+                    config.repository.url.as_deref().unwrap_or_default(),
                 ),
                 network_available: conditions.network_available,
                 on_battery: conditions.on_battery,
@@ -315,14 +331,42 @@ impl ServiceRuntime {
         )
     }
 
-    pub fn handle_request(&self, request: Request, _identity: ClientIdentity) -> Response {
+    pub fn handle_request(&self, request: Request, identity: ClientIdentity) -> Response {
         let request_id = request.request_id;
         let payload = match request.command {
             RequestCommand::GetStatus => ResponsePayload::Status {
                 status: self.status(),
             },
+            RequestCommand::GetBackupSources => {
+                if identity.is_elevated_administrator {
+                    ResponsePayload::BackupSources {
+                        configuration: self.backup_sources_view(),
+                    }
+                } else {
+                    administrator_required()
+                }
+            }
+            RequestCommand::DiscoverBackupSources => {
+                if !identity.is_elevated_administrator {
+                    administrator_required()
+                } else {
+                    match discover_backup_sources() {
+                        Ok(sources) => ResponsePayload::DiscoveredBackupSources { sources },
+                        Err(error) => {
+                            eprintln!("could not discover local user profile folders: {error}");
+                            rejected(
+                                "source_discovery_failed",
+                                "Windows user folders could not be discovered.",
+                            )
+                        }
+                    }
+                }
+            }
+            RequestCommand::UpdateBackupSources { paths, exclusions } => {
+                self.update_backup_sources(paths, exclusions, identity)
+            }
             RequestCommand::RunBackupNow => {
-                if !self.config.is_configured() {
+                if !self.config_read().is_configured() {
                     rejected(
                         "not_configured",
                         "Configure backup sources and a repository first.",
@@ -379,6 +423,116 @@ impl ServiceRuntime {
         Response::new(request_id, payload)
     }
 
+    fn backup_sources_view(&self) -> BackupSourcesView {
+        let config = self.config_read();
+        BackupSourcesView {
+            paths: config.backup.paths.clone(),
+            exclusions: config.backup.exclusions.clone(),
+            paths_locked: self.field_locked(PolicyField::BackupPaths),
+            exclusions_locked: self.field_locked(PolicyField::BackupExclusions),
+        }
+    }
+
+    fn update_backup_sources(
+        &self,
+        paths: Option<Vec<std::path::PathBuf>>,
+        exclusions: Option<Vec<String>>,
+        identity: ClientIdentity,
+    ) -> ResponsePayload {
+        if !identity.is_elevated_administrator {
+            return administrator_required();
+        }
+        if paths.is_none() && exclusions.is_none() {
+            return rejected(
+                "no_configuration_changes",
+                "No backup-source changes were supplied.",
+            );
+        }
+        if paths.is_some() && self.field_locked(PolicyField::BackupPaths)
+            || exclusions.is_some() && self.field_locked(PolicyField::BackupExclusions)
+        {
+            return rejected(
+                "managed_field_locked",
+                "Backup sources are locked by managed policy.",
+            );
+        }
+        let mut candidate = self.local_config_guard().clone();
+        let mut effective = self.config();
+        if let Some(paths) = paths {
+            let paths = deduplicate_paths(paths);
+            candidate.backup.paths = Some(paths.clone());
+            effective.backup.paths = paths;
+        }
+        if let Some(exclusions) = exclusions {
+            let exclusions = deduplicate_exclusions(exclusions);
+            candidate.backup.exclusions = Some(exclusions.clone());
+            effective.backup.exclusions = exclusions;
+        }
+        if let Err(error) = effective.validate() {
+            return rejected("invalid_backup_sources", &error.to_string());
+        }
+        let mut runtime_state = self.state_guard();
+        if matches!(runtime_state.status.state, BackupState::Running { .. }) {
+            return rejected(
+                "backup_running",
+                "Wait for the active backup to finish before changing its sources.",
+            );
+        }
+        if let Some(store) = &self.config_store
+            && let Err(error) = store.save(&candidate)
+        {
+            eprintln!(
+                "could not save local configuration to {}: {error}",
+                store.path().display()
+            );
+            return rejected(
+                "configuration_save_failed",
+                "The local configuration could not be saved.",
+            );
+        }
+
+        *self.local_config_guard() = candidate;
+        *self.config_write() = effective.clone();
+        Self::apply_configuration_status(&mut runtime_state, &effective, Utc::now());
+        drop(runtime_state);
+        let _ = self.events.send(RuntimeEvent::ConfigurationChanged);
+        ResponsePayload::Accepted {
+            message: "Backup sources updated.".to_owned(),
+        }
+    }
+
+    fn apply_configuration_status(
+        state: &mut RuntimeState,
+        config: &EffectiveConfig,
+        now: DateTime<Utc>,
+    ) {
+        state.status.repository_display_name = config.repository.display_name.clone();
+        state.status.repository_mode = config.repository.mode;
+        if config.is_configured() {
+            let scheduled_deadline = state.status.last_success.map_or(now, |last_success| {
+                last_success + Duration::hours(i64::from(config.schedule.interval_hours))
+            });
+            state.status.next_deadline =
+                Some(state.not_before.map_or(scheduled_deadline, |not_before| {
+                    scheduled_deadline.max(not_before)
+                }));
+            if matches!(state.status.state, BackupState::Unconfigured) {
+                transition_state(&mut state.status, BackupState::Idle, now);
+            }
+        } else {
+            transition_state(&mut state.status, BackupState::Unconfigured, now);
+            state.status.next_deadline = None;
+            state.manual_requested = false;
+            state.not_before = None;
+        }
+    }
+
+    fn field_locked(&self, field: PolicyField) -> bool {
+        self.field_resolutions
+            .get(&field)
+            .is_some_and(|resolution| resolution.locked)
+    }
+
     fn send_event(&self, event: RuntimeEvent, message: &str) -> ResponsePayload {
         match self.events.send(event) {
             Ok(()) => ResponsePayload::Accepted {
@@ -396,6 +550,40 @@ impl ServiceRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn config_read(&self) -> RwLockReadGuard<'_, EffectiveConfig> {
+        self.config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn config_write(&self) -> RwLockWriteGuard<'_, EffectiveConfig> {
+        self.config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn local_config_guard(&self) -> MutexGuard<'_, LocalConfig> {
+        self.local_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn deduplicate_paths(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.to_string_lossy().to_lowercase()))
+        .collect()
+}
+
+fn deduplicate_exclusions(exclusions: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    exclusions
+        .into_iter()
+        .filter(|exclusion| seen.insert(exclusion.clone()))
+        .collect()
 }
 
 fn transition_state(status: &mut ServiceStatus, next: BackupState, now: DateTime<Utc>) {
@@ -444,12 +632,17 @@ fn rejected(code: &str, message: &str) -> ResponsePayload {
     }
 }
 
+fn administrator_required() -> ResponsePayload {
+    rejected(
+        "administrator_required",
+        "Open resticpal as an administrator to change machine backup settings.",
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeInitError {
-    #[error("could not read local configuration: {0}")]
-    Io(#[from] std::io::Error),
     #[error(transparent)]
-    LocalConfig(#[from] LocalConfigError),
+    ConfigStore(#[from] ConfigStoreError),
     #[error(transparent)]
     Policy(#[from] PolicyError),
 }
@@ -472,6 +665,9 @@ mod tests {
 
     const USER: ClientIdentity = ClientIdentity {
         is_elevated_administrator: false,
+    };
+    const ADMIN: ClientIdentity = ClientIdentity {
+        is_elevated_administrator: true,
     };
     static NEXT_PIPE: AtomicU64 = AtomicU64::new(1);
 
@@ -733,8 +929,8 @@ mod tests {
 
     #[test]
     fn battery_policy_blocks_until_power_conditions_change() {
-        let (mut runtime, _events) = runtime(true);
-        runtime.config.schedule.allow_on_battery = false;
+        let (runtime, _events) = runtime(true);
+        runtime.config_write().schedule.allow_on_battery = false;
         let now = Utc::now();
 
         assert_eq!(
@@ -810,5 +1006,157 @@ mod tests {
         assert!(repository_requires_network(
             "sftp:user@example.test:/backup"
         ));
+    }
+
+    #[test]
+    fn backup_source_configuration_requires_an_elevated_administrator() {
+        let (runtime, _events) = runtime(true);
+
+        for command in [
+            RequestCommand::GetBackupSources,
+            RequestCommand::DiscoverBackupSources,
+            RequestCommand::UpdateBackupSources {
+                paths: Some(vec![PathBuf::from(r"D:\Data")]),
+                exclusions: Some(Vec::new()),
+            },
+        ] {
+            let response = runtime.handle_request(Request::new(20, command), USER);
+            assert!(matches!(
+                response.payload,
+                ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+            ));
+        }
+    }
+
+    #[test]
+    fn administrator_source_update_is_persisted_and_applied_live() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        let store = LocalConfigStore::new(&config_path);
+        let local = LocalConfig {
+            repository: resticpal_core::config::LocalRepositoryConfig {
+                url: Some("local:C:/backup".to_owned()),
+                ..Default::default()
+            },
+            ..LocalConfig::default()
+        };
+        store.save(&local).expect("initial config");
+        let (events, receiver) = mpsc::channel();
+        let runtime = ServiceRuntime::load(&config_path, events).expect("runtime should load");
+
+        let response = runtime.handle_request(
+            Request::new(
+                21,
+                RequestCommand::UpdateBackupSources {
+                    paths: Some(vec![PathBuf::from(r"D:\Data"), PathBuf::from(r"d:\data")]),
+                    exclusions: Some(vec!["**/cache/**".to_owned(), "**/cache/**".to_owned()]),
+                },
+            ),
+            ADMIN,
+        );
+
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(
+            receiver.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        assert_eq!(runtime.config().backup.paths, [PathBuf::from(r"D:\Data")]);
+        assert_eq!(runtime.config().backup.exclusions, ["**/cache/**"]);
+        assert!(matches!(runtime.status().state, BackupState::Idle));
+        let persisted = store.load().expect("updated config should load");
+        assert_eq!(
+            persisted.backup.paths,
+            Some(vec![PathBuf::from(r"D:\Data")])
+        );
+    }
+
+    #[test]
+    fn invalid_source_update_does_not_replace_configuration() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        let store = LocalConfigStore::new(&config_path);
+        store.save(&LocalConfig::default()).expect("initial config");
+        let before = std::fs::read(&config_path).expect("initial bytes");
+        let (events, _receiver) = mpsc::channel();
+        let runtime = ServiceRuntime::load(&config_path, events).expect("runtime should load");
+
+        let response = runtime.handle_request(
+            Request::new(
+                22,
+                RequestCommand::UpdateBackupSources {
+                    paths: Some(vec![PathBuf::from("relative")]),
+                    exclusions: Some(Vec::new()),
+                },
+            ),
+            ADMIN,
+        );
+
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "invalid_backup_sources"
+        ));
+        assert_eq!(std::fs::read(config_path).expect("config remains"), before);
+    }
+
+    #[test]
+    fn managed_source_locks_are_enforced_by_the_service() {
+        let (mut runtime, _events) = runtime(true);
+        runtime.field_resolutions.insert(
+            PolicyField::BackupPaths,
+            FieldResolution {
+                source: resticpal_core::policy::ValueSource::ManagedLocked,
+                locked: true,
+            },
+        );
+
+        let response = runtime.handle_request(
+            Request::new(
+                23,
+                RequestCommand::UpdateBackupSources {
+                    paths: Some(vec![PathBuf::from(r"D:\Data")]),
+                    exclusions: None,
+                },
+            ),
+            ADMIN,
+        );
+
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "managed_field_locked"
+        ));
+    }
+
+    #[test]
+    fn an_unlocked_source_field_can_change_without_overwriting_a_locked_field() {
+        let (mut runtime, events) = runtime(true);
+        runtime.config_write().backup.exclusions = vec!["managed-pattern".to_owned()];
+        runtime.field_resolutions.insert(
+            PolicyField::BackupExclusions,
+            FieldResolution {
+                source: resticpal_core::policy::ValueSource::ManagedLocked,
+                locked: true,
+            },
+        );
+
+        let response = runtime.handle_request(
+            Request::new(
+                24,
+                RequestCommand::UpdateBackupSources {
+                    paths: Some(vec![PathBuf::from(r"D:\Data")]),
+                    exclusions: None,
+                },
+            ),
+            ADMIN,
+        );
+
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(
+            events.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        let config = runtime.config();
+        assert_eq!(config.backup.paths, [PathBuf::from(r"D:\Data")]);
+        assert_eq!(config.backup.exclusions, ["managed-pattern"]);
+        assert_eq!(config.repository.url.as_deref(), Some("local:C:/backup"));
     }
 }
