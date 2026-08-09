@@ -25,5 +25,18 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" />
     <PackageReference Include="NetSparkleUpdater.SparkleUpdater" Version="3.1.0" />
   </ItemGroup>
-</Project>
 
+  <Target Name="CopyWinUiMarkupToPublishDirectory" AfterTargets="Publish">
+    <ItemGroup>
+      <_WinUiMarkup Include="$(TargetDir)*.xbf" />
+    </ItemGroup>
+    <Error Condition="'@(_WinUiMarkup)' == '' or !Exists('$(TargetDir)$(ProjectPriFileName)')"
+           Text="The WinUI markup compiler did not produce runtime resources." />
+    <Copy SourceFiles="@(_WinUiMarkup)"
+          DestinationFolder="$(PublishDir)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(TargetDir)$(ProjectPriFileName)"
+          DestinationFiles="$(PublishDir)resources.pri"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>

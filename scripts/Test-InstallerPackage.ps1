@@ -61,6 +61,9 @@ try {
         'resticpal-service.exe',
         'resticpal-tray.exe',
         'resticpal-ui.exe',
+        'App.xbf',
+        'MainWindow.xbf',
+        'resources.pri',
         'restic.exe',
         'LICENSE-resticpal.txt',
         'THIRD-PARTY-NOTICES.md'
