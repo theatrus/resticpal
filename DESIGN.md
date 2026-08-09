@@ -6,7 +6,7 @@ This document records the product requirements, architecture decisions, and curr
 
 ## Implementation status
 
-The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10. The automated baseline is 109 Rust tests plus a warning-free WinUI build. It is a development build, not an installable or production-qualified release.
+The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The automated baseline is 109 Rust tests plus a warning-free WinUI build. The MSI is build/ICE/admin-image validated but its privileged install and VSS behavior are not yet production-qualified.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
@@ -16,7 +16,7 @@ The repository now contains a buildable x64 Windows vertical slice using Rust 1.
 | Tray | Native Win32 notification icon, current status tooltip, run/cancel action, and elevated UI launch | Push-driven live icon updates, deferral UI, notifications, richer health icons, and startup registration |
 | WinUI application | Overview, backup sources, repository, schedule/power/network, and bounded backup-history pages | Diagnostics/logs, enrollment/managed-policy, updates/settings, accessibility and Windows 10 qualification |
 | Remote management | Typed managed-policy data model and lock-aware service/UI paths | Enrollment, device keys, signed policy cache, credential bootstrap, metadata/API schemas, and status delivery |
-| Distribution | x64 project targets and a NetSparkleUpdater package reference | Bundled pinned `restic.exe`, WiX MSI, service/tray registration, update UI/appcast verification, elevated updater, repair, and uninstall |
+| Distribution | Per-machine x64 WiX MSI, pinned restic 0.19.1, release service/tray, self-contained WinUI payload, virtual-account service/recovery authoring, ProgramData ACL authoring, tray logon registration, data-preserving uninstall design, notices, and local E2E harness | Elevated service/VSS qualification, installer UI/bootstrap, Start Menu integration, code signing, complete license generation, update UI/appcast verification, elevated updater, and upgrade/repair matrix |
 
 Current durable state consists of atomic `config.toml`, DPAPI-protected credential files, `state.json` for scheduler/repository-verification state, and lazy `state.db` backup history. The history retains the newest 200 attempts and exposes at most 100 per IPC request; the WinUI page requests 50.
 
@@ -70,7 +70,7 @@ User session              +-- resticpal-tray.exe     Rust/Win32; always present
 On demand: resticpal-updater.exe       elevated update/bootstrap helper
 ```
 
-The service, tray, and WinUI projects in this diagram are implemented. The updater is still a planned process, and packaging does not yet install or register any of the components.
+The service, tray, and WinUI projects in this diagram are implemented. The development MSI packages them with restic and authors service/tray registration. The updater remains a planned process, and privileged installer behavior still requires local and OS-matrix qualification.
 
 ### `resticpal-service.exe`
 
@@ -88,13 +88,13 @@ The Rust Windows service is the sole owner of:
 
 No tray or UI process may invoke restic directly.
 
-The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler state, and backup history. Remote enrollment/reporting, structured logs, and update coordination remain planned. The service expects a fixed sibling `restic.exe`, but the repository does not yet package that binary.
+The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler state, and backup history. Remote enrollment/reporting, structured logs, and update coordination remain planned. The service expects a fixed sibling `restic.exe`; the development MSI now supplies a checksum-verified pinned binary at that location.
 
 ### `resticpal-tray.exe`
 
 The persistent tray process uses native Win32 notification-area APIs from Rust. The current message-loop implementation fetches status at startup and when its menu or an action needs it; it has no background polling timer. It displays a native menu, opens the WinUI process through UAC, and requests run-now or cancellation. Push updates, notifications, deferral, and richer state-specific icons await the IPC subscription channel.
 
-The installed design runs the tray in each interactive user session. It may view machine backup status and request a one-run backup, deferral, or cancellation. Permanent configuration changes require elevation and service-side authorization. Logon registration is not implemented yet.
+The installed design runs the tray in each interactive user session. It may view machine backup status and request a one-run backup, deferral, or cancellation. Permanent configuration changes require elevation and service-side authorization. The development MSI registers the tray under the machine Run key so it starts for future interactive logons; upgrade, repair, and multi-session behavior still need qualification.
 
 ### `resticpal-ui.exe`
 
@@ -134,7 +134,7 @@ The preferred identity is a dedicated virtual service account, `NT SERVICE\Resti
 
 If reliable file access or VSS cannot be achieved with the virtual account, the installer may offer or use LocalSystem as a documented fallback. LocalSystem is highly privileged, so the service command surface, binaries, configuration, named pipes, and update path must be tightly ACLed and validated.
 
-The service host and service-control handling exist, but the repository has no installer and has not yet validated the virtual account against real user ACLs, VSS, network shares, or cloud credentials on the supported Windows matrix. DPAPI data is intentionally bound to whichever identity runs the service, so changing that identity requires an explicit credential migration or reprovisioning design.
+The service host, service-control handling, and virtual-account MSI authoring exist, but the virtual account has not yet been validated against real user ACLs, VSS, network shares, or cloud credentials on the supported Windows matrix. DPAPI data is intentionally bound to whichever identity runs the service, so changing that identity requires an explicit credential migration or reprovisioning design.
 
 ## IPC and authorization
 
@@ -271,7 +271,7 @@ Machine state lives under `%ProgramData%\ResticPal` with service/admin-only ACLs
 | Scheduler checkpoint | `state.json` | Implemented; last success plus repository-validation identity/time for restart-safe scheduling |
 | Run history | `state.db` | Implemented lazily; SQLite, newest 200 attempts, sanitized and non-blocking |
 | Logs | `Logs\` | Planned; structured, rotated, sanitized |
-| Bundled tools | under installation directory | Planned; administrator/service write only |
+| Bundled tools | under installation directory | Implemented in the development MSI with checksum-verified restic 0.19.1; signing and upgrade replacement remain |
 
 The UI writes configuration through elevated typed service operations, not directly. Those writes validate a candidate effective configuration before atomically replacing `config.toml` and immediately reevaluating the scheduler. A directly edited file is validated at service startup, but live file watching and last-known-good recovery for invalid edits are not implemented yet.
 
@@ -406,18 +406,30 @@ The WinUI project references NetSparkleUpdater 3.1.0, but no appcast, update-che
 
 ## Installer and deployment
 
-Installer and deployment work has not started. The following is the target packaging behavior:
+The first development installer is implemented as a per-machine x64 WiX 6 MSI. Its build pipeline creates optimized Rust binaries, a self-contained WinUI payload, and a checksum-verified pinned restic 0.19.1 payload; embeds project/third-party notices and package metadata; and runs MSI ICE validation. A non-privileged administrative-image extraction has verified cabinet layout and packaged service/restic execution.
+
+The MSI currently:
+
+- installs the application under 64-bit Program Files;
+- registers an automatically started `ResticPal` service under `NT SERVICE\ResticPal` with bounded restart recovery actions;
+- authors service/admin/system access for `%ProgramData%\ResticPal` while leaving created configuration, credentials, state, history, and repositories untracked by MSI so uninstall preserves them;
+- registers the lightweight tray under the machine Run key for future interactive logons;
+- installs the on-demand self-contained WinUI application beside the tray so the tray can launch it;
+- embeds the pinned restic binary and development license/notice inventory;
+- supports standard MSI reinstall, repair, upgrade, and uninstall mechanics, though the upgrade/repair matrix is not yet qualified.
+
+An elevated PowerShell E2E harness refuses to touch a pre-existing installation or data directory, installs the MSI, verifies identity/payload/registration, configures a disposable local repository and DPAPI password through protected IPC, initializes then switches it to append-only mode, runs a VSS backup, checks restart-persistent history, uninstalls, proves data preservation, and removes only its synthetic state. The current desktop session could build and inspect the package but could not cross the UAC boundary, so the privileged cycle remains ready but unexecuted here.
+
+The following packaging work remains:
 
 The development WinUI project currently declares `10.0.17763.0` (Windows 10 version 1809) as its target-platform minimum. That is a build setting, not yet a qualified support promise.
 
-- Per-machine x64 WiX MSI.
 - Target Windows 10 and Windows 11; the exact minimum Windows 10 build will be validated with the first WinUI/installer prototype.
-- Installs and configures the Windows service and service SID/account.
-- Applies restrictive ACLs to binaries and `%ProgramData%\ResticPal`.
-- Registers the lightweight tray process for interactive user logon.
-- Installs the on-demand WinUI application, updater, and pinned restic binary.
+- Qualify virtual-account source access, ProgramData ACL behavior, VSS privileges, repair, same/major upgrades, and reboot/restart cases.
+- Add a Start Menu entry and installer UI.
+- Install an updater after its trust and rollback design is implemented.
 - Offers initial local setup or optional enrollment by bootstrap URL.
-- Supports repair/uninstall without deleting repositories. Removal of local configuration and credentials must be an explicit choice.
+- Add an explicit uninstall choice for removing local configuration and credentials; default uninstall remains data-preserving.
 
 ## Logging and audit
 
@@ -428,7 +440,7 @@ The development WinUI project currently declares `10.0.17763.0` (Windows 10 vers
 
 ## Security boundaries
 
-The service-only execution boundary, shell-free command construction, typed option validation, bounded IPC/progress parsing, DPAPI credential references, and append-only operation checks are implemented. Filesystem ACL protection for installed binaries/configuration and update/policy signature boundaries still depend on the installer, enrollment, and updater milestones.
+The service-only execution boundary, shell-free command construction, typed option validation, bounded IPC/progress parsing, DPAPI credential references, append-only operation checks, and initial MSI ACL authoring are implemented. Installed ACL behavior still needs elevated qualification, and update/policy signature boundaries still depend on the enrollment and updater milestones.
 
 - Only the service launches restic.
 - Installed executable paths will be fixed and ACL-protected; the current executor already fixes restic to the sibling application path.
@@ -448,7 +460,7 @@ The service-only execution boundary, shell-free command construction, typed opti
    - Sleep/resume event handling and two-hour power request.
    - Measure idle service/tray resource use.
 
-   The service host, named-pipe authorization, resume event, and timed power request exist. A real-restic disposable local-repository lifecycle is covered by an opt-in non-elevated test, and an exact VSS variant is available for elevated/service qualification. Installation/identity, successful elevated VSS qualification, OS-matrix qualification, and resource measurement remain.
+   The service host, named-pipe authorization, resume event, timed power request, MSI service registration, and elevated installed-service harness exist. A real-restic disposable local-repository lifecycle is covered by an opt-in non-elevated test, and exact VSS variants are available for elevated/executed-service qualification. Successful elevated identity/VSS execution, OS-matrix qualification, and resource measurement remain.
 
 2. **Local vertical slice — functional development slice**
    - Rust service and tray.
@@ -456,7 +468,7 @@ The service-only execution boundary, shell-free command construction, typed opti
    - Bundled restic, one repository, source selection, daily/wake scheduling, progress, cancellation, and history.
    - DPAPI/CNG secret storage.
 
-   All listed application behaviors are implemented except release bundling of restic and production installation/qualification. Cancellation is currently immediate Job Object termination rather than graceful-first shutdown.
+   All listed application behaviors and development release bundling are implemented. Production installation/qualification remains. Cancellation is currently immediate Job Object termination rather than graceful-first shutdown.
 
 3. **Repository and policy breadth — partially implemented**
    - Create/connect flows and typed common backends.
@@ -469,12 +481,14 @@ The service-only execution boundary, shell-free command construction, typed opti
 4. **Enrollment and reporting — not started**
    - Bootstrap flow, device identity, signed policy cache, encrypted secret bootstrap, metadata-file mode, status reports, schemas, fixtures, and protocol tests.
 
-5. **Packaging and updates — package reference only**
+5. **Packaging and updates — installer prototype**
    - WiX MSI, startup registration, upgrade/repair/uninstall behavior, NetSparkle appcast verification, and elevated atomic updater.
+
+   The x64 MSI, service/tray registration, bundled restic, data-preserving uninstall authoring, validation, and E2E harness exist. Privileged execution, upgrade/repair qualification, installer UX/bootstrap, signing, and the updater remain.
 
 ## Required test themes
 
-The 109-test automated Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, policy precedence and locks, command construction, append-only authorization, configuration bounds, named-pipe framing/ACL/token checks, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, and SQLite history retention/redaction/restart behavior. Two additional ignored, opt-in real-restic tests create disposable local repositories: the normal developer variant removes only the VSS flag after asserting the production builder supplied it, while the exact production variant requires an elevated token with VSS access. The lifecycle verifies missing-repository detection, initialization, wrong-password rejection, probe, append-only backup, snapshots, check, and changed second-backup behavior. A PowerShell helper locates or checksum-verifies a pinned restic test binary without writing it into the repository. The WinUI project is build-validated but does not yet have an automated UI test suite.
+The 109-test automated Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, policy precedence and locks, command construction, append-only authorization, configuration bounds, named-pipe framing/ACL/token checks, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, and SQLite history retention/redaction/restart behavior. Two additional ignored, opt-in real-restic tests create disposable local repositories: the normal developer variant removes only the VSS flag after asserting the production builder supplied it, while the exact production variant requires an elevated token with VSS access. The lifecycle verifies missing-repository detection, initialization, wrong-password rejection, probe, append-only backup, snapshots, check, and changed second-backup behavior. A PowerShell helper locates or checksum-verifies a pinned restic test binary without writing it into the repository. The MSI is release-build, ICE, administrative-image, payload-hash, restic-version, and packaged-service console validated. The elevated installed-service lifecycle is implemented but still awaiting execution across the local UAC boundary. The WinUI project is build-validated but does not yet have an automated UI test suite.
 
 The following themes remain required as their corresponding product areas land:
 

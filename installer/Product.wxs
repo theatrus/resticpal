@@ -1,0 +1,78 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="resticpal"
+           Manufacturer="Yann Ramin"
+           Version="$(ProductVersion)"
+           UpgradeCode="C10194E3-DD2B-42E2-84E4-0A4CEC84F11C"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Compressed="yes">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of resticpal is already installed."
+                  Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="resticpal" />
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="PROGRAMDATADIR" Name="ResticPal" />
+    </StandardDirectory>
+    <Feature Id="Complete" Title="resticpal" Level="1" AllowAdvertise="no">
+      <Files Directory="INSTALLFOLDER" Include="$(StageDir)\**">
+        <Exclude Files="$(StageDir)\resticpal-service.exe" />
+      </Files>
+
+      <Component Id="ServiceComponent"
+                 Guid="5606D705-0482-413E-B476-B81CA4A0BCF2"
+                 Directory="INSTALLFOLDER">
+        <File Id="ServiceExecutable"
+              Source="$(StageDir)\resticpal-service.exe"
+              KeyPath="yes" />
+        <ServiceInstall Id="ServiceInstaller"
+                        Name="ResticPal"
+                        DisplayName="resticpal backup service"
+                        Description="Runs machine-wide restic backups and exposes protected local status."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="NT SERVICE\ResticPal"
+                        Vital="yes">
+          <util:ServiceConfig FirstFailureActionType="restart"
+                              SecondFailureActionType="restart"
+                              ThirdFailureActionType="none"
+                              RestartServiceDelayInSeconds="30"
+                              ResetPeriodInDays="1" />
+        </ServiceInstall>
+        <ServiceControl Id="ServiceLifecycle"
+                        Name="ResticPal"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+
+      <Component Id="ProgramDataPermissions"
+                 Guid="E00F5551-A672-4A89-8A3C-B4EF509FB47D"
+                 Directory="PROGRAMDATADIR"
+                 KeyPath="yes">
+        <CreateFolder>
+          <util:PermissionEx User="NT SERVICE\ResticPal" GenericAll="yes" />
+          <util:PermissionEx User="BUILTIN\Administrators" GenericAll="yes" />
+          <util:PermissionEx User="NT AUTHORITY\SYSTEM" GenericAll="yes" />
+        </CreateFolder>
+      </Component>
+
+      <Component Id="TrayStartup"
+                 Guid="17E07A3D-C868-4D1F-9701-0CE3F77B2164"
+                 Directory="INSTALLFOLDER">
+        <RegistryValue Root="HKLM"
+                       Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="ResticPal"
+                       Type="string"
+                       Value="&quot;[INSTALLFOLDER]resticpal-tray.exe&quot;"
+                       KeyPath="yes" />
+      </Component>
+
+    </Feature>
+  </Package>
+</Wix>

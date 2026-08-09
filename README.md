@@ -12,6 +12,8 @@ The agreed product and architecture direction is recorded in [DESIGN.md](DESIGN.
 - `apps/resticpal-service`: Rust Windows service host
 - `apps/resticpal-tray`: low-resource native Rust/Win32 tray host
 - `apps/ResticPal.UI`: on-demand .NET 10 / WinUI 3 application
+- `installer`: WiX 6 per-machine x64 MSI authoring
+- `scripts`: verified restic acquisition plus local-repository and installed-service test harnesses
 - `config`: example human-editable configuration
 
 ## Current implementation slice
@@ -49,9 +51,12 @@ The first slice establishes:
 - elevated, per-field policy-aware schedule configuration with atomic persistence and immediate scheduler reevaluation;
 - a WinUI Schedule page for interval, wake grace, wake-lock timeout, battery, and metered-network behavior;
 - bounded SQLite run history containing only timestamps, outcomes, aggregate counts, sanitized codes, and snapshot identifiers;
-- read-only bounded history IPC for interactive users and a native WinUI History page.
+- read-only bounded history IPC for interactive users and a native WinUI History page;
+- a build-validated per-machine x64 MSI containing the release service, tray, self-contained WinUI application, and pinned restic 0.19.1;
+- virtual-service-account registration, machine-data ACL authoring, service recovery, tray logon registration, and data-preserving uninstall behavior;
+- an elevated installed-service harness that drives configuration, credential provisioning, repository initialization, append-only validation, VSS backup, restart persistence, and uninstall through the production named pipe.
 
-Credential provisioning through installer bootstrap/enrollment, automatic discovery for newly created profiles, direct-file configuration watching, installation, and enrollment are not wired up yet. The executor fails closed when a referenced credential is absent, corrupt, or not a valid environment value, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
+Credential provisioning through installer bootstrap/enrollment, automatic discovery for newly created profiles, direct-file configuration watching, and enrollment are not wired up yet. The development MSI supplies the pinned sibling `restic.exe`, but its service-account/VSS lifecycle still requires qualification from an elevated shell and across the supported Windows matrix. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
 
 ## Build and test
 
@@ -77,6 +82,26 @@ That non-elevated test verifies that the production invocation requests VSS, the
 ```
 
 Pass `-ResticPath C:\path\to\restic.exe` to test a specific binary. The lifecycle covers missing-repository detection, initialization, password validation, append-only backups, snapshots/check inspection, and a second changed backup. Neither test writes a restic binary or repository into the working tree.
+
+Build the development MSI with WiX 6. The script derives the package version from `Cargo.toml`, creates release Rust and self-contained WinUI payloads, downloads and verifies the pinned restic binary when necessary, embeds notices, and runs Windows Installer ICE validation:
+
+```powershell
+.\scripts\Build-Installer.ps1
+```
+
+Validate the resulting MSI without elevation by performing an administrative extraction and running its packaged binaries:
+
+```powershell
+.\scripts\Test-InstallerPackage.ps1
+```
+
+From an elevated PowerShell session on a machine without an existing ResticPal install or data directory, run the destructive-but-self-cleaning installed-service test:
+
+```powershell
+.\scripts\Test-InstalledResticPal.ps1
+```
+
+The harness refuses to overwrite existing ResticPal state. It installs the MSI silently, verifies the virtual service account and tray registration, configures a disposable local repository through protocol v2, performs a real VSS backup, restarts the service, verifies durable history, uninstalls, proves machine data survived uninstall, and then removes only the synthetic data it created. Pass `-KeepInstalled` to retain the test installation for manual UI/tray inspection.
 
 Run a non-service smoke test for the service host:
 
