@@ -1,23 +1,28 @@
+mod conditions;
 mod executor;
 mod power_request;
 mod runtime;
+mod state;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
+use chrono::Utc;
+use conditions::{SystemConditions, WinRtApartment};
 use executor::{
     BackupOutcome, CancellationToken, DpapiSecretResolver, ResticExecutor, SecretResolver,
     SystemWakeLockProvider, UnavailableSecretResolver,
 };
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::{DEFAULT_PIPE_NAME, NamedPipeServer};
-use runtime::{RuntimeEvent, ServiceRuntime};
+use runtime::{RuntimeEvent, ScheduleAction, ServiceRuntime};
 use windows_service::define_windows_service;
 use windows_service::service::{
     PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
@@ -76,6 +81,13 @@ fn service_main(arguments: Vec<OsString>) {
 }
 
 fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
+    let _winrt_apartment = match WinRtApartment::initialize() {
+        Ok(apartment) => Some(apartment),
+        Err(error) => {
+            eprintln!("could not initialize Windows Runtime network checks: {error}");
+            None
+        }
+    };
     let (event_tx, event_rx) = mpsc::channel();
     let handler_tx = event_tx.clone();
 
@@ -176,11 +188,11 @@ fn run_event_loop(
     executor: ResticExecutor,
     event_sender: mpsc::Sender<RuntimeEvent>,
 ) {
-    // The scheduler and backup executor will share this event loop. A long
-    // timeout is intentional: control, timer, network, and IPC sources wake it.
     let mut active_backup: Option<CancellationToken> = None;
+    evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
     loop {
-        match events.recv_timeout(Duration::from_secs(60)) {
+        let delay = runtime.next_evaluation_delay(Utc::now());
+        match events.recv_timeout(delay) {
             Ok(RuntimeEvent::Stop) | Err(RecvTimeoutError::Disconnected) => {
                 if let Some(cancellation) = &active_backup {
                     cancellation.cancel();
@@ -188,22 +200,7 @@ fn run_event_loop(
                 break;
             }
             Ok(RuntimeEvent::RunNow) => {
-                if active_backup.is_some() {
-                    continue;
-                }
-                let cancellation = CancellationToken::default();
-                active_backup = Some(cancellation.clone());
-                if start_backup_worker(
-                    Arc::clone(&runtime),
-                    executor.clone(),
-                    cancellation,
-                    event_sender.clone(),
-                )
-                .is_err()
-                {
-                    runtime.finish_backup(&BackupOutcome::failed("executor_start_failed"));
-                    active_backup = None;
-                }
+                evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
             }
             Ok(RuntimeEvent::Cancel) => {
                 if let Some(cancellation) = &active_backup {
@@ -214,15 +211,63 @@ fn run_event_loop(
                 runtime.finish_backup(&outcome);
                 active_backup = None;
             }
+            Ok(RuntimeEvent::Resume) => {
+                runtime.record_resume(Utc::now());
+                evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
+            }
             Ok(
-                RuntimeEvent::Resume
-                | RuntimeEvent::PowerStatusChanged
+                RuntimeEvent::PowerStatusChanged
                 | RuntimeEvent::TimeChanged
                 | RuntimeEvent::Deferred,
             )
             | Err(RecvTimeoutError::Timeout) => {
-                // Re-evaluate policy and scheduling as executor state is added.
+                evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
             }
+        }
+    }
+}
+
+fn evaluate_and_maybe_start(
+    runtime: &Arc<ServiceRuntime>,
+    executor: &ResticExecutor,
+    event_sender: &mpsc::Sender<RuntimeEvent>,
+    active_backup: &mut Option<CancellationToken>,
+) {
+    if active_backup.is_some() {
+        return;
+    }
+
+    if !matches!(
+        runtime.evaluate_schedule(Utc::now(), current_conditions()),
+        ScheduleAction::Start { .. }
+    ) {
+        return;
+    }
+
+    let cancellation = CancellationToken::default();
+    *active_backup = Some(cancellation.clone());
+    if start_backup_worker(
+        Arc::clone(runtime),
+        executor.clone(),
+        cancellation,
+        event_sender.clone(),
+    )
+    .is_err()
+    {
+        runtime.finish_backup(&BackupOutcome::failed("executor_start_failed"));
+        *active_backup = None;
+    }
+}
+
+fn current_conditions() -> SystemConditions {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    match SystemConditions::query() {
+        Ok(conditions) => conditions,
+        Err(error) => {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("could not query power or network conditions: {error}");
+            }
+            SystemConditions::conservative()
         }
     }
 }

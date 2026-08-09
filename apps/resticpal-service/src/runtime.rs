@@ -2,16 +2,26 @@ use std::fs;
 use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration as StdDuration;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use resticpal_core::config::{EffectiveConfig, LocalConfig, LocalConfigError};
 use resticpal_core::policy::{PolicyError, ResolvedConfig, resolve_config};
+use resticpal_core::schedule::{
+    BackupTrigger, ScheduleBlocker, ScheduleDecision, SchedulerSnapshot, decide,
+};
 use resticpal_core::status::{BackupPhase, BackupProgress, BackupState, ServiceStatus};
 use resticpal_protocol::{Request, RequestCommand, Response, ResponsePayload};
 use resticpal_windows::named_pipe::ClientIdentity;
 use thiserror::Error;
 
+use crate::conditions::SystemConditions;
 use crate::executor::{BackupOutcome, BackupOutcomeKind};
+use crate::state::ScheduleStateStore;
+
+const CONDITION_RETRY_SECONDS: u64 = 60;
+const INITIAL_FAILURE_RETRY_MINUTES: i64 = 5;
+const MAX_FAILURE_BACKOFF_EXPONENT: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
@@ -25,9 +35,24 @@ pub enum RuntimeEvent {
     BackupFinished(BackupOutcome),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleAction {
+    None,
+    Start { trigger: BackupTrigger },
+}
+
+struct RuntimeState {
+    status: ServiceStatus,
+    resumed_at: Option<DateTime<Utc>>,
+    not_before: Option<DateTime<Utc>>,
+    manual_requested: bool,
+    consecutive_failures: u32,
+}
+
 pub struct ServiceRuntime {
     config: EffectiveConfig,
-    status: Mutex<ServiceStatus>,
+    state: Mutex<RuntimeState>,
+    state_store: Option<ScheduleStateStore>,
     events: Sender<RuntimeEvent>,
 }
 
@@ -39,12 +64,44 @@ impl ServiceRuntime {
             Err(error) => return Err(error.into()),
         };
         let resolved = resolve_config(&EffectiveConfig::default(), &local, None)?;
-        Ok(Self::from_resolved(resolved, events))
+        let state_store = ScheduleStateStore::next_to_config(path);
+        let last_success = match state_store.load_last_success() {
+            Ok(last_success) => last_success,
+            Err(error) => {
+                eprintln!(
+                    "could not load schedule state next to {}: {error}; an immediate backup will be eligible",
+                    path.display()
+                );
+                None
+            }
+        };
+        Ok(Self::from_resolved_with_state(
+            resolved,
+            events,
+            last_success,
+            Some(state_store),
+        ))
     }
 
+    #[cfg(test)]
     pub fn from_resolved(resolved: ResolvedConfig, events: Sender<RuntimeEvent>) -> Self {
+        Self::from_resolved_with_state(resolved, events, None, None)
+    }
+
+    fn from_resolved_with_state(
+        resolved: ResolvedConfig,
+        events: Sender<RuntimeEvent>,
+        last_success: Option<DateTime<Utc>>,
+        state_store: Option<ScheduleStateStore>,
+    ) -> Self {
         let now = Utc::now();
         let configured = resolved.effective.is_configured();
+        let next_deadline = configured.then(|| {
+            last_success.map_or(now, |last_success| {
+                last_success
+                    + Duration::hours(i64::from(resolved.effective.schedule.interval_hours))
+            })
+        });
         let status = ServiceStatus {
             state: if configured {
                 BackupState::Idle
@@ -53,8 +110,8 @@ impl ServiceRuntime {
             },
             state_since: now,
             last_attempt: None,
-            last_success: None,
-            next_deadline: configured.then_some(now),
+            last_success,
+            next_deadline,
             repository_display_name: resolved.effective.repository.display_name.clone(),
             repository_mode: resolved.effective.repository.mode,
             managed_revision: resolved.managed_revision,
@@ -63,7 +120,14 @@ impl ServiceRuntime {
 
         Self {
             config: resolved.effective,
-            status: Mutex::new(status),
+            state: Mutex::new(RuntimeState {
+                status,
+                resumed_at: None,
+                not_before: None,
+                manual_requested: false,
+                consecutive_failures: 0,
+            }),
+            state_store,
             events,
         }
     }
@@ -72,25 +136,32 @@ impl ServiceRuntime {
         let now = Utc::now();
         Self {
             config: EffectiveConfig::default(),
-            status: Mutex::new(ServiceStatus {
-                state: BackupState::Failed {
-                    code: "configuration_invalid".to_owned(),
+            state: Mutex::new(RuntimeState {
+                status: ServiceStatus {
+                    state: BackupState::Failed {
+                        code: "configuration_invalid".to_owned(),
+                    },
+                    state_since: now,
+                    last_attempt: None,
+                    last_success: None,
+                    next_deadline: None,
+                    repository_display_name: None,
+                    repository_mode: Default::default(),
+                    managed_revision: None,
+                    progress: None,
                 },
-                state_since: now,
-                last_attempt: None,
-                last_success: None,
-                next_deadline: None,
-                repository_display_name: None,
-                repository_mode: Default::default(),
-                managed_revision: None,
-                progress: None,
+                resumed_at: None,
+                not_before: None,
+                manual_requested: false,
+                consecutive_failures: 0,
             }),
+            state_store: None,
             events,
         }
     }
 
     pub fn status(&self) -> ServiceStatus {
-        self.status_guard().clone()
+        self.state_guard().status.clone()
     }
 
     pub fn config(&self) -> EffectiveConfig {
@@ -98,7 +169,8 @@ impl ServiceRuntime {
     }
 
     pub fn update_progress(&self, progress: BackupProgress) {
-        let mut status = self.status_guard();
+        let mut state = self.state_guard();
+        let status = &mut state.status;
         if matches!(status.state, BackupState::Running { .. }) {
             status.state = BackupState::Running {
                 phase: BackupPhase::Uploading,
@@ -108,24 +180,139 @@ impl ServiceRuntime {
     }
 
     pub fn finish_backup(&self, outcome: &BackupOutcome) {
-        let now = Utc::now();
-        let mut status = self.status_guard();
-        status.state = match &outcome.kind {
+        self.finish_backup_at(Utc::now(), outcome);
+    }
+
+    fn finish_backup_at(&self, now: DateTime<Utc>, outcome: &BackupOutcome) {
+        let mut state = self.state_guard();
+        let succeeded = matches!(
+            outcome.kind,
+            BackupOutcomeKind::Succeeded | BackupOutcomeKind::SucceededWithWarnings
+        );
+        state.status.state = match &outcome.kind {
             BackupOutcomeKind::Succeeded => BackupState::Succeeded,
             BackupOutcomeKind::SucceededWithWarnings => BackupState::SucceededWithWarnings,
             BackupOutcomeKind::Failed { code } => BackupState::Failed { code: code.clone() },
             BackupOutcomeKind::Cancelled => BackupState::Cancelled,
         };
-        if matches!(
-            outcome.kind,
-            BackupOutcomeKind::Succeeded | BackupOutcomeKind::SucceededWithWarnings
-        ) {
-            status.last_success = Some(now);
-            status.next_deadline =
+        if succeeded {
+            state.status.last_success = Some(now);
+            state.status.next_deadline =
                 Some(now + Duration::hours(i64::from(self.config.schedule.interval_hours)));
+            state.not_before = None;
+            state.consecutive_failures = 0;
+        } else {
+            if matches!(outcome.kind, BackupOutcomeKind::Failed { .. }) {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            }
+            let exponent = state
+                .consecutive_failures
+                .saturating_sub(1)
+                .min(MAX_FAILURE_BACKOFF_EXPONENT);
+            let retry_minutes = INITIAL_FAILURE_RETRY_MINUTES * i64::from(1_u32 << exponent);
+            let retry_at = now + Duration::minutes(retry_minutes);
+            state.not_before = Some(retry_at);
+            state.status.next_deadline = Some(retry_at);
         }
-        status.state_since = now;
-        status.progress = None;
+        state.resumed_at = None;
+        state.status.state_since = now;
+        state.status.progress = None;
+        drop(state);
+
+        if succeeded
+            && let Some(store) = &self.state_store
+            && let Err(error) = store.save_last_success(now)
+        {
+            eprintln!("could not persist the last successful backup time: {error}");
+        }
+    }
+
+    pub fn record_resume(&self, now: DateTime<Utc>) {
+        self.state_guard().resumed_at = Some(now);
+    }
+
+    pub fn evaluate_schedule(
+        &self,
+        now: DateTime<Utc>,
+        conditions: SystemConditions,
+    ) -> ScheduleAction {
+        if !self.config.is_configured() {
+            return ScheduleAction::None;
+        }
+
+        let mut state = self.state_guard();
+        let decision = decide(
+            &self.config.schedule,
+            &SchedulerSnapshot {
+                now,
+                last_success: state.status.last_success,
+                resumed_at: state.resumed_at,
+                not_before: state.not_before,
+                manual_requested: state.manual_requested,
+                backup_running: matches!(state.status.state, BackupState::Running { .. }),
+                network_required: repository_requires_network(
+                    self.config.repository.url.as_deref().unwrap_or_default(),
+                ),
+                network_available: conditions.network_available,
+                on_battery: conditions.on_battery,
+                metered_network: conditions.metered_network,
+            },
+        );
+
+        match decision {
+            ScheduleDecision::AlreadyRunning => ScheduleAction::None,
+            ScheduleDecision::Start { trigger } => {
+                state.status.state = BackupState::Running {
+                    phase: BackupPhase::PreparingSnapshot,
+                };
+                state.status.state_since = now;
+                state.status.last_attempt = Some(now);
+                state.status.progress = None;
+                state.status.next_deadline = None;
+                state.manual_requested = false;
+                state.resumed_at = None;
+                state.not_before = None;
+                ScheduleAction::Start { trigger }
+            }
+            ScheduleDecision::Idle { next_deadline } => {
+                state.status.next_deadline = Some(next_deadline);
+                if matches!(state.status.state, BackupState::Waiting { .. }) {
+                    transition_state(&mut state.status, BackupState::Idle, now);
+                }
+                state.resumed_at = None;
+                ScheduleAction::None
+            }
+            ScheduleDecision::Waiting {
+                blockers, retry_at, ..
+            } => {
+                let reason = waiting_reason(blockers[0]);
+                transition_state(&mut state.status, BackupState::Waiting { reason }, now);
+                state.status.next_deadline = retry_at.or(state.not_before).or(Some(now));
+                ScheduleAction::None
+            }
+        }
+    }
+
+    pub fn next_evaluation_delay(&self, now: DateTime<Utc>) -> StdDuration {
+        let state = self.state_guard();
+        if matches!(
+            state.status.state,
+            BackupState::Waiting {
+                reason: resticpal_core::status::WaitingReason::Network
+                    | resticpal_core::status::WaitingReason::Battery
+                    | resticpal_core::status::WaitingReason::MeteredNetwork
+            }
+        ) {
+            return StdDuration::from_secs(CONDITION_RETRY_SECONDS);
+        }
+
+        state.status.next_deadline.map_or_else(
+            || StdDuration::from_secs(60 * 60),
+            |deadline| {
+                let milliseconds = (deadline - now).num_milliseconds().max(0);
+                StdDuration::from_millis(u64::try_from(milliseconds).unwrap_or(u64::MAX))
+            },
+        )
     }
 
     pub fn handle_request(&self, request: Request, _identity: ClientIdentity) -> Response {
@@ -141,33 +328,29 @@ impl ServiceRuntime {
                         "Configure backup sources and a repository first.",
                     )
                 } else {
-                    let mut status = self.status_guard();
-                    if matches!(status.state, BackupState::Running { .. }) {
+                    let mut state = self.state_guard();
+                    if matches!(state.status.state, BackupState::Running { .. }) {
                         rejected("already_running", "A backup is already running.")
                     } else {
+                        state.manual_requested = true;
+                        state.not_before = None;
                         match self.events.send(RuntimeEvent::RunNow) {
-                            Ok(()) => {
-                                let now = Utc::now();
-                                status.state = BackupState::Running {
-                                    phase: BackupPhase::PreparingSnapshot,
-                                };
-                                status.state_since = now;
-                                status.last_attempt = Some(now);
-                                status.progress = None;
-                                ResponsePayload::Accepted {
-                                    message: "Backup request accepted.".to_owned(),
-                                }
+                            Ok(()) => ResponsePayload::Accepted {
+                                message: "Backup request accepted.".to_owned(),
+                            },
+                            Err(_) => {
+                                state.manual_requested = false;
+                                rejected(
+                                    "service_stopping",
+                                    "The backup service is stopping. Try again shortly.",
+                                )
                             }
-                            Err(_) => rejected(
-                                "service_stopping",
-                                "The backup service is stopping. Try again shortly.",
-                            ),
                         }
                     }
                 }
             }
             RequestCommand::CancelBackup => {
-                if matches!(self.status_guard().state, BackupState::Running { .. }) {
+                if matches!(self.state_guard().status.state, BackupState::Running { .. }) {
                     self.send_event(RuntimeEvent::Cancel, "Cancellation requested.")
                 } else {
                     rejected("not_running", "There is no running backup to cancel.")
@@ -179,9 +362,15 @@ impl ServiceRuntime {
                         "invalid_deferral",
                         "A deferral must be between one minute and 24 hours.",
                     )
+                } else if matches!(self.state_guard().status.state, BackupState::Running { .. }) {
+                    rejected("already_running", "A running backup cannot be deferred.")
                 } else {
-                    self.status_guard().next_deadline =
-                        Some(Utc::now() + Duration::minutes(i64::from(minutes)));
+                    let deadline = Utc::now() + Duration::minutes(i64::from(minutes));
+                    let mut state = self.state_guard();
+                    state.manual_requested = false;
+                    state.not_before = Some(deadline);
+                    state.status.next_deadline = Some(deadline);
+                    drop(state);
                     self.send_event(RuntimeEvent::Deferred, "Backup deferred.")
                 }
             }
@@ -202,11 +391,50 @@ impl ServiceRuntime {
         }
     }
 
-    fn status_guard(&self) -> MutexGuard<'_, ServiceStatus> {
-        self.status
+    fn state_guard(&self) -> MutexGuard<'_, RuntimeState> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn transition_state(status: &mut ServiceStatus, next: BackupState, now: DateTime<Utc>) {
+    if status.state != next {
+        status.state = next;
+        status.state_since = now;
+    }
+}
+
+fn waiting_reason(blocker: ScheduleBlocker) -> resticpal_core::status::WaitingReason {
+    match blocker {
+        ScheduleBlocker::WakeGrace => resticpal_core::status::WaitingReason::WakeGrace,
+        ScheduleBlocker::NetworkUnavailable => resticpal_core::status::WaitingReason::Network,
+        ScheduleBlocker::BatteryDisallowed => resticpal_core::status::WaitingReason::Battery,
+        ScheduleBlocker::MeteredNetworkDisallowed => {
+            resticpal_core::status::WaitingReason::MeteredNetwork
+        }
+    }
+}
+
+fn repository_requires_network(repository: &str) -> bool {
+    let repository = repository.trim();
+    let local = repository
+        .strip_prefix("local:")
+        .or_else(|| repository.strip_prefix("LOCAL:"));
+    if let Some(path) = local {
+        return path.starts_with(r"\\");
+    }
+    if repository.starts_with(r"\\") {
+        return true;
+    }
+    if repository.len() >= 3
+        && repository.as_bytes()[0].is_ascii_alphabetic()
+        && repository.as_bytes()[1] == b':'
+        && matches!(repository.as_bytes()[2], b'\\' | b'/')
+    {
+        return false;
+    }
+    repository.contains(':')
 }
 
 fn rejected(code: &str, message: &str) -> ResponsePayload {
@@ -268,6 +496,14 @@ mod tests {
         (ServiceRuntime::from_resolved(resolved, events), receiver)
     }
 
+    fn available_conditions() -> SystemConditions {
+        SystemConditions {
+            network_available: true,
+            on_battery: false,
+            metered_network: false,
+        }
+    }
+
     #[test]
     fn status_reports_an_unconfigured_service() {
         let (runtime, _events) = runtime(false);
@@ -285,12 +521,18 @@ mod tests {
     }
 
     #[test]
-    fn run_now_transitions_to_running_and_queues_the_executor() {
+    fn run_now_queues_a_scheduler_evaluation_that_starts_the_executor() {
         let (runtime, events) = runtime(true);
         let response = runtime.handle_request(Request::new(2, RequestCommand::RunBackupNow), USER);
 
         assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
         assert_eq!(events.recv().expect("runtime event"), RuntimeEvent::RunNow);
+        assert_eq!(
+            runtime.evaluate_schedule(Utc::now(), available_conditions()),
+            ScheduleAction::Start {
+                trigger: BackupTrigger::Manual
+            }
+        );
         assert!(matches!(
             runtime.status().state,
             BackupState::Running {
@@ -337,6 +579,10 @@ mod tests {
         let response = runtime.handle_request(Request::new(7, RequestCommand::RunBackupNow), USER);
         assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
         assert_eq!(events.recv().expect("run event"), RuntimeEvent::RunNow);
+        assert!(matches!(
+            runtime.evaluate_schedule(Utc::now(), available_conditions()),
+            ScheduleAction::Start { .. }
+        ));
 
         runtime.update_progress(BackupProgress {
             percent_done: Some(50),
@@ -391,6 +637,10 @@ mod tests {
 
         let _ = runtime.handle_request(Request::new(9, RequestCommand::RunBackupNow), USER);
         assert_eq!(events.recv().expect("run event"), RuntimeEvent::RunNow);
+        assert!(matches!(
+            runtime.evaluate_schedule(Utc::now(), available_conditions()),
+            ScheduleAction::Start { .. }
+        ));
         let running_cancel =
             runtime.handle_request(Request::new(10, RequestCommand::CancelBackup), USER);
         assert!(matches!(
@@ -442,6 +692,123 @@ mod tests {
                     ..
                 }
             }
+        ));
+    }
+
+    #[test]
+    fn overdue_startup_runs_without_a_manual_request() {
+        let (runtime, _events) = runtime(true);
+
+        assert_eq!(
+            runtime.evaluate_schedule(Utc::now(), available_conditions()),
+            ScheduleAction::Start {
+                trigger: BackupTrigger::Scheduled
+            }
+        );
+    }
+
+    #[test]
+    fn resume_catch_up_waits_for_the_configured_grace_period() {
+        let (runtime, _events) = runtime(true);
+        let resumed_at = Utc::now();
+        runtime.record_resume(resumed_at);
+
+        assert_eq!(
+            runtime.evaluate_schedule(resumed_at, available_conditions()),
+            ScheduleAction::None
+        );
+        assert!(matches!(
+            runtime.status().state,
+            BackupState::Waiting {
+                reason: resticpal_core::status::WaitingReason::WakeGrace
+            }
+        ));
+        assert_eq!(
+            runtime.evaluate_schedule(resumed_at + Duration::seconds(300), available_conditions()),
+            ScheduleAction::Start {
+                trigger: BackupTrigger::ResumeCatchUp
+            }
+        );
+    }
+
+    #[test]
+    fn battery_policy_blocks_until_power_conditions_change() {
+        let (mut runtime, _events) = runtime(true);
+        runtime.config.schedule.allow_on_battery = false;
+        let now = Utc::now();
+
+        assert_eq!(
+            runtime.evaluate_schedule(
+                now,
+                SystemConditions {
+                    on_battery: true,
+                    ..available_conditions()
+                }
+            ),
+            ScheduleAction::None
+        );
+        assert!(matches!(
+            runtime.status().state,
+            BackupState::Waiting {
+                reason: resticpal_core::status::WaitingReason::Battery
+            }
+        ));
+        assert!(matches!(
+            runtime.evaluate_schedule(now, available_conditions()),
+            ScheduleAction::Start { .. }
+        ));
+    }
+
+    #[test]
+    fn failed_backups_use_bounded_exponential_retry_delays() {
+        let (runtime, _events) = runtime(true);
+        let now = Utc::now();
+        assert!(matches!(
+            runtime.evaluate_schedule(now, available_conditions()),
+            ScheduleAction::Start { .. }
+        ));
+        runtime.finish_backup_at(now, &BackupOutcome::failed("repository_unreachable"));
+
+        assert_eq!(
+            runtime.status().next_deadline,
+            Some(now + Duration::minutes(5))
+        );
+        assert_eq!(
+            runtime.evaluate_schedule(now, available_conditions()),
+            ScheduleAction::None
+        );
+        assert!(matches!(runtime.status().state, BackupState::Failed { .. }));
+
+        assert!(matches!(
+            runtime.evaluate_schedule(now + Duration::minutes(5), available_conditions()),
+            ScheduleAction::Start { .. }
+        ));
+        runtime.finish_backup_at(
+            now + Duration::minutes(5),
+            &BackupOutcome::failed("repository_unreachable"),
+        );
+        assert_eq!(
+            runtime.status().next_deadline,
+            Some(now + Duration::minutes(15))
+        );
+
+        for _ in 0..10 {
+            runtime.finish_backup_at(now, &BackupOutcome::failed("repository_unreachable"));
+        }
+        assert_eq!(
+            runtime.status().next_deadline,
+            Some(now + Duration::minutes(320))
+        );
+    }
+
+    #[test]
+    fn repository_network_detection_distinguishes_local_and_remote_targets() {
+        assert!(!repository_requires_network(r"C:\Backups\restic"));
+        assert!(!repository_requires_network("local:C:/Backups/restic"));
+        assert!(repository_requires_network(r"\\server\share\restic"));
+        assert!(repository_requires_network("s3:s3.example.test/bucket"));
+        assert!(repository_requires_network(
+            "sftp:user@example.test:/backup"
         ));
     }
 }

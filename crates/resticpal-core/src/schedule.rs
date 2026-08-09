@@ -8,8 +8,10 @@ pub struct SchedulerSnapshot {
     pub now: DateTime<Utc>,
     pub last_success: Option<DateTime<Utc>>,
     pub resumed_at: Option<DateTime<Utc>>,
+    pub not_before: Option<DateTime<Utc>>,
     pub manual_requested: bool,
     pub backup_running: bool,
+    pub network_required: bool,
     pub network_available: bool,
     pub on_battery: bool,
     pub metered_network: bool,
@@ -55,9 +57,18 @@ pub fn decide(config: &ScheduleConfig, snapshot: &SchedulerSnapshot) -> Schedule
         return ScheduleDecision::AlreadyRunning;
     }
 
-    let next_deadline = snapshot.last_success.map_or(snapshot.now, |last_success| {
+    let scheduled_deadline = snapshot.last_success.map_or(snapshot.now, |last_success| {
         last_success + Duration::hours(i64::from(config.interval_hours))
     });
+    let next_deadline = if snapshot.manual_requested {
+        scheduled_deadline
+    } else {
+        snapshot
+            .not_before
+            .map_or(scheduled_deadline, |not_before| {
+                scheduled_deadline.max(not_before)
+            })
+    };
     let due = snapshot.manual_requested || snapshot.now >= next_deadline;
 
     if !due {
@@ -86,7 +97,7 @@ pub fn decide(config: &ScheduleConfig, snapshot: &SchedulerSnapshot) -> Schedule
         }
     }
 
-    if !snapshot.network_available {
+    if snapshot.network_required && !snapshot.network_available {
         blockers.push(ScheduleBlocker::NetworkUnavailable);
     }
     if snapshot.on_battery && !config.allow_on_battery {
@@ -124,8 +135,10 @@ mod tests {
             now,
             last_success: Some(timestamp(8, 0)),
             resumed_at: None,
+            not_before: None,
             manual_requested: false,
             backup_running: false,
+            network_required: true,
             network_available: true,
             on_battery: false,
             metered_network: false,
@@ -205,6 +218,50 @@ mod tests {
         assert_eq!(
             decide(&ScheduleConfig::default(), &state),
             ScheduleDecision::AlreadyRunning
+        );
+    }
+
+    #[test]
+    fn a_deferral_postpones_an_overdue_scheduled_backup() {
+        let mut state = snapshot(timestamp(9, 0));
+        state.last_success = None;
+        state.not_before = Some(timestamp(9, 30));
+
+        assert_eq!(
+            decide(&ScheduleConfig::default(), &state),
+            ScheduleDecision::Idle {
+                next_deadline: timestamp(9, 30)
+            }
+        );
+    }
+
+    #[test]
+    fn a_manual_request_bypasses_deferral() {
+        let mut state = snapshot(timestamp(9, 0));
+        state.last_success = None;
+        state.not_before = Some(timestamp(9, 30));
+        state.manual_requested = true;
+
+        assert_eq!(
+            decide(&ScheduleConfig::default(), &state),
+            ScheduleDecision::Start {
+                trigger: BackupTrigger::Manual
+            }
+        );
+    }
+
+    #[test]
+    fn local_repositories_do_not_require_a_network() {
+        let mut state = snapshot(timestamp(9, 0));
+        state.last_success = None;
+        state.network_available = false;
+        state.network_required = false;
+
+        assert_eq!(
+            decide(&ScheduleConfig::default(), &state),
+            ScheduleDecision::Start {
+                trigger: BackupTrigger::Scheduled
+            }
         );
     }
 }

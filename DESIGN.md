@@ -231,6 +231,7 @@ Machine state lives under `%ProgramData%\ResticPal` with service/admin-only ACLs
 | Local configuration | `config.toml` | Human-editable, no secrets |
 | Managed policy cache | `managed-policy.json` | Signed, versioned, last-known-good |
 | Credential store | implementation-private | DPAPI/CNG protected and service-only |
+| Scheduler checkpoint | `state.json` | Last successful completion for restart-safe deadlines |
 | Run history | `state.db` | Bounded SQLite history |
 | Logs | `Logs\` | Structured, rotated, sanitized |
 | Bundled tools | under installation directory | Administrator/service write only |
