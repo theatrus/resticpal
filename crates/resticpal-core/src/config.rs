@@ -117,6 +117,7 @@ pub struct LocalManagementConfig {
     pub status_url: Option<String>,
     pub device_id: Option<String>,
     pub status_token_ref: Option<String>,
+    pub enrollment_key_ref: Option<String>,
 }
 
 impl LocalManagementConfig {
@@ -133,6 +134,7 @@ impl LocalManagementConfig {
                     || self.status_url.is_some()
                     || self.device_id.is_some()
                     || self.status_token_ref.is_some()
+                    || self.enrollment_key_ref.is_some()
                 {
                     return Err(ManagementConfigError::UnexpectedDisabledFields);
                 }
@@ -143,6 +145,7 @@ impl LocalManagementConfig {
                     || self.status_url.is_some()
                     || self.device_id.is_some()
                     || self.status_token_ref.is_some()
+                    || self.enrollment_key_ref.is_some()
                 {
                     return Err(ManagementConfigError::PlainModeCannotReport);
                 }
@@ -187,6 +190,13 @@ impl LocalManagementConfig {
                     .is_some_and(|reference| !is_valid_secret_reference(reference))
                 {
                     return Err(ManagementConfigError::InvalidStatusTokenReference);
+                }
+                if self
+                    .enrollment_key_ref
+                    .as_deref()
+                    .is_some_and(|reference| !is_valid_secret_reference(reference))
+                {
+                    return Err(ManagementConfigError::InvalidEnrollmentKeyReference);
                 }
             }
         }
@@ -508,6 +518,8 @@ pub enum ManagementConfigError {
     InvalidDeviceId,
     #[error("the status token reference is malformed")]
     InvalidStatusTokenReference,
+    #[error("the enrollment key reference is malformed")]
+    InvalidEnrollmentKeyReference,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]

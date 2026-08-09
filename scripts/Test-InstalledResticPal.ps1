@@ -74,7 +74,7 @@ function Invoke-ResticPalRequest([hashtable] $Command) {
 
     $client = [IO.Pipes.NamedPipeClientStream]::new(
         '.',
-        'ResticPal.v2',
+        'ResticPal.v3',
         [IO.Pipes.PipeDirection]::InOut,
         [IO.Pipes.PipeOptions]::None
     )

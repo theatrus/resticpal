@@ -29,6 +29,8 @@ public sealed partial class MainWindow : Window
     private bool _allowBatteryLocked;
     private bool _allowMeteredLocked;
     private bool _historyLoaded;
+    private bool _managementLoaded;
+    private bool _managedDevice;
     private IReadOnlySet<string> _configuredRepositorySecrets = new HashSet<string>();
 
     public ObservableCollection<string> BackupPaths { get; } = new();
@@ -55,9 +57,7 @@ public sealed partial class MainWindow : Window
         RepositoryPanel.Visibility = tag == "repository" ? Visibility.Visible : Visibility.Collapsed;
         SchedulePanel.Visibility = tag == "schedule" ? Visibility.Visible : Visibility.Collapsed;
         HistoryPanel.Visibility = tag == "history" ? Visibility.Visible : Visibility.Collapsed;
-        ComingSoonPanel.Visibility = tag is not ("overview" or "sources" or "repository" or "schedule" or "history")
-            ? Visibility.Visible
-            : Visibility.Collapsed;
+        ManagementPanel.Visibility = tag == "settings" ? Visibility.Visible : Visibility.Collapsed;
 
         if (tag == "sources" && !_sourcesLoaded)
         {
@@ -75,12 +75,119 @@ public sealed partial class MainWindow : Window
         {
             await LoadHistoryAsync();
         }
-        else if (tag is not ("overview" or "sources" or "repository" or "schedule" or "history"))
+        else if (tag == "settings" && !_managementLoaded)
         {
-            ComingSoonTitle.Text = args.IsSettingsSelected
-                ? "Application settings"
-                : args.SelectedItemContainer?.Content?.ToString() ?? "Coming soon";
+            await LoadManagementAsync();
         }
+    }
+
+    private async Task LoadManagementAsync()
+    {
+        SetManagementBusy(true);
+        try
+        {
+            ManagementConfiguration configuration = await _service.GetManagementAsync();
+            _managedDevice = configuration.Enrolled;
+            ManagementStatusTitle.Text = configuration.Enrolled
+                ? "Managed by your backup service"
+                : configuration.Mode == "plain_manifest"
+                    ? "Using a plain policy file"
+                    : "Not enrolled";
+            ManagementStatusDescription.Text = configuration.Enrolled
+                ? $"Device {configuration.DeviceId} receives signed policy from {configuration.ManifestUrl}."
+                : configuration.Mode == "plain_manifest"
+                    ? $"Policy is fetched from {configuration.ManifestUrl}; status reporting is disabled."
+                    : "Paste a current one-time bootstrap URL to enroll this PC.";
+            _managementLoaded = true;
+        }
+        catch (Exception exception)
+        {
+            ShowConnectionError(exception);
+        }
+        finally
+        {
+            SetManagementBusy(false);
+        }
+    }
+
+    private async void EnrollButton_Click(object sender, RoutedEventArgs e)
+    {
+        string bootstrapUrl = BootstrapUrlBox.Password.Trim();
+        if (string.IsNullOrWhiteSpace(bootstrapUrl))
+        {
+            ShowMessage(InfoBarSeverity.Warning, "Paste the one-time bootstrap URL first.");
+            return;
+        }
+        SetManagementBusy(true);
+        try
+        {
+            CommandResult result = await _service.EnrollAsync(bootstrapUrl);
+            ShowMessage(
+                result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning,
+                result.Message);
+            if (result.Accepted)
+            {
+                _managementLoaded = false;
+                await LoadManagementAsync();
+                await RefreshStatusAsync();
+            }
+        }
+        catch (Exception exception)
+        {
+            ShowConnectionError(exception);
+        }
+        finally
+        {
+            BootstrapUrlBox.Password = string.Empty;
+            SetManagementBusy(false);
+        }
+    }
+
+    private async void UnenrollButton_Click(object sender, RoutedEventArgs e)
+    {
+        var confirmation = new ContentDialog
+        {
+            Title = "Remove managed backup?",
+            Content = "This removes signed policy and status reporting from this PC. Existing backups and repository credentials remain available locally.",
+            PrimaryButtonText = "Remove management",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = (Content as FrameworkElement)?.XamlRoot,
+        };
+        if (await confirmation.ShowAsync() != ContentDialogResult.Primary)
+        {
+            return;
+        }
+        SetManagementBusy(true);
+        try
+        {
+            CommandResult result = await _service.UnenrollAsync();
+            ShowMessage(
+                result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning,
+                result.Message);
+            if (result.Accepted)
+            {
+                _managementLoaded = false;
+                await LoadManagementAsync();
+                await RefreshStatusAsync();
+            }
+        }
+        catch (Exception exception)
+        {
+            ShowConnectionError(exception);
+        }
+        finally
+        {
+            SetManagementBusy(false);
+        }
+    }
+
+    private void SetManagementBusy(bool busy)
+    {
+        ManagementProgress.IsActive = busy;
+        BootstrapUrlBox.IsEnabled = !busy;
+        EnrollButton.IsEnabled = !busy;
+        UnenrollButton.IsEnabled = !busy && _managedDevice;
     }
 
     private async void RunBackupButton_Click(object sender, RoutedEventArgs e)

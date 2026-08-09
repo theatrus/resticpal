@@ -10,6 +10,7 @@ mod state;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -32,6 +33,11 @@ use resticpal_protocol::RepositoryOperationKind;
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::{DEFAULT_PIPE_NAME, NamedPipeServer};
 use runtime::{RuntimeEvent, ScheduleAction, ServiceRuntime};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+use windows::Win32::System::Registry::{
+    HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
+};
+use windows::core::w;
 use windows_service::define_windows_service;
 use windows_service::service::{
     PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
@@ -41,6 +47,7 @@ use windows_service::service_control_handler::{
     self, ServiceControlHandlerResult, ServiceStatusHandle,
 };
 use windows_service::{Result as ServiceResult, service_dispatcher};
+use zeroize::Zeroizing;
 
 const SERVICE_NAME: &str = "ResticPal";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
@@ -166,16 +173,28 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
             ))
         }
     };
-    start_ipc_server(Arc::clone(&runtime));
-    if let Some(local) = local_for_management {
-        start_management_worker(
-            Arc::clone(&runtime),
-            config_path.clone(),
-            local,
-            loaded_policy.map_or(0, |loaded| loaded.sequence),
-            credential_store.clone(),
-        );
+    match staged_bootstrap_url() {
+        Ok(Some(url)) => match runtime.enroll_bootstrap(&url) {
+            Ok(()) => {
+                if let Err(error) = clear_staged_bootstrap_url() {
+                    eprintln!(
+                        "managed enrollment succeeded but its staged URL could not be removed: {error}"
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "staged managed enrollment failed; the URL remains available for a later service start: {error}"
+            ),
+        },
+        Ok(None) => {}
+        Err(error) => eprintln!("could not read the installer-staged bootstrap URL: {error}"),
     }
+    start_ipc_server(Arc::clone(&runtime));
+    start_management_worker(
+        Arc::clone(&runtime),
+        config_path.clone(),
+        credential_store.clone(),
+    );
     let executor = ResticExecutor::new(
         restic_path(),
         secret_resolver(credential_store),
@@ -219,28 +238,70 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
 fn start_management_worker(
     runtime: Arc<ServiceRuntime>,
     config_path: PathBuf,
-    local: resticpal_core::config::LocalConfig,
-    initial_sequence: u64,
     credential_store: Option<DpapiSecretStore>,
 ) {
-    if local.management.mode == resticpal_core::config::ManagementMode::Disabled {
-        return;
-    }
     thread::Builder::new()
         .name("resticpal-management".to_owned())
         .spawn(move || {
             let client = management::ManagementClient::new();
-            let mut sequence = initial_sequence;
-            let refresh_interval =
-                Duration::from_secs(u64::from(local.management.refresh_interval_minutes()) * 60);
-            let mut next_refresh = Instant::now() + refresh_interval;
-            let reporting_enabled = local.management.status_url.is_some();
+            let config_store = LocalConfigStore::new(&config_path);
+            let mut sequence = 0;
+            let mut source_identity = None;
+            let mut next_refresh = Instant::now();
             let mut next_report = Instant::now();
             let mut report_failures = 0_u32;
             let mut last_observed_state: Option<BackupState> = None;
 
             loop {
+                let local = match config_store.load() {
+                    Ok(local) => local,
+                    Err(error) => {
+                        eprintln!("managed configuration reload failed: {error}");
+                        thread::sleep(Duration::from_secs(30));
+                        continue;
+                    }
+                };
+                if local.management.mode == resticpal_core::config::ManagementMode::Disabled {
+                    source_identity = None;
+                    sequence = 0;
+                    last_observed_state = None;
+                    thread::sleep(Duration::from_secs(30));
+                    continue;
+                }
+                let current_identity = (
+                    local.management.mode,
+                    local.management.manifest_url.clone(),
+                    local.management.signing_public_key.clone(),
+                    local.management.device_id.clone(),
+                );
                 let now = Instant::now();
+                if source_identity.as_ref() != Some(&current_identity) {
+                    match management::load_best_policy(
+                        &config_path,
+                        &local,
+                        credential_store.as_ref(),
+                    ) {
+                        Ok(Some(loaded)) => {
+                            if runtime
+                                .apply_managed_policy(&loaded.policy)
+                                .unwrap_or(false)
+                            {
+                                sequence = loaded.sequence;
+                            }
+                        }
+                        Ok(None) => sequence = 0,
+                        Err(error) => eprintln!("managed source activation failed: {error}"),
+                    }
+                    source_identity = Some(current_identity);
+                    next_refresh = now
+                        + Duration::from_secs(
+                            u64::from(local.management.refresh_interval_minutes()) * 60,
+                        );
+                    next_report = now;
+                    report_failures = 0;
+                    last_observed_state = None;
+                }
+
                 if now >= next_refresh {
                     match management::refresh_policy(
                         &client,
@@ -262,10 +323,13 @@ fn start_management_worker(
                         }
                         Err(error) => eprintln!("managed policy refresh failed: {error}"),
                     }
-                    next_refresh = now + refresh_interval;
+                    next_refresh = now
+                        + Duration::from_secs(
+                            u64::from(local.management.refresh_interval_minutes()) * 60,
+                        );
                 }
 
-                if reporting_enabled {
+                if local.management.status_url.is_some() {
                     let status = runtime.status();
                     let state_changed = last_observed_state
                         .as_ref()
@@ -547,6 +611,78 @@ fn config_path(arguments: &[OsString]) -> PathBuf {
         .windows(2)
         .find_map(|pair| (pair[0] == OsStr::new("--config")).then(|| PathBuf::from(&pair[1])))
         .unwrap_or_else(default_config_path)
+}
+
+fn staged_bootstrap_url() -> Result<Option<Zeroizing<String>>, io::Error> {
+    let mut byte_count = 0_u32;
+    // SAFETY: the registry paths are fixed strings and this call requests only
+    // the required buffer size.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SOFTWARE\resticpal"),
+            w!("BootstrapUrl"),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&raw mut byte_count),
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status.0 as i32));
+    }
+    if !(2..=64 * 1024).contains(&byte_count) || !byte_count.is_multiple_of(2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged bootstrap URL has an invalid registry size",
+        ));
+    }
+    let mut buffer = Zeroizing::new(vec![0_u16; byte_count as usize / 2]);
+    // SAFETY: buffer is writable for the byte count returned by the size query.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SOFTWARE\resticpal"),
+            w!("BootstrapUrl"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&raw mut byte_count),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status.0 as i32));
+    }
+    let length = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    let value = String::from_utf16(&buffer[..length])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bootstrap URL is not UTF-16"))?;
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Zeroizing::new(value)))
+    }
+}
+
+fn clear_staged_bootstrap_url() -> Result<(), io::Error> {
+    // SAFETY: the registry paths are fixed null-terminated strings.
+    let status = unsafe {
+        RegDeleteKeyValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SOFTWARE\resticpal"),
+            w!("BootstrapUrl"),
+        )
+    };
+    if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status.0 as i32))
+    }
 }
 
 fn default_config_path() -> PathBuf {

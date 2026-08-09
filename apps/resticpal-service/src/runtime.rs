@@ -6,7 +6,8 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use resticpal_core::config::{
-    EffectiveConfig, LocalConfig, RepositoryMode, SecretEnvironmentVariable,
+    EffectiveConfig, LocalConfig, LocalManagementConfig, ManagementMode, RepositoryMode,
+    SecretEnvironmentVariable,
 };
 use resticpal_core::policy::{
     FieldResolution, ManagedPolicy, PolicyError, PolicyField, ResolvedConfig, resolve_config,
@@ -20,8 +21,9 @@ use resticpal_core::status::{
     BackupPhase, BackupProgress, BackupRunOutcome, BackupState, ServiceStatus, WaitingReason,
 };
 use resticpal_protocol::{
-    BackupSourcesView, RepositoryOperationKind, RepositoryOperationStatus, RepositorySecretUpdate,
-    RepositoryView, Request, RequestCommand, Response, ResponsePayload, ScheduleView,
+    BackupSourcesView, ManagementView, RepositoryOperationKind, RepositoryOperationStatus,
+    RepositorySecretUpdate, RepositoryView, Request, RequestCommand, Response, ResponsePayload,
+    ScheduleView,
 };
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::ClientIdentity;
@@ -32,6 +34,9 @@ use crate::conditions::SystemConditions;
 use crate::config_store::{ConfigStoreError, LocalConfigStore};
 use crate::executor::{BackupOutcome, BackupOutcomeKind, RepositoryOutcome, RepositoryOutcomeKind};
 use crate::history::{BackupHistoryStore, CompletedBackupRun, MAX_HISTORY_RESULTS};
+use crate::management::{
+    ManagementClient, PendingEnrollment, remove_management_cache, save_enrollment_cache,
+};
 use crate::state::{ScheduleStateStore, ServiceStateSnapshot};
 
 const CONDITION_RETRY_SECONDS: u64 = 60;
@@ -71,6 +76,7 @@ struct RuntimeState {
     consecutive_failures: u32,
     repository_operation: RepositoryOperationStatus,
     service_state: ServiceStateSnapshot,
+    management_operation_active: bool,
 }
 
 #[derive(Default)]
@@ -231,6 +237,7 @@ impl ServiceRuntime {
                 consecutive_failures: 0,
                 repository_operation,
                 service_state,
+                management_operation_active: false,
             }),
             state_store,
             history_store,
@@ -270,6 +277,7 @@ impl ServiceRuntime {
                 consecutive_failures: 0,
                 repository_operation: RepositoryOperationStatus::NotRun,
                 service_state: ServiceStateSnapshot::default(),
+                management_operation_active: false,
             }),
             state_store: Some(ScheduleStateStore::next_to_config(path)),
             history_store: Some(BackupHistoryStore::next_to_config(path)),
@@ -283,6 +291,25 @@ impl ServiceRuntime {
 
     pub fn config(&self) -> EffectiveConfig {
         self.config_read().clone()
+    }
+
+    pub fn enroll_bootstrap(&self, bootstrap_url: &str) -> Result<(), String> {
+        {
+            let mut state = self.state_guard();
+            if matches!(state.status.state, BackupState::Running { .. })
+                || matches!(
+                    state.repository_operation,
+                    RepositoryOperationStatus::Running { .. }
+                )
+                || state.management_operation_active
+            {
+                return Err("another service operation is active".to_owned());
+            }
+            state.management_operation_active = true;
+        }
+        let result = self.perform_enrollment(bootstrap_url);
+        self.state_guard().management_operation_active = false;
+        result
     }
 
     pub fn update_progress(&self, progress: BackupProgress) {
@@ -389,6 +416,9 @@ impl ServiceRuntime {
         }
 
         let mut state = self.state_guard();
+        if state.management_operation_active {
+            return ScheduleAction::None;
+        }
         if !repository_operation_allows_backup(&state.repository_operation) {
             return ScheduleAction::None;
         }
@@ -472,6 +502,19 @@ impl ServiceRuntime {
             RequestCommand::GetStatus => ResponsePayload::Status {
                 status: self.status(),
             },
+            RequestCommand::GetManagement => {
+                if identity.is_elevated_administrator {
+                    ResponsePayload::Management {
+                        configuration: self.management_view(),
+                    }
+                } else {
+                    administrator_required()
+                }
+            }
+            RequestCommand::Enroll { bootstrap_url } => {
+                self.enroll(bootstrap_url.as_bytes(), identity)
+            }
+            RequestCommand::Unenroll => self.unenroll(identity),
             RequestCommand::GetRunHistory { limit } => {
                 let limit = usize::from(limit);
                 if !(1..=MAX_HISTORY_RESULTS).contains(&limit) {
@@ -648,6 +691,288 @@ impl ServiceRuntime {
         };
 
         Response::new(request_id, payload)
+    }
+
+    fn management_view(&self) -> ManagementView {
+        let management = self.local_config_guard().management.clone();
+        ManagementView {
+            mode: management.mode,
+            enrolled: management.mode == ManagementMode::SignedManifest
+                && management.status_token_ref.is_some()
+                && management.enrollment_key_ref.is_some(),
+            device_id: management.device_id,
+            manifest_url: management.manifest_url,
+        }
+    }
+
+    fn enroll(&self, bootstrap_url: &[u8], identity: ClientIdentity) -> ResponsePayload {
+        if !identity.is_elevated_administrator {
+            return administrator_required();
+        }
+        let Ok(bootstrap_url) = std::str::from_utf8(bootstrap_url) else {
+            return rejected(
+                "invalid_bootstrap_url",
+                "The bootstrap URL is not valid UTF-8.",
+            );
+        };
+        {
+            let mut state = self.state_guard();
+            if matches!(state.status.state, BackupState::Running { .. })
+                || matches!(
+                    state.repository_operation,
+                    RepositoryOperationStatus::Running { .. }
+                )
+                || state.management_operation_active
+            {
+                return rejected(
+                    "operation_running",
+                    "Wait for the current backup, repository, or enrollment operation to finish.",
+                );
+            }
+            state.management_operation_active = true;
+        }
+        let result = self.perform_enrollment(bootstrap_url);
+        self.state_guard().management_operation_active = false;
+        match result {
+            Ok(()) => ResponsePayload::Accepted {
+                message: "This device is now enrolled and its signed policy is active.".to_owned(),
+            },
+            Err(error) => {
+                eprintln!("managed enrollment failed: {error}");
+                rejected(
+                    "enrollment_failed",
+                    "Enrollment failed. Check that the one-time URL is current and try again.",
+                )
+            }
+        }
+    }
+
+    fn perform_enrollment(&self, bootstrap_url: &str) -> Result<(), String> {
+        let pending = ManagementClient::new()
+            .enroll(bootstrap_url)
+            .map_err(|error| error.to_string())?;
+        self.commit_enrollment(pending)
+    }
+
+    fn commit_enrollment(&self, pending: PendingEnrollment) -> Result<(), String> {
+        let credential_store = self
+            .credential_store
+            .as_ref()
+            .ok_or_else(|| "protected credential storage is unavailable".to_owned())?;
+        let config_store = self
+            .config_store
+            .as_ref()
+            .ok_or_else(|| "local configuration storage is unavailable".to_owned())?;
+        let old_local = self.local_config_guard().clone();
+        let mut candidate = old_local.clone();
+        let mut created_references = Vec::new();
+        let stored = (|| -> Result<(), String> {
+            let status_ref = credential_store
+                .put_new("management-token", pending.material.status_token.as_bytes())
+                .map_err(|error| error.to_string())?;
+            created_references.push(status_ref.clone());
+            let key_ref = credential_store
+                .put_new("management-key", &*pending.private_key)
+                .map_err(|error| error.to_string())?;
+            created_references.push(key_ref.clone());
+
+            let secret_refs = candidate.repository.secret_refs.get_or_insert_default();
+            for (variable, secret) in &pending.material.repository_secrets {
+                let reference = credential_store
+                    .put_new(variable.reference_prefix(), secret.as_bytes())
+                    .map_err(|error| error.to_string())?;
+                created_references.push(reference.clone());
+                secret_refs.insert(*variable, reference);
+            }
+            candidate.management = LocalManagementConfig {
+                mode: ManagementMode::SignedManifest,
+                manifest_url: Some(pending.material.manifest_url.clone()),
+                signing_public_key: Some(pending.public_key.clone()),
+                refresh_interval_minutes: Some(pending.material.refresh_interval_minutes),
+                status_url: Some(pending.material.status_url.clone()),
+                device_id: Some(pending.material.device_id.clone()),
+                status_token_ref: Some(status_ref),
+                enrollment_key_ref: Some(key_ref),
+            };
+            candidate
+                .management
+                .validate()
+                .map_err(|error| error.to_string())?;
+            if pending
+                .material
+                .initial_manifest
+                .payload
+                .policy
+                .repository
+                .secret_refs
+                .is_some()
+            {
+                return Err(
+                    "enrolled policy contains client-local credential references".to_owned(),
+                );
+            }
+            let resolved = resolve_config(
+                &EffectiveConfig::default(),
+                &candidate,
+                Some(&pending.material.initial_manifest.payload.policy),
+            )
+            .map_err(|error| error.to_string())?;
+
+            config_store
+                .save(&candidate)
+                .map_err(|error| error.to_string())?;
+            if let Err(error) = save_enrollment_cache(
+                config_store.path(),
+                &candidate.management,
+                &pending.material.initial_manifest_document,
+            ) {
+                eprintln!(
+                    "enrollment committed but its initial policy cache could not be saved: {error}"
+                );
+            }
+
+            let next_config = resolved.effective;
+            let now = Utc::now();
+            let mut state = self.state_guard();
+            if state
+                .service_state
+                .repository_requires_validation(&next_config)
+            {
+                state.service_state.require_repository_validation();
+                if let Some(store) = &self.state_store {
+                    let _ = store.save(&state.service_state);
+                }
+                state.repository_operation = RepositoryOperationStatus::ValidationRequired;
+            }
+            *self.config_write() = next_config.clone();
+            *self
+                .field_resolutions
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = resolved.fields;
+            state.status.managed_revision = resolved.managed_revision;
+            Self::apply_configuration_status(&mut state, &next_config, now);
+            drop(state);
+            *self.local_config_guard() = candidate;
+            Ok(())
+        })();
+
+        if let Err(error) = stored {
+            for reference in &created_references {
+                let _ = credential_store.remove(reference);
+            }
+            return Err(error);
+        }
+
+        let new_local = self.local_config_guard().clone();
+        let mut retired = Vec::new();
+        if let Some(reference) = old_local.management.status_token_ref {
+            retired.push(reference);
+        }
+        if let Some(reference) = old_local.management.enrollment_key_ref {
+            retired.push(reference);
+        }
+        for variable in pending.material.repository_secrets.keys() {
+            if let Some(reference) = old_local
+                .repository
+                .secret_refs
+                .as_ref()
+                .and_then(|refs| refs.get(variable))
+                && new_local
+                    .repository
+                    .secret_refs
+                    .as_ref()
+                    .and_then(|refs| refs.get(variable))
+                    != Some(reference)
+            {
+                retired.push(reference.clone());
+            }
+        }
+        for reference in retired {
+            let _ = credential_store.remove(&reference);
+        }
+        let _ = self.events.send(RuntimeEvent::ConfigurationChanged);
+        Ok(())
+    }
+
+    fn unenroll(&self, identity: ClientIdentity) -> ResponsePayload {
+        if !identity.is_elevated_administrator {
+            return administrator_required();
+        }
+        {
+            let state = self.state_guard();
+            if matches!(state.status.state, BackupState::Running { .. })
+                || matches!(
+                    state.repository_operation,
+                    RepositoryOperationStatus::Running { .. }
+                )
+                || state.management_operation_active
+            {
+                return rejected(
+                    "operation_running",
+                    "Wait for the current backup, repository, or enrollment operation to finish.",
+                );
+            }
+        }
+        let Some(config_store) = &self.config_store else {
+            return rejected(
+                "configuration_unavailable",
+                "Local configuration storage is unavailable.",
+            );
+        };
+        let old_local = self.local_config_guard().clone();
+        if old_local.management.mode == ManagementMode::Disabled {
+            return ResponsePayload::Accepted {
+                message: "This device is already unmanaged.".to_owned(),
+            };
+        }
+        let mut candidate = old_local.clone();
+        candidate.management = LocalManagementConfig::default();
+        let resolved = match resolve_config(&EffectiveConfig::default(), &candidate, None) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                eprintln!("could not resolve unmanaged configuration: {error}");
+                return rejected(
+                    "configuration_invalid",
+                    "The remaining local configuration is invalid.",
+                );
+            }
+        };
+        if let Err(error) = config_store.save(&candidate) {
+            eprintln!("could not save unmanaged configuration: {error}");
+            return rejected(
+                "configuration_save_failed",
+                "The unmanaged configuration could not be saved.",
+            );
+        }
+        if let Err(error) = remove_management_cache(config_store.path()) {
+            eprintln!("could not remove the managed policy cache: {error}");
+        }
+        *self.local_config_guard() = candidate;
+        *self.config_write() = resolved.effective.clone();
+        *self
+            .field_resolutions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = resolved.fields;
+        let mut state = self.state_guard();
+        state.status.managed_revision = None;
+        Self::apply_configuration_status(&mut state, &resolved.effective, Utc::now());
+        drop(state);
+        if let Some(credentials) = &self.credential_store {
+            for reference in [
+                old_local.management.status_token_ref,
+                old_local.management.enrollment_key_ref,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let _ = credentials.remove(&reference);
+            }
+        }
+        let _ = self.events.send(RuntimeEvent::ConfigurationChanged);
+        ResponsePayload::Accepted {
+            message: "Managed policy and reporting were removed; repository credentials remain protected locally."
+                .to_owned(),
+        }
     }
 
     fn backup_sources_view(&self) -> BackupSourcesView {
@@ -1461,6 +1786,9 @@ pub enum RuntimeInitError {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::{Signer, SigningKey};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1472,6 +1800,10 @@ mod tests {
         BackupConfig, LocalBackupConfig, LocalRepositoryConfig, RepositoryConfig,
         SecretEnvironmentVariable,
     };
+    use resticpal_core::management::{
+        EnrollmentMaterial, MANAGEMENT_SCHEMA_VERSION, ManifestPayload, SignedManifestEnvelope,
+        VerifiedManifest,
+    };
     use resticpal_core::policy::{Managed, ManagedSchedulePolicy};
     use resticpal_protocol::{PROTOCOL_VERSION, SecretValue};
     use resticpal_windows::credentials::CredentialStoreError;
@@ -1479,6 +1811,7 @@ mod tests {
 
     use super::*;
     use crate::executor::BackupSummary;
+    use zeroize::Zeroizing;
 
     const USER: ClientIdentity = ClientIdentity {
         is_elevated_administrator: false,
@@ -1530,6 +1863,43 @@ mod tests {
                     ..
                 }
             }
+        ));
+    }
+
+    #[test]
+    fn management_state_and_enrollment_require_an_elevated_administrator() {
+        let (runtime, _events) = runtime(false);
+        assert!(matches!(
+            runtime
+                .handle_request(Request::new(60, RequestCommand::GetManagement), USER)
+                .payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+        ));
+        assert!(matches!(
+            runtime
+                .handle_request(Request::new(61, RequestCommand::GetManagement), ADMIN)
+                .payload,
+            ResponsePayload::Management {
+                configuration: ManagementView {
+                    mode: ManagementMode::Disabled,
+                    enrolled: false,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            runtime
+                .handle_request(
+                    Request::new(
+                        62,
+                        RequestCommand::Enroll {
+                            bootstrap_url: SecretValue::new("https://example.invalid/#token=secret"),
+                        },
+                    ),
+                    USER,
+                )
+                .payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
         ));
     }
 
@@ -2786,5 +3156,124 @@ mod tests {
                 .payload,
             ResponsePayload::Rejected { ref code, .. } if code == "invalid_history_limit"
         ));
+    }
+
+    #[test]
+    fn enrollment_commit_protects_credentials_activates_policy_and_unenrolls_cleanly() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        let credentials =
+            DpapiSecretStore::open(directory.path().join("Credentials")).expect("credentials");
+        let (events, _receiver) = mpsc::channel();
+        let runtime =
+            ServiceRuntime::load_with_credentials(&config_path, events, Some(credentials.clone()))
+                .expect("runtime");
+        let now = Utc::now();
+        let signing_key = SigningKey::from_bytes(&[61_u8; 32]);
+        let payload = ManifestPayload {
+            schema_version: MANAGEMENT_SCHEMA_VERSION,
+            sequence: 4,
+            issued_at: now,
+            expires_at: Some(now + Duration::days(7)),
+            policy: ManagedPolicy {
+                revision: "enrollment-4".to_owned(),
+                ..ManagedPolicy::default()
+            },
+        };
+        let payload_bytes = serde_json::to_vec(&payload).expect("manifest payload");
+        let envelope = SignedManifestEnvelope {
+            schema_version: MANAGEMENT_SCHEMA_VERSION,
+            algorithm: "ed25519".to_owned(),
+            key_id: "server-primary".to_owned(),
+            payload: URL_SAFE_NO_PAD.encode(&payload_bytes),
+            signature: URL_SAFE_NO_PAD.encode(signing_key.sign(&payload_bytes).to_bytes()),
+        };
+        let document = serde_json::to_string(&envelope).expect("manifest document");
+        runtime
+            .commit_enrollment(PendingEnrollment {
+                material: EnrollmentMaterial {
+                    device_id: "test-device".to_owned(),
+                    manifest_url: "http://127.0.0.1:9/v1/manifest/test-device".to_owned(),
+                    status_url: "http://127.0.0.1:9/v1/status".to_owned(),
+                    refresh_interval_minutes: 15,
+                    initial_manifest_document: document,
+                    initial_manifest: VerifiedManifest {
+                        payload,
+                        signed: true,
+                    },
+                    status_token: Zeroizing::new("device-token".to_owned()),
+                    repository_secrets: BTreeMap::from([(
+                        SecretEnvironmentVariable::ResticPassword,
+                        Zeroizing::new("repository-password".to_owned()),
+                    )]),
+                },
+                private_key: Zeroizing::new([67_u8; 32]),
+                public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+            })
+            .expect("commit enrollment");
+
+        let local = LocalConfigStore::new(&config_path)
+            .load()
+            .expect("enrolled config");
+        assert_eq!(local.management.mode, ManagementMode::SignedManifest);
+        assert_eq!(
+            runtime.status().managed_revision.as_deref(),
+            Some("enrollment-4")
+        );
+        let status_ref = local
+            .management
+            .status_token_ref
+            .clone()
+            .expect("status reference");
+        let key_ref = local
+            .management
+            .enrollment_key_ref
+            .clone()
+            .expect("key reference");
+        let repository_ref = local.repository.secret_refs.as_ref().expect("secret refs")
+            [&SecretEnvironmentVariable::ResticPassword]
+            .clone();
+        assert_eq!(
+            credentials
+                .get(&status_ref)
+                .expect("status token")
+                .as_slice(),
+            b"device-token"
+        );
+        assert_eq!(
+            credentials.get(&key_ref).expect("identity key").as_slice(),
+            &[67_u8; 32]
+        );
+        assert_eq!(
+            credentials
+                .get(&repository_ref)
+                .expect("repository secret")
+                .as_slice(),
+            b"repository-password"
+        );
+
+        assert!(matches!(
+            runtime.unenroll(ADMIN),
+            ResponsePayload::Accepted { .. }
+        ));
+        let local = LocalConfigStore::new(&config_path)
+            .load()
+            .expect("unmanaged config");
+        assert_eq!(local.management.mode, ManagementMode::Disabled);
+        assert!(matches!(
+            credentials.get(&status_ref),
+            Err(CredentialStoreError::NotFound)
+        ));
+        assert!(matches!(
+            credentials.get(&key_ref),
+            Err(CredentialStoreError::NotFound)
+        ));
+        assert_eq!(
+            credentials
+                .get(&repository_ref)
+                .expect("retained repository secret")
+                .as_slice(),
+            b"repository-password"
+        );
     }
 }

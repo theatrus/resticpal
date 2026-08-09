@@ -8,14 +8,14 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use resticpal_core::config::{RepositoryMode, SecretEnvironmentVariable};
+use resticpal_core::config::{ManagementMode, RepositoryMode, SecretEnvironmentVariable};
 use resticpal_core::status::{BackupRunRecord, ServiceStatus};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +41,11 @@ impl Request {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequestCommand {
     GetStatus,
+    GetManagement,
+    Enroll {
+        bootstrap_url: SecretValue,
+    },
+    Unenroll,
     GetRunHistory {
         limit: u16,
     },
@@ -113,6 +118,9 @@ pub enum ResponsePayload {
     Status {
         status: ServiceStatus,
     },
+    Management {
+        configuration: ManagementView,
+    },
     RunHistory {
         runs: Vec<BackupRunRecord>,
     },
@@ -135,6 +143,15 @@ pub enum ResponsePayload {
         code: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementView {
+    pub mode: ManagementMode,
+    pub enrolled: bool,
+    pub device_id: Option<String>,
+    pub manifest_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -448,6 +465,25 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_url_round_trips_but_is_redacted_from_debug_output() {
+        let request = Request::new(
+            104,
+            RequestCommand::Enroll {
+                bootstrap_url: SecretValue::new(
+                    "https://example.test/v1/enroll/id#token=unique-bootstrap-secret",
+                ),
+            },
+        );
+        assert!(!format!("{request:?}").contains("unique-bootstrap-secret"));
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &request).expect("request should serialize");
+        let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn repository_operation_status_round_trips() {
         let completed_at = Utc::now();
         let response = Response::new(
@@ -503,7 +539,7 @@ mod tests {
     #[test]
     fn exact_protocol_rejects_unknown_fields() {
         let top_level = r#"{
-            "protocol_version": 2,
+            "protocol_version": 3,
             "request_id": 1,
             "command": { "type": "get_status" },
             "future_field": true
@@ -511,7 +547,7 @@ mod tests {
         assert!(serde_json::from_str::<Request>(top_level).is_err());
 
         let command = r#"{
-            "protocol_version": 2,
+            "protocol_version": 3,
             "request_id": 1,
             "command": { "type": "defer_backup", "minutes": 30, "future_field": true }
         }"#;

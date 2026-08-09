@@ -8,7 +8,7 @@ namespace ResticPal.UI.Services;
 
 internal sealed class ResticPalServiceClient
 {
-    private const int ProtocolVersion = 2;
+    private const int ProtocolVersion = 3;
     private const int MaxFrameBytes = 1024 * 1024;
     private static long _nextRequestId;
 
@@ -80,6 +80,36 @@ internal sealed class ResticPalServiceClient
         };
 
         return new ServiceSnapshot(headline, description, canRun, canCancel);
+    }
+
+    public async Task<ManagementConfiguration> GetManagementAsync(
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(new { type = "get_management" }, cancellationToken);
+        RequirePayloadType(payload, "management");
+        JsonElement configuration = payload.GetProperty("configuration");
+        return new ManagementConfiguration(
+            configuration.GetProperty("mode").GetString() ?? "disabled",
+            configuration.GetProperty("enrolled").GetBoolean(),
+            ReadOptionalString(configuration, "device_id"),
+            ReadOptionalString(configuration, "manifest_url"));
+    }
+
+    public async Task<CommandResult> EnrollAsync(
+        string bootstrapUrl,
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(
+            new { type = "enroll", bootstrap_url = bootstrapUrl },
+            cancellationToken,
+            TimeSpan.FromSeconds(45));
+        return ReadCommandResult(payload);
+    }
+
+    public async Task<CommandResult> UnenrollAsync(
+        CancellationToken cancellationToken = default)
+    {
+        return await SendCommandAsync(new { type = "unenroll" }, cancellationToken);
     }
 
     public async Task<IReadOnlyList<BackupRun>> GetRunHistoryAsync(
@@ -262,6 +292,11 @@ internal sealed class ResticPalServiceClient
         CancellationToken cancellationToken)
     {
         JsonElement payload = await SendAsync(command, cancellationToken);
+        return ReadCommandResult(payload);
+    }
+
+    private static CommandResult ReadCommandResult(JsonElement payload)
+    {
         string responseType = payload.GetProperty("type").GetString() ?? "rejected";
         string message = payload.GetProperty("message").GetString() ?? "No message was returned.";
         return new CommandResult(responseType == "accepted", message);
@@ -303,7 +338,7 @@ internal sealed class ResticPalServiceClient
         timeout.CancelAfter(requestTimeout ?? TimeSpan.FromSeconds(2));
         await using var pipe = new NamedPipeClientStream(
             ".",
-            "ResticPal.v2",
+            "ResticPal.v3",
             PipeDirection.InOut,
             PipeOptions.Asynchronous);
         await pipe.ConnectAsync(timeout.Token);
@@ -461,6 +496,12 @@ internal sealed record ServiceSnapshot(
     bool CanCancelBackup);
 
 internal sealed record CommandResult(bool Accepted, string Message);
+
+internal sealed record ManagementConfiguration(
+    string Mode,
+    bool Enrolled,
+    string? DeviceId,
+    string? ManifestUrl);
 
 internal sealed record BackupRun(
     ulong Id,

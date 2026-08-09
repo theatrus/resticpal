@@ -408,6 +408,7 @@ fn fetch_status_tooltip() -> std::result::Result<String, NamedPipeError> {
         ResponsePayload::Rejected { message, .. } => format!("resticpal: {message}"),
         ResponsePayload::Accepted { .. } => "resticpal: connected".to_owned(),
         ResponsePayload::RunHistory { .. }
+        | ResponsePayload::Management { .. }
         | ResponsePayload::BackupSources { .. }
         | ResponsePayload::DiscoveredBackupSources { .. }
         | ResponsePayload::Repository { .. }

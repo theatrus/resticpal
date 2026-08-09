@@ -50,7 +50,7 @@ Control normal cadence, wake grace, wake-lock safety timeout, battery use, and m
 
 **Managed server** fetches independently signed policy documents, keeps a last-known-good policy for offline operation, and sends privacy-bounded device status. A separate `resticpal-server` keeps full repository maintenance credentials so append-only clients never receive the authority needed to delete their backups.
 
-All three policy transport paths now have an end-to-end implementation. One-time enrollment and secret bootstrap are the next management milestone; today a signed-server deployment requires a pre-provisioned protected token reference plus its endpoint, pinned public key, and device ID. See [DESIGN.md](DESIGN.md) for the exact security model and current boundary.
+All three policy transport paths now have an end-to-end implementation. A one-time signed bootstrap URL creates a local device identity, decrypts repository and reporting credentials directly into DPAPI-protected storage, activates the initial signed policy, and can later be rotated or removed from Settings. See [DESIGN.md](DESIGN.md) for the exact security model and current boundary.
 
 ## What works today
 
@@ -77,7 +77,7 @@ Retention for such repositories belongs on a separate, better-protected host. Th
 
 ## Project status
 
-resticpal is early alpha software. The core backup path, native UI, tray, protected configuration, local history, append-only restrictions, managed policy/status transport, companion maintenance server, MSI authoring, and real-restic test harnesses are in place. Production qualification across the supported Windows 10/11 matrix, one-time enrollment, secret bootstrap, update UX, and graceful-first cancellation remain in progress.
+resticpal is early alpha software. The core backup path, native UI, tray, protected configuration, local history, append-only restrictions, one-time managed enrollment and secret bootstrap, policy/status transport, companion maintenance server, MSI authoring, and real-restic test harnesses are in place. Production qualification across the supported Windows 10/11 matrix, update UX, and graceful-first cancellation remain in progress.
 
 The source of truth for requirements, trust boundaries, implementation status, and open decisions is [DESIGN.md](DESIGN.md).
 

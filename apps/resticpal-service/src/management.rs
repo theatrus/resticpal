@@ -6,8 +6,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use resticpal_core::config::{EffectiveConfig, LocalConfig, LocalManagementConfig, ManagementMode};
 use resticpal_core::management::{
-    DeviceStatusReport, MANAGEMENT_SCHEMA_VERSION, MAX_MANIFEST_BYTES, ManifestError,
-    parse_plain_manifest, verify_signed_manifest,
+    BootstrapDescriptor, DeviceStatusReport, EnrollmentError, EnrollmentMaterial,
+    MANAGEMENT_SCHEMA_VERSION, MAX_ENROLLMENT_BYTES, MAX_MANIFEST_BYTES, ManifestError,
+    new_enrollment_request, parse_plain_manifest, verify_and_decrypt_enrollment,
+    verify_signed_manifest,
 };
 use resticpal_core::policy::{ManagedPolicy, resolve_config};
 use resticpal_core::status::ServiceStatus;
@@ -30,6 +32,12 @@ pub struct LoadedPolicy {
 
 pub struct ManagementClient {
     agent: ureq::Agent,
+}
+
+pub struct PendingEnrollment {
+    pub material: EnrollmentMaterial,
+    pub private_key: Zeroizing<[u8; 32]>,
+    pub public_key: String,
 }
 
 impl ManagementClient {
@@ -102,6 +110,41 @@ impl ManagementClient {
             },
             document,
         ))
+    }
+
+    pub fn enroll(&self, bootstrap_url: &str) -> Result<PendingEnrollment, ManagementError> {
+        let descriptor = BootstrapDescriptor::parse(bootstrap_url)?;
+        let request_context = new_enrollment_request(
+            bounded_hostname(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+            std::env::consts::ARCH.to_owned(),
+        )?;
+        let authorization = Zeroizing::new(format!("Bearer {}", descriptor.token()));
+        let mut response = self
+            .agent
+            .post(descriptor.endpoint_url())
+            .header("Authorization", authorization.as_str())
+            .send_json(&request_context.request)?;
+        let document = response
+            .body_mut()
+            .with_config()
+            .limit(u64::try_from(MAX_ENROLLMENT_BYTES + 1).expect("enrollment limit fits in u64"))
+            .read_to_vec()?;
+        if document.len() > MAX_ENROLLMENT_BYTES {
+            return Err(ManagementError::EnrollmentTooLarge);
+        }
+        let material = verify_and_decrypt_enrollment(
+            &document,
+            &descriptor,
+            &request_context.private_key,
+            &request_context.request_nonce,
+            Utc::now(),
+        )?;
+        Ok(PendingEnrollment {
+            material,
+            private_key: request_context.private_key,
+            public_key: descriptor.public_key().to_owned(),
+        })
     }
 
     pub fn report_status(
@@ -207,6 +250,9 @@ fn validate_effective_policy(
     local: &LocalConfig,
     policy: &ManagedPolicy,
 ) -> Result<(), ManagementError> {
+    if local.management.enrollment_key_ref.is_some() && policy.repository.secret_refs.is_some() {
+        return Err(ManagementError::EnrolledPolicyContainsSecretReferences);
+    }
     resolve_config(&EffectiveConfig::default(), local, Some(policy))?;
     Ok(())
 }
@@ -282,6 +328,23 @@ impl ManagedPolicyCache {
     }
 }
 
+pub fn save_enrollment_cache(
+    config_path: &Path,
+    management: &LocalManagementConfig,
+    document: &str,
+) -> Result<(), ManagementError> {
+    ManagedPolicyCache::next_to_config(config_path).save(management, document, Utc::now())
+}
+
+pub fn remove_management_cache(config_path: &Path) -> Result<(), ManagementError> {
+    let path = ManagedPolicyCache::next_to_config(config_path).path;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CachedManifest {
@@ -323,6 +386,8 @@ pub enum ManagementError {
     MissingSigningKey,
     #[error("management manifest exceeds the size limit")]
     ManifestTooLarge,
+    #[error("enrollment response exceeds the size limit")]
+    EnrollmentTooLarge,
     #[error("management manifest is not UTF-8 JSON")]
     InvalidUtf8,
     #[error("status reporting is not configured")]
@@ -331,6 +396,8 @@ pub enum ManagementError {
     CredentialStoreUnavailable,
     #[error("status token is not valid single-line UTF-8")]
     InvalidStatusToken,
+    #[error("enrolled policies must deliver secret values during enrollment, not DPAPI references")]
+    EnrolledPolicyContainsSecretReferences,
     #[error("managed-policy cache exceeds the size limit")]
     CacheTooLarge,
     #[error("managed-policy cache does not match the configured source")]
@@ -341,6 +408,8 @@ pub enum ManagementError {
     Config(#[from] resticpal_core::config::ManagementConfigError),
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    #[error(transparent)]
+    Enrollment(#[from] EnrollmentError),
     #[error(transparent)]
     Policy(#[from] resticpal_core::policy::PolicyError),
     #[error("management HTTP request failed: {0}")]

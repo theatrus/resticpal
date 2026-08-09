@@ -522,14 +522,69 @@
                     </Grid>
                 </Grid>
 
-                <StackPanel
-                    x:Name="ComingSoonPanel"
-                    Margin="32"
-                    Spacing="8"
-                    Visibility="Collapsed">
-                    <TextBlock x:Name="ComingSoonTitle" Style="{StaticResource TitleTextBlockStyle}" Text="Coming soon" />
-                    <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="This settings page will arrive in a later implementation slice." />
-                </StackPanel>
+                <ScrollViewer x:Name="ManagementPanel" Visibility="Collapsed">
+                    <Grid MaxWidth="760" Padding="32" HorizontalAlignment="Left" RowSpacing="20">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Managed backup" />
+                            <TextBlock
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="Enroll this PC with a one-time signed URL to receive policy, repository credentials, and status reporting settings."
+                                TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <Border
+                            Grid.Row="1"
+                            Padding="20"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                            <StackPanel Spacing="14">
+                                <TextBlock x:Name="ManagementStatusTitle" FontSize="17" FontWeight="SemiBold" Text="Checking enrollment" />
+                                <TextBlock
+                                    x:Name="ManagementStatusDescription"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Waiting for the resticpal service."
+                                    TextWrapping="Wrap" />
+                                <PasswordBox
+                                    x:Name="BootstrapUrlBox"
+                                    Header="One-time bootstrap URL"
+                                    PasswordRevealMode="Peek"
+                                    PlaceholderText="https://backup.example/v1/enroll/...#token=..." />
+                                <TextBlock
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="The URL is sent only to the local Windows service. Its token is consumed once and is never saved in the configuration file."
+                                    TextWrapping="Wrap" />
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <Button
+                                        x:Name="EnrollButton"
+                                        Click="EnrollButton_Click"
+                                        Content="Enroll or rotate"
+                                        Style="{StaticResource AccentButtonStyle}" />
+                                    <Button
+                                        x:Name="UnenrollButton"
+                                        Click="UnenrollButton_Click"
+                                        Content="Remove management"
+                                        IsEnabled="False" />
+                                    <ProgressRing x:Name="ManagementProgress" IsActive="False" Width="24" Height="24" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <InfoBar
+                            Grid.Row="2"
+                            IsClosable="False"
+                            IsOpen="True"
+                            Message="Removing management keeps repository credentials and existing backups on this PC. It removes the reporting token, device identity key, and cached managed policy."
+                            Severity="Informational" />
+                    </Grid>
+                </ScrollViewer>
             </Grid>
 
             <InfoBar

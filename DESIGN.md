@@ -6,17 +6,17 @@ This document records the product requirements, architecture decisions, and curr
 
 ## Implementation status
 
-The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The active automated baseline is 120 passing client tests plus five passing tests in the adjacent `resticpal-server` repository and a warning-free WinUI build. The MSI is build/ICE/admin-image validated but its privileged install and VSS behavior are not yet production-qualified.
+The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The active automated baseline is 124 passing client tests plus eight passing tests in the adjacent `resticpal-server` repository and a warning-free WinUI build. The MSI is build/ICE/admin-image validated but its privileged install and VSS behavior are not yet production-qualified.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, append-only command authorization, versioned manifest payloads, strict Ed25519 envelopes, freshness, and replay checks | Standard-mode retention execution, enrollment/device-key contracts, and schema evolution beyond v1 |
-| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler checkpoint, bounded SQLite history, bounded shutdown outcome draining, plain/signed manifest fetching, last-known-good cache, runtime policy application, and bounded status delivery | Installer-created service identity/ACL validation, enrollment/bootstrap token consumption, direct-file watching, structured logs/audit, graceful cancellation before escalation, and production VSS testing |
-| Local IPC | Protocol v2, 1 MiB bounded frames, bounded per-connection I/O, protected named pipe, client-token authorization, ordinary-user status/history/run/cancel/defer, and elevated configuration operations | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v2 |
+| Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, append-only command authorization, versioned manifest and enrollment payloads, strict Ed25519 envelopes, X25519/HKDF/ChaCha20-Poly1305 secret bootstrap, freshness, and replay checks | Standard-mode retention execution and schema evolution beyond v1 |
+| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository and enrollment credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler checkpoint, bounded SQLite history, bounded shutdown outcome draining, plain/signed manifest fetching, last-known-good cache, runtime policy application, bounded status delivery, one-time enrollment/rotation, and unenrollment | Installer-created service identity/ACL validation, direct-file watching, structured logs/audit, graceful cancellation before escalation, and production VSS testing |
+| Local IPC | Protocol v3, 1 MiB bounded frames, bounded per-connection I/O, protected named pipe, client-token authorization, ordinary-user status/history/run/cancel/defer, and elevated configuration/enrollment operations | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v3 |
 | Tray | Native Win32 notification icon, current status tooltip, run/cancel action, and elevated UI launch | Push-driven live icon updates, deferral UI, notifications, richer health icons, and startup registration |
-| WinUI application | Overview, backup sources, repository, schedule/power/network, and bounded backup-history pages | Diagnostics/logs, enrollment/managed-policy, updates/settings, accessibility and Windows 10 qualification |
-| Remote management | Plain HTTP/HTTPS manifest mode without reporting; signed HTTPS manifest mode with pinned Ed25519 key, atomic cache, replay/freshness checks, authenticated status delivery; adjacent server with signed manifests, bounded SQLite status, and admin-only maintenance jobs | One-time enrollment, device keys, encrypted credential bootstrap, UI/installer enrollment, key rotation, conditional requests, and production deployment hardening |
-| Distribution | Per-machine x64 WiX MSI, pinned restic 0.19.1, release service/tray, self-contained WinUI payload, virtual-account service/recovery authoring, ProgramData ACL authoring, tray logon registration, data-preserving uninstall design, notices, and local E2E harness | Elevated service/VSS qualification, installer UI/bootstrap, Start Menu integration, code signing, complete license generation, update UI/appcast verification, elevated updater, and upgrade/repair matrix |
+| WinUI application | Overview, backup sources, repository, schedule/power/network, bounded backup history, and managed enrollment/rotation/unenrollment pages | Diagnostics/logs, updates/settings, accessibility and Windows 10 qualification |
+| Remote management | Plain HTTP/HTTPS manifest mode without reporting; signed HTTPS manifest mode with pinned Ed25519 key, atomic cache, replay/freshness checks, authenticated status delivery; one-time signed enrollment with encrypted credentials; adjacent server with signed manifests, bounded SQLite status, and admin-only maintenance jobs | Conditional requests, enrollment audit/rate limits, and production deployment hardening |
+| Distribution | Per-machine x64 WiX MSI, pinned restic 0.19.1, release service/tray, self-contained WinUI payload, virtual-account service/recovery authoring, ProgramData and bootstrap registry ACL authoring, optional hidden bootstrap property, tray logon registration, data-preserving uninstall design, notices, and local E2E harness | Elevated service/VSS qualification, interactive installer bootstrap dialog, Start Menu integration, code signing, complete license generation, update UI/appcast verification, elevated updater, and upgrade/repair matrix |
 
 Current durable state consists of atomic `config.toml`, DPAPI-protected credential files, `state.json` for scheduler/repository-verification state, and lazy `state.db` backup history. The history retains the newest 200 attempts and exposes at most 100 per IPC request; the WinUI page requests 50.
 
@@ -88,7 +88,7 @@ The Rust Windows service is the sole owner of:
 
 No tray or UI process may invoke restic directly.
 
-The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler state, backup history, managed-manifest fetching/caching, runtime policy refresh, and authenticated status delivery. One-time enrollment/bootstrap, structured logs, and update coordination remain planned. The service expects a fixed sibling `restic.exe`; the development MSI now supplies a checksum-verified pinned binary at that location.
+The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler state, backup history, managed-manifest fetching/caching, runtime policy refresh, authenticated status delivery, and one-time managed enrollment/rotation/unenrollment. Structured logs and update coordination remain planned. The service expects a fixed sibling `restic.exe`; the development MSI now supplies a checksum-verified pinned binary at that location.
 
 ### `resticpal-tray.exe`
 
@@ -138,7 +138,7 @@ The service host, service-control handling, and virtual-account MSI authoring ex
 
 ## IPC and authorization
 
-Service-to-client communication uses a versioned protocol over Windows named pipes. The implemented protocol is v2 over `\\.\pipe\ResticPal.v2` with one bounded request and response per connection.
+Service-to-client communication uses a versioned protocol over Windows named pipes. The implemented protocol is v3 over `\\.\pipe\ResticPal.v3` with one bounded request and response per connection.
 
 - The pipe security descriptor permits interactive users to read status.
 - The service inspects the connecting process token rather than trusting identity fields supplied in a message.
@@ -288,11 +288,11 @@ Managed policy marks individual fields as locked. A managed value overrides loca
 
 Loss of server connectivity does not stop backups. The service continues with its last valid policy and reports that management connectivity is stale. Only a signed explicit disable policy may stop managed backups.
 
-The typed precedence/lock resolver and lock-aware service/UI mutation paths are implemented and tested. The running service currently resolves product defaults plus local configuration with no managed document; signed policy loading, freshness, caching, and runtime revision changes belong to the enrollment milestone.
+The typed precedence/lock resolver and lock-aware service/UI mutation paths are implemented and tested. The running service resolves product defaults, local configuration, and an optional signed managed document; it verifies freshness and sequence, persists a last-known-good cache, and applies new revisions without restarting.
 
 ## Credentials and device keys
 
-Repository credential storage is implemented with DPAPI under the service identity. Credential values cross only the protected administrator IPC request, are written under opaque collision-resistant references, are zeroized where practical, and never enter TOML or response views. Rotation commits the new configuration before retiring superseded credential files. Device enrollment keys and bootstrapped-secret decryption are not implemented.
+Repository and device-identity credential storage is implemented with DPAPI under the service identity. Credential values cross only protected administrator IPC or the verified enrollment exchange, are written under opaque collision-resistant references, are zeroized where practical, and never enter TOML or response views. Enrollment and rotation commit new protected references and configuration before retiring superseded credential files.
 
 The target credential/device-key model is:
 
@@ -307,7 +307,7 @@ The target credential/device-key model is:
 
 The transport is now split into two explicit modes. `plain_manifest` fetches a direct v1 payload from any bounded HTTP or HTTPS URL, supports offline last-known-good startup, and cannot configure signing or status reporting. `signed_manifest` fetches a v1 Ed25519 envelope, pins the public key locally, requires HTTPS except on loopback, rejects expiry/tampering/rollback/schema mismatch, and may use a DPAPI-backed bearer token for manifest and status requests. Both modes apply only typed `ManagedPolicy` fields through the existing resolver.
 
-The remaining enrollment protocol below is still proposed. Bootstrap URL consumption, generated device key pairs, encrypted secret bootstrap, unenrollment, and rotation are not implemented.
+The enrollment protocol below is implemented end to end by the service, WinUI Settings page, MSI bootstrap staging, and companion server. Interactive MSI entry remains future installer UX; unattended installs may set the hidden `RESTICPAL_BOOTSTRAP_URL` property.
 
 The installer offers an optional bootstrap URL field. Interactive entry is preferred because one-time URLs and tokens can leak through process listings, shell history, response logs, or MSI logs when passed on a command line.
 
@@ -320,14 +320,14 @@ The installer offers an optional bootstrap URL field. Interactive entry is prefe
 - The last valid policy is retained atomically.
 - Client status requests are authenticated with the enrolled device identity.
 
-### Proposed enrollment sequence
+### Enrollment sequence
 
-1. The installer stores the bootstrap URL in a service-only staging location.
-2. On first start, the service consumes the URL and fetches the bootstrap descriptor.
+1. The UI sends the bootstrap URL over administrator-only IPC, or the installer stores it in a service-readable protected registry value.
+2. The service parses the URL fragment, removes it from the HTTP request target, and extracts the one-time bearer token plus pinned Ed25519 public key.
 3. The service generates a device key pair.
 4. The service enrolls with its public key, hostname, app/restic version, OS build, architecture, and a nonce.
 5. The server returns a device ID, policy/status endpoints, a signed initial policy, and any secrets encrypted for the device.
-6. The service verifies and commits enrollment, then erases the one-time bootstrap material.
+6. The service verifies the response signature, request nonce, freshness, URLs, and initial signed manifest; decrypts the secret bundle; commits DPAPI references, cache, and configuration; then erases the one-time bootstrap material.
 7. Future policy fetches use conditional requests such as ETag/version and retain the last-known-good policy when offline.
 
 The adjacent `resticpal-server` repository implements the initial conventional API and carries v1 JSON Schemas and a plain-manifest fixture. A normal static HTTP server remains a supported metadata-only integration and never gains status reporting. OpenAPI generation and signature test-vector publication remain.
@@ -364,11 +364,11 @@ The complete tray and UI status surface will expose:
 
 Tray notifications should be useful rather than noisy: notify on an initial failure, repeated/stale protection, user action required, and recovery after a failure streak. Exact notification thresholds are proposed behavior and should be user configurable.
 
-The current local status protocol exposes redacted state, repository name/mode, last attempt/success, deadline/blocker, and bounded progress. The overview and tray reduce that to a friendly health summary and current progress. The WinUI History page exposes timestamps, duration, outcome, aggregate file/byte statistics, sanitized error code, and snapshot ID for the newest 50 records. Version, enrollment, update, detailed diagnostic, and notification surfaces remain planned.
+The current local status protocol exposes redacted state, repository name/mode, last attempt/success, deadline/blocker, bounded progress, and redacted management enrollment state. The overview and tray reduce backup state to a friendly health summary and current progress. The WinUI History page exposes timestamps, duration, outcome, aggregate file/byte statistics, sanitized error code, and snapshot ID for the newest 50 records; Settings provides enrollment, rotation, and unenrollment. Version, update, detailed diagnostic, and notification surfaces remain planned.
 
 ## Remote status reporting
 
-Authenticated status delivery is implemented for signed-manifest configurations that provide a device ID, status URL, and DPAPI token reference. The worker reports important state changes, every five minutes while running, every six hours while idle, and uses bounded exponential backoff after failure. Delivery is isolated from backup success. Jitter, richer version fields, durable delivery state, and enrollment-created credentials remain.
+Authenticated status delivery is implemented for signed-manifest configurations that provide a device ID, status URL, and DPAPI token reference. Enrollment creates and protects those credentials. The worker reloads the local management source so a live enrollment activates without restarting, reports important state changes, every five minutes while running, every six hours while idle, and uses bounded exponential backoff after failure. Delivery is isolated from backup success. Jitter, richer version fields, and durable delivery state remain.
 
 Remote reporting occurs only when enrolled. The default cadence is:
 
@@ -480,8 +480,8 @@ The service-only execution boundary, shell-free command construction, typed opti
 
    Create/connect, S3/advanced configuration, append-only enforcement, typed policy precedence, per-field lock enforcement, plain/signed manifest ingestion, and live remote policy application are implemented. Standard client-side retention UI/execution and live local-file reload remain.
 
-4. **Enrollment and reporting — in progress**
-   Plain-file mode, signed-envelope verification, replay/freshness checks, atomic cache fallback, authenticated status delivery, schemas, fixtures, and the initial companion server are implemented. One-time bootstrap, generated device identity, encrypted secret bootstrap, installer/UI enrollment, key rotation, and unenrollment remain.
+4. **Enrollment and reporting — functional alpha**
+   Plain-file mode, signed-envelope verification, replay/freshness checks, atomic cache fallback, authenticated status delivery, one-time bootstrap, generated device identity, encrypted secret bootstrap, installer staging, UI enrollment/rotation/unenrollment, schemas, tests, and the companion server are implemented. Conditional requests, audit retention, rate limits, and production deployment hardening remain.
 
 5. **Packaging and updates — installer prototype**
    - WiX MSI, startup registration, upgrade/repair/uninstall behavior, NetSparkle appcast verification, and elevated atomic updater.
@@ -507,7 +507,7 @@ The following themes remain required as their corresponding product areas land:
 
 - Whether the virtual service account is sufficient for reliable VSS and arbitrary configured user paths; LocalSystem is the fallback.
 - Remote schema shapes, signature envelopes, and API/metadata serialization.
-- Local IPC subscription framing and compatibility policy beyond protocol v2.
+- Local IPC subscription framing and compatibility policy beyond protocol v3.
 - Concrete idle memory/CPU targets after the feasibility prototype.
 - Default prune cadence in standard/client-maintained mode.
 - Notification thresholds.

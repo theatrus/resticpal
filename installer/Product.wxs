@@ -12,6 +12,7 @@
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
     <Icon Id="ResticPalIcon" SourceFile="$(BrandIcon)" />
     <Property Id="ARPPRODUCTICON" Value="ResticPalIcon" />
+    <Property Id="RESTICPAL_BOOTSTRAP_URL" Hidden="yes" Secure="yes" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="resticpal" />
@@ -73,6 +74,23 @@
                        Type="string"
                        Value="&quot;[INSTALLFOLDER]resticpal-tray.exe&quot;"
                        KeyPath="yes" />
+      </Component>
+
+      <Component Id="BootstrapEnrollment"
+                 Guid="4B165580-7EDB-4B74-904D-A31DD91F8BCE"
+                 Directory="INSTALLFOLDER"
+                 Condition="RESTICPAL_BOOTSTRAP_URL">
+        <RegistryKey Root="HKLM"
+                     Key="Software\resticpal"
+                     ForceCreateOnInstall="yes">
+          <RegistryValue Name="BootstrapUrl"
+                         Type="string"
+                         Value="[RESTICPAL_BOOTSTRAP_URL]"
+                         KeyPath="yes" />
+          <util:PermissionEx User="NT SERVICE\ResticPal" GenericAll="yes" />
+          <util:PermissionEx User="BUILTIN\Administrators" GenericAll="yes" />
+          <util:PermissionEx User="NT AUTHORITY\SYSTEM" GenericAll="yes" />
+        </RegistryKey>
       </Component>
 
     </Feature>

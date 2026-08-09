@@ -36,6 +36,10 @@ try {
         'Account="NT SERVICE\ResticPal"',
         'Start="install" Stop="both" Remove="uninstall"',
         'Software\Microsoft\Windows\CurrentVersion\Run',
+        'Property Id="RESTICPAL_BOOTSTRAP_URL"',
+        'Secure="yes" Hidden="yes"',
+        'Name="BootstrapUrl"',
+        'Value="[RESTICPAL_BOOTSTRAP_URL]"',
         'Property Id="ARPPRODUCTICON" Value="ResticPalIcon"',
         '<CustomTable Id="Wix4SecureObject">'
     )) {

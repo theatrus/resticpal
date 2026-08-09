@@ -23,6 +23,7 @@ windows = { workspace = true, features = [
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_Power",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_WinRT",
     "Win32_Storage_FileSystem",
@@ -37,4 +38,6 @@ embed-resource.workspace = true
 workspace = true
 
 [dev-dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
 tempfile.workspace = true

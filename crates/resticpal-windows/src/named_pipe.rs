@@ -29,7 +29,7 @@ use windows::Win32::System::Pipes::{
 };
 use windows::core::{BOOL, Error as WindowsError, HRESULT, PCWSTR, w};
 
-pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\ResticPal.v2";
+pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\ResticPal.v3";
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(20);
