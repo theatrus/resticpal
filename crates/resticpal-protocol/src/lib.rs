@@ -56,6 +56,14 @@ pub enum RequestCommand {
     },
     ValidateRepository,
     InitializeRepository,
+    GetSchedule,
+    UpdateSchedule {
+        interval_hours: Option<u32>,
+        wake_grace_seconds: Option<u64>,
+        wake_lock_timeout_seconds: Option<u64>,
+        allow_on_battery: Option<bool>,
+        allow_metered_network: Option<bool>,
+    },
     RunBackupNow,
     CancelBackup,
     DeferBackup {
@@ -108,6 +116,9 @@ pub enum ResponsePayload {
     },
     Repository {
         configuration: RepositoryView,
+    },
+    Schedule {
+        configuration: ScheduleView,
     },
     Accepted {
         message: String,
@@ -182,6 +193,20 @@ pub enum RepositoryOperationStatus {
         completed_at: DateTime<Utc>,
         code: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleView {
+    pub interval_hours: u32,
+    pub wake_grace_seconds: u64,
+    pub wake_lock_timeout_seconds: u64,
+    pub allow_on_battery: bool,
+    pub allow_metered_network: bool,
+    pub interval_hours_locked: bool,
+    pub wake_grace_seconds_locked: bool,
+    pub wake_lock_timeout_seconds_locked: bool,
+    pub allow_on_battery_locked: bool,
+    pub allow_metered_network_locked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,5 +455,25 @@ mod tests {
             read_frame(Cursor::new(bytes)).expect("response should deserialize");
 
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn typed_schedule_update_round_trips() {
+        let request = Request::new(
+            103,
+            RequestCommand::UpdateSchedule {
+                interval_hours: Some(12),
+                wake_grace_seconds: Some(600),
+                wake_lock_timeout_seconds: Some(7_200),
+                allow_on_battery: Some(false),
+                allow_metered_network: Some(true),
+            },
+        );
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &request).expect("request should serialize");
+        let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
+
+        assert_eq!(decoded, request);
     }
 }

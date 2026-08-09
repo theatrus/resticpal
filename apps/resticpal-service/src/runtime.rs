@@ -20,7 +20,7 @@ use resticpal_core::status::{
 };
 use resticpal_protocol::{
     BackupSourcesView, RepositoryOperationKind, RepositoryOperationStatus, RepositorySecretUpdate,
-    RepositoryView, Request, RequestCommand, Response, ResponsePayload,
+    RepositoryView, Request, RequestCommand, Response, ResponsePayload, ScheduleView,
 };
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::ClientIdentity;
@@ -457,6 +457,29 @@ impl ServiceRuntime {
             RequestCommand::InitializeRepository => {
                 self.begin_repository_operation(RepositoryOperationKind::Initialize, identity)
             }
+            RequestCommand::GetSchedule => {
+                if identity.is_elevated_administrator {
+                    ResponsePayload::Schedule {
+                        configuration: self.schedule_view(),
+                    }
+                } else {
+                    administrator_required()
+                }
+            }
+            RequestCommand::UpdateSchedule {
+                interval_hours,
+                wake_grace_seconds,
+                wake_lock_timeout_seconds,
+                allow_on_battery,
+                allow_metered_network,
+            } => self.update_schedule(
+                interval_hours,
+                wake_grace_seconds,
+                wake_lock_timeout_seconds,
+                allow_on_battery,
+                allow_metered_network,
+                identity,
+            ),
             RequestCommand::RunBackupNow => {
                 if !self.config_read().is_configured() {
                     rejected(
@@ -704,6 +727,128 @@ impl ServiceRuntime {
             },
         };
         Self::apply_configuration_status(&mut state, &config, completed_at);
+    }
+
+    fn schedule_view(&self) -> ScheduleView {
+        let config = self.config_read();
+        ScheduleView {
+            interval_hours: config.schedule.interval_hours,
+            wake_grace_seconds: config.schedule.wake_grace_seconds,
+            wake_lock_timeout_seconds: config.schedule.wake_lock_timeout_seconds,
+            allow_on_battery: config.schedule.allow_on_battery,
+            allow_metered_network: config.schedule.allow_metered_network,
+            interval_hours_locked: self.field_locked(PolicyField::ScheduleIntervalHours),
+            wake_grace_seconds_locked: self.field_locked(PolicyField::ScheduleWakeGraceSeconds),
+            wake_lock_timeout_seconds_locked: self
+                .field_locked(PolicyField::ScheduleWakeLockTimeoutSeconds),
+            allow_on_battery_locked: self.field_locked(PolicyField::ScheduleAllowOnBattery),
+            allow_metered_network_locked: self
+                .field_locked(PolicyField::ScheduleAllowMeteredNetwork),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_schedule(
+        &self,
+        interval_hours: Option<u32>,
+        wake_grace_seconds: Option<u64>,
+        wake_lock_timeout_seconds: Option<u64>,
+        allow_on_battery: Option<bool>,
+        allow_metered_network: Option<bool>,
+        identity: ClientIdentity,
+    ) -> ResponsePayload {
+        if !identity.is_elevated_administrator {
+            return administrator_required();
+        }
+        if interval_hours.is_none()
+            && wake_grace_seconds.is_none()
+            && wake_lock_timeout_seconds.is_none()
+            && allow_on_battery.is_none()
+            && allow_metered_network.is_none()
+        {
+            return rejected(
+                "no_configuration_changes",
+                "No schedule changes were supplied.",
+            );
+        }
+        if interval_hours.is_some() && self.field_locked(PolicyField::ScheduleIntervalHours)
+            || wake_grace_seconds.is_some()
+                && self.field_locked(PolicyField::ScheduleWakeGraceSeconds)
+            || wake_lock_timeout_seconds.is_some()
+                && self.field_locked(PolicyField::ScheduleWakeLockTimeoutSeconds)
+            || allow_on_battery.is_some() && self.field_locked(PolicyField::ScheduleAllowOnBattery)
+            || allow_metered_network.is_some()
+                && self.field_locked(PolicyField::ScheduleAllowMeteredNetwork)
+        {
+            return rejected(
+                "managed_field_locked",
+                "One or more schedule fields are locked by managed policy.",
+            );
+        }
+
+        let mut candidate = self.local_config_guard().clone();
+        let mut effective = self.config();
+        if let Some(value) = interval_hours {
+            candidate.schedule.interval_hours = Some(value);
+            effective.schedule.interval_hours = value;
+        }
+        if let Some(value) = wake_grace_seconds {
+            candidate.schedule.wake_grace_seconds = Some(value);
+            effective.schedule.wake_grace_seconds = value;
+        }
+        if let Some(value) = wake_lock_timeout_seconds {
+            candidate.schedule.wake_lock_timeout_seconds = Some(value);
+            effective.schedule.wake_lock_timeout_seconds = value;
+        }
+        if let Some(value) = allow_on_battery {
+            candidate.schedule.allow_on_battery = Some(value);
+            effective.schedule.allow_on_battery = value;
+        }
+        if let Some(value) = allow_metered_network {
+            candidate.schedule.allow_metered_network = Some(value);
+            effective.schedule.allow_metered_network = value;
+        }
+        if let Err(error) = effective.validate() {
+            return rejected("invalid_schedule", &error.to_string());
+        }
+
+        let mut runtime_state = self.state_guard();
+        if matches!(runtime_state.status.state, BackupState::Running { .. }) {
+            return rejected(
+                "backup_running",
+                "Wait for the active backup to finish before changing its schedule.",
+            );
+        }
+        if matches!(
+            runtime_state.repository_operation,
+            RepositoryOperationStatus::Running { .. }
+        ) {
+            return rejected(
+                "repository_operation_running",
+                "Wait for the repository operation to finish before changing the schedule.",
+            );
+        }
+        if let Some(store) = &self.config_store
+            && let Err(error) = store.save(&candidate)
+        {
+            eprintln!(
+                "could not save local configuration to {}: {error}",
+                store.path().display()
+            );
+            return rejected(
+                "configuration_save_failed",
+                "The local configuration could not be saved.",
+            );
+        }
+
+        *self.local_config_guard() = candidate;
+        *self.config_write() = effective.clone();
+        Self::apply_configuration_status(&mut runtime_state, &effective, Utc::now());
+        drop(runtime_state);
+        let _ = self.events.send(RuntimeEvent::ConfigurationChanged);
+        ResponsePayload::Accepted {
+            message: "Backup schedule updated.".to_owned(),
+        }
     }
 
     fn update_backup_sources(
@@ -2135,5 +2280,153 @@ mod tests {
             runtime.evaluate_schedule(Utc::now(), available_conditions()),
             ScheduleAction::Start { .. }
         ));
+    }
+
+    #[test]
+    fn schedule_configuration_requires_admin_and_persists_live_updates() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        LocalConfigStore::new(&config_path)
+            .save(&LocalConfig {
+                backup: LocalBackupConfig {
+                    paths: Some(vec![PathBuf::from(r"C:\Data")]),
+                    exclusions: Some(Vec::new()),
+                },
+                repository: LocalRepositoryConfig {
+                    url: Some("local:C:/backup".to_owned()),
+                    ..LocalRepositoryConfig::default()
+                },
+                ..LocalConfig::default()
+            })
+            .expect("initial config");
+        let (events, receiver) = mpsc::channel();
+        let runtime = ServiceRuntime::load(&config_path, events).expect("runtime");
+        let update = || RequestCommand::UpdateSchedule {
+            interval_hours: Some(12),
+            wake_grace_seconds: Some(600),
+            wake_lock_timeout_seconds: Some(3_600),
+            allow_on_battery: Some(false),
+            allow_metered_network: Some(false),
+        };
+
+        for command in [RequestCommand::GetSchedule, update()] {
+            let response = runtime.handle_request(Request::new(50, command), USER);
+            assert!(matches!(
+                response.payload,
+                ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+            ));
+        }
+
+        let response = runtime.handle_request(Request::new(51, update()), ADMIN);
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(
+            receiver.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        let schedule = runtime.config().schedule;
+        assert_eq!(schedule.interval_hours, 12);
+        assert_eq!(schedule.wake_grace_seconds, 600);
+        assert_eq!(schedule.wake_lock_timeout_seconds, 3_600);
+        assert!(!schedule.allow_on_battery);
+        assert!(!schedule.allow_metered_network);
+        let persisted = LocalConfigStore::new(&config_path)
+            .load()
+            .expect("persisted config");
+        assert_eq!(persisted.schedule.interval_hours, Some(12));
+        assert_eq!(persisted.schedule.wake_grace_seconds, Some(600));
+        assert_eq!(persisted.schedule.wake_lock_timeout_seconds, Some(3_600));
+        assert_eq!(persisted.schedule.allow_on_battery, Some(false));
+        assert_eq!(persisted.schedule.allow_metered_network, Some(false));
+    }
+
+    #[test]
+    fn schedule_policy_locks_are_reported_and_enforced_per_field() {
+        let (mut runtime, events) = runtime(true);
+        runtime.field_resolutions.insert(
+            PolicyField::ScheduleIntervalHours,
+            FieldResolution {
+                source: resticpal_core::policy::ValueSource::ManagedLocked,
+                locked: true,
+            },
+        );
+        let view = runtime.handle_request(Request::new(52, RequestCommand::GetSchedule), ADMIN);
+        assert!(matches!(
+            view.payload,
+            ResponsePayload::Schedule {
+                configuration: ScheduleView {
+                    interval_hours_locked: true,
+                    allow_on_battery_locked: false,
+                    ..
+                }
+            }
+        ));
+
+        let rejected_response = runtime.handle_request(
+            Request::new(
+                53,
+                RequestCommand::UpdateSchedule {
+                    interval_hours: Some(6),
+                    wake_grace_seconds: None,
+                    wake_lock_timeout_seconds: None,
+                    allow_on_battery: None,
+                    allow_metered_network: None,
+                },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(
+            rejected_response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "managed_field_locked"
+        ));
+
+        let accepted_response = runtime.handle_request(
+            Request::new(
+                54,
+                RequestCommand::UpdateSchedule {
+                    interval_hours: None,
+                    wake_grace_seconds: None,
+                    wake_lock_timeout_seconds: None,
+                    allow_on_battery: Some(false),
+                    allow_metered_network: None,
+                },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(
+            accepted_response.payload,
+            ResponsePayload::Accepted { .. }
+        ));
+        assert_eq!(
+            events.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        assert_eq!(runtime.config().schedule.interval_hours, 24);
+        assert!(!runtime.config().schedule.allow_on_battery);
+    }
+
+    #[test]
+    fn invalid_schedule_update_does_not_replace_configuration() {
+        let (runtime, _events) = runtime(true);
+        let before = runtime.config().schedule;
+
+        let response = runtime.handle_request(
+            Request::new(
+                55,
+                RequestCommand::UpdateSchedule {
+                    interval_hours: Some(0),
+                    wake_grace_seconds: None,
+                    wake_lock_timeout_seconds: None,
+                    allow_on_battery: None,
+                    allow_metered_network: None,
+                },
+            ),
+            ADMIN,
+        );
+
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "invalid_schedule"
+        ));
+        assert_eq!(runtime.config().schedule, before);
     }
 }

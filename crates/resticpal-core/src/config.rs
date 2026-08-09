@@ -13,6 +13,7 @@ pub const MAX_REPOSITORY_URL_CHARACTERS: usize = 8 * 1_024;
 pub const MAX_REPOSITORY_DISPLAY_NAME_CHARACTERS: usize = 256;
 pub const MAX_REPOSITORY_OPTIONS: usize = 64;
 pub const MAX_REPOSITORY_OPTION_VALUE_CHARACTERS: usize = 4 * 1_024;
+pub const MAX_SCHEDULE_INTERVAL_HOURS: u32 = 24 * 365;
 
 const DEFAULT_INTERVAL_HOURS: u32 = 24;
 const DEFAULT_WAKE_GRACE_SECONDS: u64 = 5 * 60;
@@ -183,8 +184,8 @@ impl EffectiveConfig {
             return Err(ConfigValidationError::InvalidRepositoryDisplayName);
         }
 
-        if self.schedule.interval_hours == 0 {
-            return Err(ConfigValidationError::ZeroScheduleInterval);
+        if !(1..=MAX_SCHEDULE_INTERVAL_HOURS).contains(&self.schedule.interval_hours) {
+            return Err(ConfigValidationError::InvalidScheduleInterval);
         }
 
         if self.schedule.wake_grace_seconds > 24 * 60 * 60 {
@@ -336,8 +337,8 @@ pub enum ConfigValidationError {
     InvalidRepositoryUrl,
     #[error("repository display name must be a non-empty single-line value within the size limit")]
     InvalidRepositoryDisplayName,
-    #[error("schedule interval must be greater than zero")]
-    ZeroScheduleInterval,
+    #[error("schedule interval must be between one hour and {MAX_SCHEDULE_INTERVAL_HOURS} hours")]
+    InvalidScheduleInterval,
     #[error("wake grace period cannot exceed 24 hours")]
     WakeGraceTooLong,
     #[error("wake-lock timeout must be between one second and 24 hours")]
@@ -377,6 +378,30 @@ mod tests {
         assert_eq!(config.retention.weekly, 5);
         assert_eq!(config.retention.monthly, 12);
         assert_eq!(config.retention.yearly, 3);
+    }
+
+    #[test]
+    fn schedule_safety_bounds_are_enforced() {
+        let mut config = EffectiveConfig::default();
+        config.schedule.interval_hours = MAX_SCHEDULE_INTERVAL_HOURS + 1;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidScheduleInterval)
+        );
+
+        config.schedule.interval_hours = 24;
+        config.schedule.wake_grace_seconds = 24 * 60 * 60 + 1;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::WakeGraceTooLong)
+        );
+
+        config.schedule.wake_grace_seconds = 300;
+        config.schedule.wake_lock_timeout_seconds = 0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidWakeLockTimeout)
+        );
     }
 
     #[test]

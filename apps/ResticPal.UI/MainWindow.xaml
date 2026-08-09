@@ -29,7 +29,7 @@
                     <SymbolIcon Symbol="Save" />
                 </NavigationViewItem.Icon>
             </NavigationViewItem>
-            <NavigationViewItem Content="Schedule" Tag="schedule">
+            <NavigationViewItem x:Name="ScheduleItem" Content="Schedule" Tag="schedule">
                 <NavigationViewItem.Icon>
                     <SymbolIcon Symbol="Calendar" />
                 </NavigationViewItem.Icon>
@@ -329,6 +329,96 @@
                                 Click="CreateRepositoryButton_Click"
                                 Content="Create new repository" />
                             <ProgressRing x:Name="RepositoryProgress" IsActive="False" Width="24" Height="24" />
+                        </StackPanel>
+                    </Grid>
+                </ScrollViewer>
+
+                <ScrollViewer x:Name="SchedulePanel" Visibility="Collapsed">
+                    <Grid MaxWidth="760" Padding="32" HorizontalAlignment="Left" RowSpacing="20">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Schedule" />
+                            <TextBlock
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="Backups use completion-based deadlines and catch up after sleep, shutdown, or a missed interval."
+                                TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <InfoBar
+                            x:Name="SchedulePolicyMessage"
+                            Grid.Row="1"
+                            IsClosable="False"
+                            IsOpen="False"
+                            Severity="Informational" />
+
+                        <Border
+                            Grid.Row="2"
+                            Padding="20"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                            <StackPanel Spacing="18">
+                                <NumberBox
+                                    x:Name="ScheduleIntervalBox"
+                                    Header="Backup interval (hours)"
+                                    Maximum="8760"
+                                    Minimum="1"
+                                    SmallChange="1"
+                                    SpinButtonPlacementMode="Compact"
+                                    Value="24" />
+                                <NumberBox
+                                    x:Name="WakeGraceBox"
+                                    Header="Wait after wake (minutes)"
+                                    Maximum="1440"
+                                    Minimum="0"
+                                    SmallChange="1"
+                                    SpinButtonPlacementMode="Compact"
+                                    Value="5" />
+                                <TextBlock
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="An overdue backup waits for this grace period after the PC wakes, giving networking and external drives time to reconnect. Manual backups do not wait."
+                                    TextWrapping="Wrap" />
+                                <NumberBox
+                                    x:Name="WakeLockTimeoutBox"
+                                    Header="Keep the PC awake for up to (minutes)"
+                                    Maximum="1440"
+                                    Minimum="0.0166666667"
+                                    SmallChange="1"
+                                    SpinButtonPlacementMode="Compact"
+                                    Value="120" />
+                                <TextBlock
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="The wake request expires at this safety limit even if restic is still running. It does not terminate the backup."
+                                    TextWrapping="Wrap" />
+                                <ToggleSwitch
+                                    x:Name="AllowBatteryToggle"
+                                    Header="Battery power"
+                                    IsOn="True"
+                                    OffContent="Wait for AC power"
+                                    OnContent="Allow backups on battery" />
+                                <ToggleSwitch
+                                    x:Name="AllowMeteredToggle"
+                                    Header="Metered networks"
+                                    IsOn="True"
+                                    OffContent="Wait for an unmetered network"
+                                    OnContent="Allow backups on metered networks" />
+                            </StackPanel>
+                        </Border>
+
+                        <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="12">
+                            <Button
+                                x:Name="SaveScheduleButton"
+                                Click="SaveScheduleButton_Click"
+                                Content="Save schedule"
+                                Style="{StaticResource AccentButtonStyle}" />
+                            <ProgressRing x:Name="ScheduleProgress" IsActive="False" Width="24" Height="24" />
                         </StackPanel>
                     </Grid>
                 </ScrollViewer>

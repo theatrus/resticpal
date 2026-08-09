@@ -194,6 +194,46 @@ internal sealed class ResticPalServiceClient
         return await SendCommandAsync(new { type = "initialize_repository" }, cancellationToken);
     }
 
+    public async Task<ScheduleConfiguration> GetScheduleAsync(
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(new { type = "get_schedule" }, cancellationToken);
+        RequirePayloadType(payload, "schedule");
+        JsonElement configuration = payload.GetProperty("configuration");
+        return new ScheduleConfiguration(
+            configuration.GetProperty("interval_hours").GetUInt32(),
+            configuration.GetProperty("wake_grace_seconds").GetUInt64(),
+            configuration.GetProperty("wake_lock_timeout_seconds").GetUInt64(),
+            configuration.GetProperty("allow_on_battery").GetBoolean(),
+            configuration.GetProperty("allow_metered_network").GetBoolean(),
+            configuration.GetProperty("interval_hours_locked").GetBoolean(),
+            configuration.GetProperty("wake_grace_seconds_locked").GetBoolean(),
+            configuration.GetProperty("wake_lock_timeout_seconds_locked").GetBoolean(),
+            configuration.GetProperty("allow_on_battery_locked").GetBoolean(),
+            configuration.GetProperty("allow_metered_network_locked").GetBoolean());
+    }
+
+    public async Task<CommandResult> UpdateScheduleAsync(
+        uint? intervalHours,
+        ulong? wakeGraceSeconds,
+        ulong? wakeLockTimeoutSeconds,
+        bool? allowOnBattery,
+        bool? allowMeteredNetwork,
+        CancellationToken cancellationToken = default)
+    {
+        return await SendCommandAsync(
+            new
+            {
+                type = "update_schedule",
+                interval_hours = intervalHours,
+                wake_grace_seconds = wakeGraceSeconds,
+                wake_lock_timeout_seconds = wakeLockTimeoutSeconds,
+                allow_on_battery = allowOnBattery,
+                allow_metered_network = allowMeteredNetwork,
+            },
+            cancellationToken);
+    }
+
     private static async Task<CommandResult> SendCommandAsync(
         object command,
         CancellationToken cancellationToken)
@@ -391,6 +431,18 @@ internal sealed record RepositoryOperationStatus(
     string? Operation,
     DateTimeOffset? CompletedAt,
     string? Code);
+
+internal sealed record ScheduleConfiguration(
+    uint IntervalHours,
+    ulong WakeGraceSeconds,
+    ulong WakeLockTimeoutSeconds,
+    bool AllowOnBattery,
+    bool AllowMeteredNetwork,
+    bool IntervalHoursLocked,
+    bool WakeGraceSecondsLocked,
+    bool WakeLockTimeoutSecondsLocked,
+    bool AllowOnBatteryLocked,
+    bool AllowMeteredNetworkLocked);
 
 internal sealed record RepositorySecretUpdate(
     [property: JsonPropertyName("action")] string Action,

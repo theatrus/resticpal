@@ -22,6 +22,12 @@ public sealed partial class MainWindow : Window
     private bool _repositoryBusy;
     private bool _applyingRepositoryConfiguration;
     private bool _repositoryDirty;
+    private bool _scheduleLoaded;
+    private bool _scheduleIntervalLocked;
+    private bool _wakeGraceLocked;
+    private bool _wakeLockTimeoutLocked;
+    private bool _allowBatteryLocked;
+    private bool _allowMeteredLocked;
     private IReadOnlySet<string> _configuredRepositorySecrets = new HashSet<string>();
 
     public ObservableCollection<string> BackupPaths { get; } = new();
@@ -44,7 +50,8 @@ public sealed partial class MainWindow : Window
         OverviewPanel.Visibility = tag == "overview" ? Visibility.Visible : Visibility.Collapsed;
         SourcesPanel.Visibility = tag == "sources" ? Visibility.Visible : Visibility.Collapsed;
         RepositoryPanel.Visibility = tag == "repository" ? Visibility.Visible : Visibility.Collapsed;
-        ComingSoonPanel.Visibility = tag is not ("overview" or "sources" or "repository")
+        SchedulePanel.Visibility = tag == "schedule" ? Visibility.Visible : Visibility.Collapsed;
+        ComingSoonPanel.Visibility = tag is not ("overview" or "sources" or "repository" or "schedule")
             ? Visibility.Visible
             : Visibility.Collapsed;
 
@@ -56,7 +63,11 @@ public sealed partial class MainWindow : Window
         {
             await LoadRepositoryAsync();
         }
-        else if (tag is not ("overview" or "sources" or "repository"))
+        else if (tag == "schedule" && !_scheduleLoaded)
+        {
+            await LoadScheduleAsync();
+        }
+        else if (tag is not ("overview" or "sources" or "repository" or "schedule"))
         {
             ComingSoonTitle.Text = args.IsSettingsSelected
                 ? "Application settings"
@@ -658,6 +669,157 @@ public sealed partial class MainWindow : Window
         }
 
         return 2;
+    }
+
+    private async void SaveScheduleButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!TryReadWholeNumber(
+                ScheduleIntervalBox,
+                "Backup interval",
+                1,
+                8_760,
+                out ulong intervalHours)
+            || !TryReadDurationSeconds(
+                WakeGraceBox,
+                "Wake grace period",
+                allowZero: true,
+                out ulong wakeGraceSeconds)
+            || !TryReadDurationSeconds(
+                WakeLockTimeoutBox,
+                "Wake-lock timeout",
+                allowZero: false,
+                out ulong wakeLockTimeoutSeconds))
+        {
+            return;
+        }
+
+        SetScheduleBusy(true);
+        try
+        {
+            CommandResult result = await _service.UpdateScheduleAsync(
+                _scheduleIntervalLocked ? null : checked((uint)intervalHours),
+                _wakeGraceLocked ? null : wakeGraceSeconds,
+                _wakeLockTimeoutLocked ? null : wakeLockTimeoutSeconds,
+                _allowBatteryLocked ? null : AllowBatteryToggle.IsOn,
+                _allowMeteredLocked ? null : AllowMeteredToggle.IsOn);
+            ShowMessage(
+                result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning,
+                result.Message);
+            if (result.Accepted)
+            {
+                _scheduleLoaded = false;
+                await LoadScheduleAsync();
+                await RefreshStatusAsync();
+            }
+        }
+        catch (Exception exception)
+        {
+            ShowConnectionError(exception);
+        }
+        finally
+        {
+            SetScheduleBusy(false);
+        }
+    }
+
+    private async Task LoadScheduleAsync()
+    {
+        SetScheduleBusy(true);
+        try
+        {
+            ScheduleConfiguration configuration = await _service.GetScheduleAsync();
+            ScheduleIntervalBox.Value = configuration.IntervalHours;
+            WakeGraceBox.Value = configuration.WakeGraceSeconds / 60.0;
+            WakeLockTimeoutBox.Value = configuration.WakeLockTimeoutSeconds / 60.0;
+            AllowBatteryToggle.IsOn = configuration.AllowOnBattery;
+            AllowMeteredToggle.IsOn = configuration.AllowMeteredNetwork;
+            _scheduleIntervalLocked = configuration.IntervalHoursLocked;
+            _wakeGraceLocked = configuration.WakeGraceSecondsLocked;
+            _wakeLockTimeoutLocked = configuration.WakeLockTimeoutSecondsLocked;
+            _allowBatteryLocked = configuration.AllowOnBatteryLocked;
+            _allowMeteredLocked = configuration.AllowMeteredNetworkLocked;
+
+            int lockedFields = new[]
+            {
+                _scheduleIntervalLocked,
+                _wakeGraceLocked,
+                _wakeLockTimeoutLocked,
+                _allowBatteryLocked,
+                _allowMeteredLocked,
+            }.Count(value => value);
+            SchedulePolicyMessage.IsOpen = lockedFields > 0;
+            SchedulePolicyMessage.Message = lockedFields == 5
+                ? "The backup schedule and power/network behavior are managed by your organization."
+                : $"{lockedFields} schedule field{(lockedFields == 1 ? " is" : "s are")} managed by your organization.";
+            _scheduleLoaded = true;
+        }
+        catch (Exception exception)
+        {
+            ShowConnectionError(exception);
+        }
+        finally
+        {
+            SetScheduleBusy(false);
+        }
+    }
+
+    private void SetScheduleBusy(bool busy)
+    {
+        ScheduleProgress.IsActive = busy;
+        ScheduleIntervalBox.IsEnabled = !busy && !_scheduleIntervalLocked;
+        WakeGraceBox.IsEnabled = !busy && !_wakeGraceLocked;
+        WakeLockTimeoutBox.IsEnabled = !busy && !_wakeLockTimeoutLocked;
+        AllowBatteryToggle.IsEnabled = !busy && !_allowBatteryLocked;
+        AllowMeteredToggle.IsEnabled = !busy && !_allowMeteredLocked;
+        SaveScheduleButton.IsEnabled = !busy && !(
+            _scheduleIntervalLocked
+            && _wakeGraceLocked
+            && _wakeLockTimeoutLocked
+            && _allowBatteryLocked
+            && _allowMeteredLocked);
+    }
+
+    private bool TryReadDurationSeconds(
+        NumberBox box,
+        string fieldName,
+        bool allowZero,
+        out ulong seconds)
+    {
+        double minimum = allowZero ? 0 : 1.0 / 60.0;
+        if (double.IsNaN(box.Value) || box.Value < minimum || box.Value > 1_440)
+        {
+            seconds = 0;
+            ShowMessage(
+                InfoBarSeverity.Warning,
+                $"{fieldName} must be between {(allowZero ? "zero" : "one second")} and 24 hours.");
+            return false;
+        }
+
+        seconds = checked((ulong)Math.Round(box.Value * 60, MidpointRounding.AwayFromZero));
+        return true;
+    }
+
+    private bool TryReadWholeNumber(
+        NumberBox box,
+        string fieldName,
+        ulong minimum,
+        ulong maximum,
+        out ulong value)
+    {
+        if (double.IsNaN(box.Value)
+            || box.Value < minimum
+            || box.Value > maximum
+            || box.Value != Math.Truncate(box.Value))
+        {
+            value = 0;
+            ShowMessage(
+                InfoBarSeverity.Warning,
+                $"{fieldName} must be a whole number from {minimum:N0} through {maximum:N0}.");
+            return false;
+        }
+
+        value = checked((ulong)box.Value);
+        return true;
     }
 
     private async Task RefreshStatusAsync()

@@ -29,14 +29,14 @@ The first slice establishes:
 - machine configuration loading with a friendly invalid/unconfigured state;
 - authenticated local IPC using client token impersonation and a protected DACL;
 - a native tray icon whose status and run-now command come from the service;
-- an on-demand WinUI application that reads service status and sends run-now requests.
+- an on-demand WinUI application that reads service status and sends run-now requests;
 - direct restic process execution in a kill-on-close Windows Job Object;
 - bounded JSON progress parsing, cancellation, and sanitized outcomes;
-- a system-required wake lock that automatically expires at the configured safety timeout.
-- DPAPI credential encryption bound to the service identity, with protected service/admin ACLs and atomic credential-file replacement.
+- a system-required wake lock that automatically expires at the configured safety timeout;
+- DPAPI credential encryption bound to the service identity, with protected service/admin ACLs and atomic credential-file replacement;
 - deadline-driven startup and resume catch-up execution through the same service scheduler used by manual runs;
 - Windows power, network-availability, and metered-network gates, with local repositories exempt from network checks;
-- bounded exponential retry after failures and durable last-success state for restart-safe daily deadlines.
+- bounded exponential retry after failures and durable last-success state for restart-safe daily deadlines;
 - elevated, typed backup-source configuration over the protected service IPC, with per-field managed-policy locks;
 - atomic local TOML replacement and live scheduler updates after accepted configuration changes;
 - Windows profile discovery for existing Desktop, Documents, Pictures, Videos, and Music folders;
@@ -45,7 +45,9 @@ The first slice establishes:
 - transactional DPAPI credential provisioning and rotation with opaque, collision-resistant references and redacted status responses;
 - a policy-aware WinUI repository page for local/network, S3-compatible, and advanced restic backends;
 - asynchronous create/connect repository flows with a hard timeout, service-owned restic execution, and append-only initialization enforcement;
-- a durable repository-validation gate tied to connection fields and credential references, preventing backups after unverified changes.
+- a durable repository-validation gate tied to connection fields and credential references, preventing backups after unverified changes;
+- elevated, per-field policy-aware schedule configuration with atomic persistence and immediate scheduler reevaluation;
+- a WinUI Schedule page for interval, wake grace, wake-lock timeout, battery, and metered-network behavior.
 
 Credential provisioning through installer bootstrap/enrollment, automatic discovery for newly created profiles, direct-file configuration watching, installation, run-history persistence, and enrollment are not wired up yet. The executor fails closed when a referenced credential is absent, corrupt, or not a valid environment value, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
 
