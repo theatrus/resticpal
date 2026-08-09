@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use resticpal_core::config::{EffectiveConfig, LocalConfig};
+use resticpal_core::config::{EffectiveConfig, LocalConfig, RepositoryMode};
 use resticpal_core::policy::{
     FieldResolution, PolicyError, PolicyField, ResolvedConfig, resolve_config,
 };
@@ -13,7 +13,11 @@ use resticpal_core::schedule::{
     BackupTrigger, ScheduleBlocker, ScheduleDecision, SchedulerSnapshot, decide,
 };
 use resticpal_core::status::{BackupPhase, BackupProgress, BackupState, ServiceStatus};
-use resticpal_protocol::{BackupSourcesView, Request, RequestCommand, Response, ResponsePayload};
+use resticpal_protocol::{
+    BackupSourcesView, RepositorySecretUpdate, RepositoryView, Request, RequestCommand, Response,
+    ResponsePayload,
+};
+use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::ClientIdentity;
 use resticpal_windows::user_profiles::discover_backup_sources;
 use thiserror::Error;
@@ -26,6 +30,7 @@ use crate::state::ScheduleStateStore;
 const CONDITION_RETRY_SECONDS: u64 = 60;
 const INITIAL_FAILURE_RETRY_MINUTES: i64 = 5;
 const MAX_FAILURE_BACKOFF_EXPONENT: u32 = 6;
+const MAX_SECRET_UPDATES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
@@ -59,6 +64,7 @@ pub struct ServiceRuntime {
     local_config: Mutex<LocalConfig>,
     field_resolutions: BTreeMap<PolicyField, FieldResolution>,
     config_store: Option<LocalConfigStore>,
+    credential_store: Option<DpapiSecretStore>,
     state: Mutex<RuntimeState>,
     state_store: Option<ScheduleStateStore>,
     events: Sender<RuntimeEvent>,
@@ -66,6 +72,14 @@ pub struct ServiceRuntime {
 
 impl ServiceRuntime {
     pub fn load(path: &Path, events: Sender<RuntimeEvent>) -> Result<Self, RuntimeInitError> {
+        Self::load_with_credentials(path, events, None)
+    }
+
+    pub fn load_with_credentials(
+        path: &Path,
+        events: Sender<RuntimeEvent>,
+        credential_store: Option<DpapiSecretStore>,
+    ) -> Result<Self, RuntimeInitError> {
         let config_store = LocalConfigStore::new(path);
         let local = config_store.load()?;
         let resolved = resolve_config(&EffectiveConfig::default(), &local, None)?;
@@ -87,12 +101,21 @@ impl ServiceRuntime {
             last_success,
             Some(state_store),
             Some(config_store),
+            credential_store,
         ))
     }
 
     #[cfg(test)]
     pub fn from_resolved(resolved: ResolvedConfig, events: Sender<RuntimeEvent>) -> Self {
-        Self::from_resolved_with_state(resolved, LocalConfig::default(), events, None, None, None)
+        Self::from_resolved_with_state(
+            resolved,
+            LocalConfig::default(),
+            events,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     fn from_resolved_with_state(
@@ -102,6 +125,7 @@ impl ServiceRuntime {
         last_success: Option<DateTime<Utc>>,
         state_store: Option<ScheduleStateStore>,
         config_store: Option<LocalConfigStore>,
+        credential_store: Option<DpapiSecretStore>,
     ) -> Self {
         let now = Utc::now();
         let configured = resolved.effective.is_configured();
@@ -132,6 +156,7 @@ impl ServiceRuntime {
             local_config: Mutex::new(local_config),
             field_resolutions: resolved.fields,
             config_store,
+            credential_store,
             state: Mutex::new(RuntimeState {
                 status,
                 resumed_at: None,
@@ -151,6 +176,7 @@ impl ServiceRuntime {
             local_config: Mutex::new(LocalConfig::default()),
             field_resolutions: BTreeMap::new(),
             config_store: None,
+            credential_store: None,
             state: Mutex::new(RuntimeState {
                 status: ServiceStatus {
                     state: BackupState::Failed {
@@ -365,6 +391,22 @@ impl ServiceRuntime {
             RequestCommand::UpdateBackupSources { paths, exclusions } => {
                 self.update_backup_sources(paths, exclusions, identity)
             }
+            RequestCommand::GetRepository => {
+                if identity.is_elevated_administrator {
+                    ResponsePayload::Repository {
+                        configuration: self.repository_view(),
+                    }
+                } else {
+                    administrator_required()
+                }
+            }
+            RequestCommand::UpdateRepository {
+                display_name,
+                url,
+                mode,
+                options,
+                secret_updates,
+            } => self.update_repository(display_name, url, mode, options, secret_updates, identity),
             RequestCommand::RunBackupNow => {
                 if !self.config_read().is_configured() {
                     rejected(
@@ -433,6 +475,22 @@ impl ServiceRuntime {
         }
     }
 
+    fn repository_view(&self) -> RepositoryView {
+        let config = self.config_read();
+        RepositoryView {
+            display_name: config.repository.display_name.clone(),
+            url: config.repository.url.clone(),
+            mode: config.repository.mode,
+            options: config.repository.options.clone(),
+            configured_secrets: config.repository.secret_refs.keys().copied().collect(),
+            display_name_locked: self.field_locked(PolicyField::RepositoryDisplayName),
+            url_locked: self.field_locked(PolicyField::RepositoryUrl),
+            mode_locked: self.field_locked(PolicyField::RepositoryMode),
+            options_locked: self.field_locked(PolicyField::RepositoryOptions),
+            secrets_locked: self.field_locked(PolicyField::RepositorySecretRefs),
+        }
+    }
+
     fn update_backup_sources(
         &self,
         paths: Option<Vec<std::path::PathBuf>>,
@@ -498,6 +556,189 @@ impl ServiceRuntime {
         let _ = self.events.send(RuntimeEvent::ConfigurationChanged);
         ResponsePayload::Accepted {
             message: "Backup sources updated.".to_owned(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_repository(
+        &self,
+        display_name: Option<String>,
+        url: Option<String>,
+        mode: Option<RepositoryMode>,
+        options: Option<BTreeMap<String, String>>,
+        secret_updates: Vec<RepositorySecretUpdate>,
+        identity: ClientIdentity,
+    ) -> ResponsePayload {
+        if !identity.is_elevated_administrator {
+            return administrator_required();
+        }
+        if display_name.is_none()
+            && url.is_none()
+            && mode.is_none()
+            && options.is_none()
+            && secret_updates.is_empty()
+        {
+            return rejected(
+                "no_configuration_changes",
+                "No repository changes were supplied.",
+            );
+        }
+        if display_name.is_some() && self.field_locked(PolicyField::RepositoryDisplayName)
+            || url.is_some() && self.field_locked(PolicyField::RepositoryUrl)
+            || mode.is_some() && self.field_locked(PolicyField::RepositoryMode)
+            || options.is_some() && self.field_locked(PolicyField::RepositoryOptions)
+            || !secret_updates.is_empty() && self.field_locked(PolicyField::RepositorySecretRefs)
+        {
+            return rejected(
+                "managed_field_locked",
+                "One or more repository fields are locked by managed policy.",
+            );
+        }
+        if secret_updates.len() > MAX_SECRET_UPDATES {
+            return rejected(
+                "too_many_secret_updates",
+                "Too many credential changes were supplied in one request.",
+            );
+        }
+        let mut seen_variables = std::collections::BTreeSet::new();
+        if secret_updates.iter().any(|update| {
+            let variable = match update {
+                RepositorySecretUpdate::Set { variable, .. }
+                | RepositorySecretUpdate::Remove { variable } => *variable,
+            };
+            !seen_variables.insert(variable)
+        }) {
+            return rejected(
+                "duplicate_secret_update",
+                "Each credential may be changed at most once per request.",
+            );
+        }
+        if !secret_updates.is_empty() && self.credential_store.is_none() {
+            return rejected(
+                "credential_store_unavailable",
+                "The protected credential store is unavailable.",
+            );
+        }
+
+        let mut candidate = self.local_config_guard().clone();
+        let mut effective = self.config();
+        if let Some(display_name) = display_name {
+            let display_name = nonempty_trimmed(display_name);
+            candidate.repository.display_name = display_name.clone();
+            effective.repository.display_name = display_name;
+        }
+        if let Some(url) = url {
+            let url = nonempty_trimmed(url);
+            candidate.repository.url = url.clone();
+            effective.repository.url = url;
+        }
+        if let Some(mode) = mode {
+            candidate.repository.mode = Some(mode);
+            effective.repository.mode = mode;
+        }
+        if let Some(options) = options {
+            candidate.repository.options = Some(options.clone());
+            effective.repository.options = options;
+        }
+        if let Err(error) = effective.validate() {
+            return rejected("invalid_repository", &error.to_string());
+        }
+
+        let mut runtime_state = self.state_guard();
+        if matches!(runtime_state.status.state, BackupState::Running { .. }) {
+            return rejected(
+                "backup_running",
+                "Wait for the active backup to finish before changing its repository.",
+            );
+        }
+
+        let mut created_references = Vec::new();
+        let mut retired_references = std::collections::BTreeSet::new();
+        if !secret_updates.is_empty() {
+            let store = self
+                .credential_store
+                .as_ref()
+                .expect("credential store availability was checked");
+            let local_references = candidate
+                .repository
+                .secret_refs
+                .get_or_insert_with(BTreeMap::new);
+            for update in secret_updates {
+                let result = match update {
+                    RepositorySecretUpdate::Set { variable, value } => store
+                        .put_new(variable.reference_prefix(), value.as_bytes())
+                        .map(|reference| {
+                            if let Some(old) = effective
+                                .repository
+                                .secret_refs
+                                .insert(variable, reference.clone())
+                            {
+                                retired_references.insert(old);
+                            }
+                            local_references.insert(variable, reference.clone());
+                            created_references.push(reference);
+                        }),
+                    RepositorySecretUpdate::Remove { variable } => {
+                        if let Some(old) = effective.repository.secret_refs.remove(&variable) {
+                            retired_references.insert(old);
+                        }
+                        local_references.remove(&variable);
+                        Ok(())
+                    }
+                };
+                if let Err(error) = result {
+                    eprintln!("could not store a repository credential: {error}");
+                    cleanup_credentials(store, &created_references);
+                    return rejected(
+                        "credential_save_failed",
+                        "A repository credential could not be stored securely.",
+                    );
+                }
+            }
+            retired_references.retain(|reference| {
+                !effective
+                    .repository
+                    .secret_refs
+                    .values()
+                    .any(|active| active == reference)
+            });
+        }
+        if let Err(error) = effective.validate() {
+            if let Some(store) = &self.credential_store {
+                cleanup_credentials(store, &created_references);
+            }
+            return rejected("invalid_repository", &error.to_string());
+        }
+        if let Some(store) = &self.config_store
+            && let Err(error) = store.save(&candidate)
+        {
+            eprintln!(
+                "could not save local configuration to {}: {error}",
+                store.path().display()
+            );
+            if let Some(credentials) = &self.credential_store {
+                cleanup_credentials(credentials, &created_references);
+            }
+            return rejected(
+                "configuration_save_failed",
+                "The local configuration could not be saved.",
+            );
+        }
+
+        *self.local_config_guard() = candidate;
+        *self.config_write() = effective.clone();
+        Self::apply_configuration_status(&mut runtime_state, &effective, Utc::now());
+        drop(runtime_state);
+        if let Some(store) = &self.credential_store {
+            for reference in retired_references {
+                if let Err(error) = store.remove(&reference) {
+                    eprintln!("could not retire an old repository credential: {error}");
+                }
+            }
+        }
+        let _ = self.events.send(RuntimeEvent::ConfigurationChanged);
+        ResponsePayload::Accepted {
+            message: "Repository settings updated.".to_owned(),
         }
     }
 
@@ -586,6 +827,17 @@ fn deduplicate_exclusions(exclusions: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn nonempty_trimmed(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn cleanup_credentials(store: &DpapiSecretStore, references: &[String]) {
+    for reference in references {
+        let _ = store.remove(reference);
+    }
+}
+
 fn transition_state(status: &mut ServiceStatus, next: BackupState, now: DateTime<Utc>) {
     if status.state != next {
         status.state = next;
@@ -656,8 +908,11 @@ mod tests {
     use std::thread;
     use std::time::Duration as StdDuration;
 
-    use resticpal_core::config::{BackupConfig, RepositoryConfig};
-    use resticpal_protocol::PROTOCOL_VERSION;
+    use resticpal_core::config::{
+        BackupConfig, LocalBackupConfig, RepositoryConfig, SecretEnvironmentVariable,
+    };
+    use resticpal_protocol::{PROTOCOL_VERSION, SecretValue};
+    use resticpal_windows::credentials::CredentialStoreError;
     use resticpal_windows::named_pipe::{NamedPipeClient, NamedPipeServer};
 
     use super::*;
@@ -1158,5 +1413,235 @@ mod tests {
         assert_eq!(config.backup.paths, [PathBuf::from(r"D:\Data")]);
         assert_eq!(config.backup.exclusions, ["managed-pattern"]);
         assert_eq!(config.repository.url.as_deref(), Some("local:C:/backup"));
+    }
+
+    #[test]
+    fn repository_configuration_requires_an_elevated_administrator() {
+        let (runtime, _events) = runtime(true);
+        let update = RequestCommand::UpdateRepository {
+            display_name: Some("Backup".to_owned()),
+            url: Some("local:C:/backup".to_owned()),
+            mode: Some(RepositoryMode::Standard),
+            options: Some(BTreeMap::new()),
+            secret_updates: Vec::new(),
+        };
+
+        for command in [RequestCommand::GetRepository, update] {
+            let response = runtime.handle_request(Request::new(30, command), USER);
+            assert!(matches!(
+                response.payload,
+                ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+            ));
+        }
+    }
+
+    #[test]
+    fn repository_credentials_rotate_without_entering_configuration_or_responses() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        let config_store = LocalConfigStore::new(&config_path);
+        config_store
+            .save(&LocalConfig {
+                backup: LocalBackupConfig {
+                    paths: Some(vec![PathBuf::from(r"C:\Data")]),
+                    exclusions: Some(Vec::new()),
+                },
+                ..LocalConfig::default()
+            })
+            .expect("initial config");
+        let credentials =
+            DpapiSecretStore::open(directory.path().join("Credentials")).expect("credential store");
+        let (events, receiver) = mpsc::channel();
+        let runtime =
+            ServiceRuntime::load_with_credentials(&config_path, events, Some(credentials.clone()))
+                .expect("runtime");
+        let first_secret = "first-unique-repository-secret";
+
+        let response = runtime.handle_request(
+            Request::new(
+                31,
+                RequestCommand::UpdateRepository {
+                    display_name: Some("Managed S3".to_owned()),
+                    url: Some("s3:https://s3.example.test/bucket/device".to_owned()),
+                    mode: Some(RepositoryMode::AppendOnly),
+                    options: Some(BTreeMap::from([(
+                        "s3.region".to_owned(),
+                        "us-west-2".to_owned(),
+                    )])),
+                    secret_updates: vec![RepositorySecretUpdate::Set {
+                        variable: SecretEnvironmentVariable::ResticPassword,
+                        value: SecretValue::new(first_secret),
+                    }],
+                },
+            ),
+            ADMIN,
+        );
+
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(
+            receiver.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        let first_reference = runtime.config().repository.secret_refs
+            [&SecretEnvironmentVariable::ResticPassword]
+            .clone();
+        assert_eq!(
+            credentials
+                .get(&first_reference)
+                .expect("first secret")
+                .as_slice(),
+            first_secret.as_bytes()
+        );
+        let config_text = std::fs::read_to_string(&config_path).expect("saved config");
+        assert!(!config_text.contains(first_secret));
+        let view = runtime.handle_request(Request::new(32, RequestCommand::GetRepository), ADMIN);
+        assert!(matches!(
+            view.payload,
+            ResponsePayload::Repository {
+                configuration: RepositoryView {
+                    mode: RepositoryMode::AppendOnly,
+                    ref configured_secrets,
+                    ..
+                }
+            } if configured_secrets == &[SecretEnvironmentVariable::ResticPassword]
+        ));
+        assert!(!format!("{view:?}").contains(first_secret));
+        assert!(!format!("{view:?}").contains(&first_reference));
+
+        let second_secret = "second-unique-repository-secret";
+        let response = runtime.handle_request(
+            Request::new(
+                33,
+                RequestCommand::UpdateRepository {
+                    display_name: None,
+                    url: None,
+                    mode: None,
+                    options: None,
+                    secret_updates: vec![RepositorySecretUpdate::Set {
+                        variable: SecretEnvironmentVariable::ResticPassword,
+                        value: SecretValue::new(second_secret),
+                    }],
+                },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert_eq!(
+            receiver.recv().expect("rotation event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        let second_reference = runtime.config().repository.secret_refs
+            [&SecretEnvironmentVariable::ResticPassword]
+            .clone();
+        assert_ne!(first_reference, second_reference);
+        assert!(matches!(
+            credentials.get(&first_reference),
+            Err(CredentialStoreError::NotFound)
+        ));
+        assert_eq!(
+            credentials
+                .get(&second_reference)
+                .expect("rotated secret")
+                .as_slice(),
+            second_secret.as_bytes()
+        );
+
+        let response = runtime.handle_request(
+            Request::new(
+                34,
+                RequestCommand::UpdateRepository {
+                    display_name: None,
+                    url: None,
+                    mode: None,
+                    options: None,
+                    secret_updates: vec![RepositorySecretUpdate::Remove {
+                        variable: SecretEnvironmentVariable::ResticPassword,
+                    }],
+                },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+        assert!(
+            !runtime
+                .config()
+                .repository
+                .secret_refs
+                .contains_key(&SecretEnvironmentVariable::ResticPassword)
+        );
+        assert!(matches!(
+            credentials.get(&second_reference),
+            Err(CredentialStoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn repository_policy_locks_are_reported_and_enforced_per_field() {
+        let (mut runtime, events) = runtime(true);
+        runtime.field_resolutions.insert(
+            PolicyField::RepositoryUrl,
+            FieldResolution {
+                source: resticpal_core::policy::ValueSource::ManagedLocked,
+                locked: true,
+            },
+        );
+
+        let view = runtime.handle_request(Request::new(35, RequestCommand::GetRepository), ADMIN);
+        assert!(matches!(
+            view.payload,
+            ResponsePayload::Repository {
+                configuration: RepositoryView {
+                    url_locked: true,
+                    display_name_locked: false,
+                    ..
+                }
+            }
+        ));
+
+        let rejected_response = runtime.handle_request(
+            Request::new(
+                36,
+                RequestCommand::UpdateRepository {
+                    display_name: None,
+                    url: Some("local:D:/replacement".to_owned()),
+                    mode: None,
+                    options: None,
+                    secret_updates: Vec::new(),
+                },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(
+            rejected_response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "managed_field_locked"
+        ));
+
+        let accepted_response = runtime.handle_request(
+            Request::new(
+                37,
+                RequestCommand::UpdateRepository {
+                    display_name: Some("Friendly name".to_owned()),
+                    url: None,
+                    mode: None,
+                    options: None,
+                    secret_updates: Vec::new(),
+                },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(
+            accepted_response.payload,
+            ResponsePayload::Accepted { .. }
+        ));
+        assert_eq!(
+            events.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        let config = runtime.config();
+        assert_eq!(config.repository.url.as_deref(), Some("local:C:/backup"));
+        assert_eq!(
+            config.repository.display_name.as_deref(),
+            Some("Friendly name")
+        );
     }
 }

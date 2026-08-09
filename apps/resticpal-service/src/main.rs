@@ -115,7 +115,12 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
     let config_path = config_path(arguments);
-    let runtime = match ServiceRuntime::load(&config_path, event_tx.clone()) {
+    let credential_store = credential_store();
+    let runtime = match ServiceRuntime::load_with_credentials(
+        &config_path,
+        event_tx.clone(),
+        credential_store.clone(),
+    ) {
         Ok(runtime) => Arc::new(runtime),
         Err(error) => {
             eprintln!(
@@ -128,7 +133,7 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
     start_ipc_server(Arc::clone(&runtime));
     let executor = ResticExecutor::new(
         restic_path(),
-        secret_resolver(),
+        secret_resolver(credential_store),
         Arc::new(SystemWakeLockProvider),
     );
 
@@ -314,14 +319,21 @@ fn program_data_root() -> PathBuf {
         .join("ResticPal")
 }
 
-fn secret_resolver() -> Arc<dyn SecretResolver> {
+fn credential_store() -> Option<DpapiSecretStore> {
     match DpapiSecretStore::open(credential_store_path()) {
-        Ok(store) => Arc::new(DpapiSecretResolver::new(store)),
+        Ok(store) => Some(store),
         Err(error) => {
             eprintln!("could not initialize the credential store: {error}");
-            Arc::new(UnavailableSecretResolver)
+            None
         }
     }
+}
+
+fn secret_resolver(store: Option<DpapiSecretStore>) -> Arc<dyn SecretResolver> {
+    store.map_or_else(
+        || Arc::new(UnavailableSecretResolver) as Arc<dyn SecretResolver>,
+        |store| Arc::new(DpapiSecretResolver::new(store)),
+    )
 }
 
 fn restic_path() -> PathBuf {

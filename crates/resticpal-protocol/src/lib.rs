@@ -2,13 +2,17 @@
 
 //! Versioned messages and bounded JSON framing for local resticpal IPC.
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use resticpal_core::config::{RepositoryMode, SecretEnvironmentVariable};
 use resticpal_core::status::ServiceStatus;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -40,6 +44,14 @@ pub enum RequestCommand {
     UpdateBackupSources {
         paths: Option<Vec<PathBuf>>,
         exclusions: Option<Vec<String>>,
+    },
+    GetRepository,
+    UpdateRepository {
+        display_name: Option<String>,
+        url: Option<String>,
+        mode: Option<RepositoryMode>,
+        options: Option<BTreeMap<String, String>>,
+        secret_updates: Vec<RepositorySecretUpdate>,
     },
     RunBackupNow,
     CancelBackup,
@@ -91,6 +103,9 @@ pub enum ResponsePayload {
     DiscoveredBackupSources {
         sources: Vec<DiscoveredBackupSource>,
     },
+    Repository {
+        configuration: RepositoryView,
+    },
     Accepted {
         message: String,
     },
@@ -125,8 +140,79 @@ pub enum DiscoveredSourceKind {
     Music,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryView {
+    pub display_name: Option<String>,
+    pub url: Option<String>,
+    pub mode: RepositoryMode,
+    pub options: BTreeMap<String, String>,
+    pub configured_secrets: Vec<SecretEnvironmentVariable>,
+    pub display_name_locked: bool,
+    pub url_locked: bool,
+    pub mode_locked: bool,
+    pub options_locked: bool,
+    pub secrets_locked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum RepositorySecretUpdate {
+    Set {
+        variable: SecretEnvironmentVariable,
+        value: SecretValue,
+    },
+    Remove {
+        variable: SecretEnvironmentVariable,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretValue(String);
+
+impl SecretValue {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for SecretValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl Serialize for SecretValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self)
+    }
+}
+
+impl Drop for SecretValue {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 pub fn write_frame<T: Serialize>(mut writer: impl Write, value: &T) -> Result<(), FrameError> {
-    let payload = serde_json::to_vec(value)?;
+    let payload = Zeroizing::new(serde_json::to_vec(value)?);
     if payload.len() > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge(payload.len()));
     }
@@ -146,7 +232,7 @@ pub fn read_frame<T: DeserializeOwned>(mut reader: impl Read) -> Result<T, Frame
         return Err(FrameError::InvalidLength(length));
     }
 
-    let mut payload = vec![0_u8; length];
+    let mut payload = Zeroizing::new(vec![0_u8; length]);
     reader.read_exact(&mut payload)?;
     Ok(serde_json::from_slice(&payload)?)
 }
@@ -251,6 +337,30 @@ mod tests {
                 exclusions: Some(vec!["**/node_modules/**".to_owned()]),
             },
         );
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &request).expect("request should serialize");
+        let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn repository_secret_round_trips_but_is_redacted_from_debug_output() {
+        let request = Request::new(
+            101,
+            RequestCommand::UpdateRepository {
+                display_name: Some("S3 backup".to_owned()),
+                url: Some("s3:https://s3.example.test/bucket".to_owned()),
+                mode: Some(RepositoryMode::AppendOnly),
+                options: Some(BTreeMap::new()),
+                secret_updates: vec![RepositorySecretUpdate::Set {
+                    variable: SecretEnvironmentVariable::ResticPassword,
+                    value: SecretValue::new("unique-secret"),
+                }],
+            },
+        );
+        assert!(!format!("{request:?}").contains("unique-secret"));
         let mut bytes = Vec::new();
 
         write_frame(&mut bytes, &request).expect("request should serialize");

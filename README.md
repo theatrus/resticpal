@@ -40,9 +40,12 @@ The first slice establishes:
 - elevated, typed backup-source configuration over the protected service IPC, with per-field managed-policy locks;
 - atomic local TOML replacement and live scheduler updates after accepted configuration changes;
 - Windows profile discovery for existing Desktop, Documents, Pictures, Videos, and Music folders;
-- a WinUI backup-sources page for discovery, folder picking, removal, and exclusion editing.
+- a WinUI backup-sources page for discovery, folder picking, removal, and exclusion editing;
+- elevated repository configuration over service IPC, including arbitrary restic repository URLs, append-only mode, and bounded advanced options;
+- transactional DPAPI credential provisioning and rotation with opaque, collision-resistant references and redacted status responses;
+- a policy-aware WinUI repository page for local/network, S3-compatible, and advanced restic backends.
 
-Credential provisioning through setup/enrollment, automatic discovery for newly created profiles, direct-file configuration watching, installation, run-history persistence, and enrollment are not wired up yet. The executor fails closed when a referenced credential is absent, corrupt, or not a valid environment value, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
+Repository initialization, credential provisioning through installer bootstrap/enrollment, automatic discovery for newly created profiles, direct-file configuration watching, installation, run-history persistence, and enrollment are not wired up yet. The executor fails closed when a referenced credential is absent, corrupt, or not a valid environment value, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
 
 ## Build and test
 

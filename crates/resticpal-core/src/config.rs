@@ -9,6 +9,10 @@ pub const MAX_BACKUP_PATHS: usize = 128;
 pub const MAX_EXCLUSIONS: usize = 512;
 pub const MAX_PATH_CHARACTERS: usize = 32_767;
 pub const MAX_EXCLUSION_CHARACTERS: usize = 1_024;
+pub const MAX_REPOSITORY_URL_CHARACTERS: usize = 8 * 1_024;
+pub const MAX_REPOSITORY_DISPLAY_NAME_CHARACTERS: usize = 256;
+pub const MAX_REPOSITORY_OPTIONS: usize = 64;
+pub const MAX_REPOSITORY_OPTION_VALUE_CHARACTERS: usize = 4 * 1_024;
 
 const DEFAULT_INTERVAL_HOURS: u32 = 24;
 const DEFAULT_WAKE_GRACE_SECONDS: u64 = 5 * 60;
@@ -135,6 +139,20 @@ impl SecretEnvironmentVariable {
             Self::RcloneConfigPassword => "RCLONE_CONFIG_PASS",
         }
     }
+
+    #[must_use]
+    pub const fn reference_prefix(self) -> &'static str {
+        match self {
+            Self::ResticPassword => "restic-password",
+            Self::AwsAccessKeyId => "aws-access-key-id",
+            Self::AwsSecretAccessKey => "aws-secret-access-key",
+            Self::AwsSessionToken => "aws-session-token",
+            Self::AzureAccountKey => "azure-account-key",
+            Self::B2AccountKey => "b2-account-key",
+            Self::GoogleApplicationCredentials => "google-credentials",
+            Self::RcloneConfigPassword => "rclone-config-password",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,10 +165,22 @@ pub struct EffectiveConfig {
 
 impl EffectiveConfig {
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
-        if let Some(url) = &self.repository.url
-            && url.trim().is_empty()
-        {
-            return Err(ConfigValidationError::EmptyRepositoryUrl);
+        if let Some(url) = &self.repository.url {
+            if url.trim().is_empty() {
+                return Err(ConfigValidationError::EmptyRepositoryUrl);
+            }
+            if url.chars().count() > MAX_REPOSITORY_URL_CHARACTERS
+                || url.contains(['\0', '\r', '\n'])
+            {
+                return Err(ConfigValidationError::InvalidRepositoryUrl);
+            }
+        }
+        if self.repository.display_name.as_ref().is_some_and(|name| {
+            name.trim().is_empty()
+                || name.chars().count() > MAX_REPOSITORY_DISPLAY_NAME_CHARACTERS
+                || name.contains(['\0', '\r', '\n'])
+        }) {
+            return Err(ConfigValidationError::InvalidRepositoryDisplayName);
         }
 
         if self.schedule.interval_hours == 0 {
@@ -190,9 +220,19 @@ impl EffectiveConfig {
             }
         }
 
-        for key in self.repository.options.keys() {
+        if self.repository.options.len() > MAX_REPOSITORY_OPTIONS {
+            return Err(ConfigValidationError::TooManyRepositoryOptions);
+        }
+        for (key, value) in &self.repository.options {
             if !is_valid_option_name(key) {
                 return Err(ConfigValidationError::InvalidRepositoryOption(key.clone()));
+            }
+            if value.chars().count() > MAX_REPOSITORY_OPTION_VALUE_CHARACTERS
+                || value.contains(['\0', '\r', '\n'])
+            {
+                return Err(ConfigValidationError::InvalidRepositoryOptionValue(
+                    key.clone(),
+                ));
             }
         }
 
@@ -292,6 +332,10 @@ pub enum LocalConfigError {
 pub enum ConfigValidationError {
     #[error("repository URL cannot be empty")]
     EmptyRepositoryUrl,
+    #[error("repository URL must be a single-line value within the size limit")]
+    InvalidRepositoryUrl,
+    #[error("repository display name must be a non-empty single-line value within the size limit")]
+    InvalidRepositoryDisplayName,
     #[error("schedule interval must be greater than zero")]
     ZeroScheduleInterval,
     #[error("wake grace period cannot exceed 24 hours")]
@@ -308,6 +352,10 @@ pub enum ConfigValidationError {
     InvalidExclusion,
     #[error("invalid repository option name: {0}")]
     InvalidRepositoryOption(String),
+    #[error("repository option value must be a single-line value within the size limit: {0}")]
+    InvalidRepositoryOptionValue(String),
+    #[error("repository configuration exceeds the maximum of {MAX_REPOSITORY_OPTIONS} options")]
+    TooManyRepositoryOptions,
     #[error("secret reference IDs cannot be empty")]
     EmptySecretReference,
 }
@@ -364,6 +412,53 @@ mod tests {
             Err(ConfigValidationError::InvalidRepositoryOption(
                 "--password-file".to_owned()
             ))
+        );
+    }
+
+    #[test]
+    fn rejects_unbounded_or_multiline_repository_metadata() {
+        let mut config = EffectiveConfig::default();
+        config.repository.url =
+            Some("s3:https://example.test/bucket\n--password-command".to_owned());
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidRepositoryUrl)
+        );
+
+        config.repository.url = Some("local:C:/backup".to_owned());
+        config.repository.display_name = Some("line one\nline two".to_owned());
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidRepositoryDisplayName)
+        );
+
+        config.repository.display_name = Some("Backup".to_owned());
+        config
+            .repository
+            .options
+            .insert("s3.region".to_owned(), "us-west-2\nmalformed".to_owned());
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidRepositoryOptionValue(
+                "s3.region".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn repository_collection_limits_are_enforced() {
+        let mut config = EffectiveConfig::default();
+        config.repository.url = Some("local:C:/backup".to_owned());
+        for index in 0..=MAX_REPOSITORY_OPTIONS {
+            config
+                .repository
+                .options
+                .insert(format!("option{index}"), "value".to_owned());
+        }
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::TooManyRepositoryOptions)
         );
     }
 

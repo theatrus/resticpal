@@ -1,6 +1,8 @@
 using System.Buffers.Binary;
 using System.IO.Pipes;
+using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace ResticPal.UI.Services;
 
@@ -125,6 +127,52 @@ internal sealed class ResticPalServiceClient
             cancellationToken);
     }
 
+    public async Task<RepositoryConfiguration> GetRepositoryAsync(
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(new { type = "get_repository" }, cancellationToken);
+        RequirePayloadType(payload, "repository");
+        JsonElement configuration = payload.GetProperty("configuration");
+        var options = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (JsonProperty option in configuration.GetProperty("options").EnumerateObject())
+        {
+            options[option.Name] = option.Value.GetString() ?? string.Empty;
+        }
+
+        return new RepositoryConfiguration(
+            configuration.GetProperty("display_name").GetString(),
+            configuration.GetProperty("url").GetString(),
+            configuration.GetProperty("mode").GetString() ?? "standard",
+            options,
+            ReadStrings(configuration.GetProperty("configured_secrets")).ToHashSet(StringComparer.Ordinal),
+            configuration.GetProperty("display_name_locked").GetBoolean(),
+            configuration.GetProperty("url_locked").GetBoolean(),
+            configuration.GetProperty("mode_locked").GetBoolean(),
+            configuration.GetProperty("options_locked").GetBoolean(),
+            configuration.GetProperty("secrets_locked").GetBoolean());
+    }
+
+    public async Task<CommandResult> UpdateRepositoryAsync(
+        string? displayName,
+        string? url,
+        string? mode,
+        IReadOnlyDictionary<string, string>? options,
+        IReadOnlyCollection<RepositorySecretUpdate> secretUpdates,
+        CancellationToken cancellationToken = default)
+    {
+        return await SendCommandAsync(
+            new
+            {
+                type = "update_repository",
+                display_name = displayName,
+                url,
+                mode,
+                options,
+                secret_updates = secretUpdates,
+            },
+            cancellationToken);
+    }
+
     private static async Task<CommandResult> SendCommandAsync(
         object command,
         CancellationToken cancellationToken)
@@ -147,11 +195,26 @@ internal sealed class ResticPalServiceClient
             request_id = requestId,
             command,
         });
+        try
+        {
+            return await ExchangeAsync(payload, requestId, cancellationToken, requestTimeout);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(payload);
+        }
+    }
+
+    private static async Task<JsonElement> ExchangeAsync(
+        byte[] payload,
+        long requestId,
+        CancellationToken cancellationToken,
+        TimeSpan? requestTimeout)
+    {
         if (payload.Length > MaxFrameBytes)
         {
             throw new InvalidDataException("The service request exceeds the IPC size limit.");
         }
-
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(requestTimeout ?? TimeSpan.FromSeconds(2));
         await using var pipe = new NamedPipeClientStream(
@@ -272,6 +335,31 @@ internal sealed record BackupSourcesConfiguration(
     IReadOnlyList<string> Exclusions,
     bool PathsLocked,
     bool ExclusionsLocked);
+
+internal sealed record RepositoryConfiguration(
+    string? DisplayName,
+    string? Url,
+    string Mode,
+    IReadOnlyDictionary<string, string> Options,
+    IReadOnlySet<string> ConfiguredSecrets,
+    bool DisplayNameLocked,
+    bool UrlLocked,
+    bool ModeLocked,
+    bool OptionsLocked,
+    bool SecretsLocked);
+
+internal sealed record RepositorySecretUpdate(
+    [property: JsonPropertyName("action")] string Action,
+    [property: JsonPropertyName("variable")] string Variable,
+    [property: JsonPropertyName("value"),
+        JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Value)
+{
+    public static RepositorySecretUpdate Set(string variable, string value) =>
+        new("set", variable, value);
+
+    public static RepositorySecretUpdate Remove(string variable) =>
+        new("remove", variable, null);
+}
 
 internal sealed record DiscoveredBackupSource(string ProfileName, string Kind, string Path)
 {

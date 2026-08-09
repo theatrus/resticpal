@@ -20,7 +20,8 @@ use windows::Win32::Security::Authorization::{
     SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::Cryptography::{
-    CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom, CRYPT_INTEGER_BLOB,
+    CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
@@ -37,6 +38,8 @@ const FILE_MAGIC: &[u8] = b"RESTICPAL-CREDENTIAL\x01";
 const FILE_EXTENSION: &str = "credential";
 const MAX_SECRET_BYTES: usize = 32 * 1024;
 const MAX_PROTECTED_BYTES: usize = 128 * 1024;
+const RANDOM_REFERENCE_BYTES: usize = 16;
+const REFERENCE_GENERATION_ATTEMPTS: usize = 8;
 // This is application separation, not a hidden key. It must remain stable so
 // existing credentials continue to decrypt after upgrades.
 const OPTIONAL_ENTROPY: &[u8] = b"resticpal credential store v1";
@@ -85,6 +88,26 @@ impl DpapiSecretStore {
         contents.extend_from_slice(FILE_MAGIC);
         contents.extend_from_slice(&protected);
         self.write_atomically(reference, &contents)
+    }
+
+    /// Stores a secret under a new collision-resistant opaque reference.
+    pub fn put_new(&self, prefix: &str, secret: &[u8]) -> Result<String, CredentialStoreError> {
+        validate_reference(prefix)?;
+        for _ in 0..REFERENCE_GENERATION_ATTEMPTS {
+            let mut random = [0_u8; RANDOM_REFERENCE_BYTES];
+            // SAFETY: random is a live writable buffer and the system-preferred
+            // RNG flag requires no explicit algorithm handle.
+            unsafe { BCryptGenRandom(None, &mut random, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }.ok()?;
+            let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+            let reference = format!("{prefix}-{suffix}");
+            let target = self.path_for(&reference)?;
+            if target.try_exists()? {
+                continue;
+            }
+            self.put(&reference, secret)?;
+            return Ok(reference);
+        }
+        Err(CredentialStoreError::ReferenceGenerationFailed)
     }
 
     pub fn get(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, CredentialStoreError> {
@@ -458,6 +481,8 @@ impl Drop for TemporaryFile {
 pub enum CredentialStoreError {
     #[error("credential reference must contain 1-64 lowercase letters, digits, or hyphens")]
     InvalidReference,
+    #[error("could not generate a unique credential reference")]
+    ReferenceGenerationFailed,
     #[error("credential value cannot be empty")]
     EmptySecret,
     #[error("credential value exceeds the storage limit")]
@@ -586,5 +611,23 @@ mod tests {
             store.get("token"),
             Err(CredentialStoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn new_credentials_receive_unique_opaque_references() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = DpapiSecretStore::open(directory.path().join("credentials"))
+            .expect("store should open");
+
+        let first = store.put_new("restic-password", b"first").expect("first");
+        let second = store.put_new("restic-password", b"second").expect("second");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("restic-password-"));
+        assert_eq!(store.get(&first).expect("first value").as_slice(), b"first");
+        assert_eq!(
+            store.get(&second).expect("second value").as_slice(),
+            b"second"
+        );
     }
 }

@@ -24,7 +24,7 @@
                     <SymbolIcon Symbol="Folder" />
                 </NavigationViewItem.Icon>
             </NavigationViewItem>
-            <NavigationViewItem Content="Repository" Tag="repository">
+            <NavigationViewItem x:Name="RepositoryItem" Content="Repository" Tag="repository">
                 <NavigationViewItem.Icon>
                     <SymbolIcon Symbol="Save" />
                 </NavigationViewItem.Icon>
@@ -161,6 +161,147 @@
                         <StackPanel Grid.Row="5" Orientation="Horizontal" Spacing="12">
                             <Button x:Name="SaveSourcesButton" Click="SaveSourcesButton_Click" Content="Save backup sources" Style="{StaticResource AccentButtonStyle}" />
                             <ProgressRing x:Name="SourcesProgress" IsActive="False" Width="24" Height="24" />
+                        </StackPanel>
+                    </Grid>
+                </ScrollViewer>
+
+                <ScrollViewer x:Name="RepositoryPanel" Visibility="Collapsed">
+                    <Grid MaxWidth="900" Padding="32" HorizontalAlignment="Left" RowSpacing="20">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Repository" />
+                            <TextBlock
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="Connect this PC to any repository supported by restic. Credentials are protected for the service account and are never displayed again."
+                                TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <InfoBar
+                            x:Name="RepositoryPolicyMessage"
+                            Grid.Row="1"
+                            IsClosable="False"
+                            IsOpen="False"
+                            Severity="Informational" />
+
+                        <Border
+                            Grid.Row="2"
+                            Padding="20"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                            <StackPanel Spacing="16">
+                                <TextBox
+                                    x:Name="RepositoryDisplayNameBox"
+                                    Header="Display name"
+                                    MaxLength="256"
+                                    PlaceholderText="Office backup" />
+                                <ComboBox
+                                    x:Name="RepositoryKindBox"
+                                    Header="Repository type"
+                                    SelectionChanged="RepositoryKindBox_SelectionChanged"
+                                    SelectedIndex="0">
+                                    <ComboBoxItem Content="Local or network folder" />
+                                    <ComboBoxItem Content="S3 or S3-compatible storage" />
+                                    <ComboBoxItem Content="Other restic repository" />
+                                </ComboBox>
+                                <TextBox
+                                    x:Name="RepositoryUrlBox"
+                                    Header="Repository URL or path"
+                                    IsSpellCheckEnabled="False"
+                                    PlaceholderText="s3:https://storage.example.com/backups/computer-name" />
+                                <StackPanel Spacing="6">
+                                    <ComboBox x:Name="RepositoryModeBox" Header="Repository behavior" SelectedIndex="0">
+                                        <ComboBoxItem Content="Standard — this PC may apply retention" Tag="standard" />
+                                        <ComboBoxItem Content="Append-only — retention is managed elsewhere" Tag="append_only" />
+                                    </ComboBox>
+                                    <TextBlock
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        Text="Append-only mode prevents this client from pruning or rewriting snapshots. The repository server must perform retention."
+                                        TextWrapping="Wrap" />
+                                </StackPanel>
+                                <TextBox
+                                    x:Name="RepositoryOptionsBox"
+                                    AcceptsReturn="True"
+                                    Header="Advanced restic options"
+                                    IsSpellCheckEnabled="False"
+                                    MinHeight="96"
+                                    PlaceholderText="s3.connections=5"
+                                    TextWrapping="NoWrap" />
+                                <TextBlock
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Optional. Enter one option=value pair per line; resticpal passes each as an --option argument."
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            Grid.Row="3"
+                            Padding="20"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                            <StackPanel Spacing="14">
+                                <StackPanel Spacing="4">
+                                    <TextBlock FontSize="16" FontWeight="SemiBold" Text="Credentials" />
+                                    <TextBlock
+                                        x:Name="RepositoryCredentialStatus"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        Text="No stored credentials"
+                                        TextWrapping="Wrap" />
+                                </StackPanel>
+                                <PasswordBox
+                                    x:Name="ResticPasswordBox"
+                                    Header="Repository password (RESTIC_PASSWORD)"
+                                    PasswordRevealMode="Peek" />
+                                <Grid ColumnSpacing="16">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <PasswordBox
+                                        x:Name="AwsAccessKeyBox"
+                                        Header="AWS access key ID"
+                                        PasswordRevealMode="Peek" />
+                                    <PasswordBox
+                                        x:Name="AwsSecretKeyBox"
+                                        Grid.Column="1"
+                                        Header="AWS secret access key"
+                                        PasswordRevealMode="Peek" />
+                                </Grid>
+                                <PasswordBox
+                                    x:Name="AwsSessionTokenBox"
+                                    Header="AWS session token (optional)"
+                                    PasswordRevealMode="Peek" />
+                                <Expander Header="Other backend credentials">
+                                    <StackPanel Padding="0,12,0,0" Spacing="12">
+                                        <PasswordBox x:Name="AzureAccountKeyBox" Header="Azure account key" PasswordRevealMode="Peek" />
+                                        <PasswordBox x:Name="B2AccountKeyBox" Header="Backblaze B2 account key" PasswordRevealMode="Peek" />
+                                        <TextBox x:Name="GoogleCredentialsBox" Header="Google application credentials path" IsSpellCheckEnabled="False" />
+                                        <PasswordBox x:Name="RcloneConfigPasswordBox" Header="rclone configuration password" PasswordRevealMode="Peek" />
+                                    </StackPanel>
+                                </Expander>
+                                <CheckBox
+                                    x:Name="RemoveStoredCredentialsCheckBox"
+                                    Content="Remove all currently stored repository credentials when saving" />
+                            </StackPanel>
+                        </Border>
+
+                        <StackPanel Grid.Row="4" Orientation="Horizontal" Spacing="12">
+                            <Button
+                                x:Name="SaveRepositoryButton"
+                                Click="SaveRepositoryButton_Click"
+                                Content="Save repository"
+                                Style="{StaticResource AccentButtonStyle}" />
+                            <ProgressRing x:Name="RepositoryProgress" IsActive="False" Width="24" Height="24" />
                         </StackPanel>
                     </Grid>
                 </ScrollViewer>
