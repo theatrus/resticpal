@@ -1,8 +1,28 @@
-# resticpal
+<p align="center">
+  <img src="docs/assets/resticpal-logo.png" alt="resticpal logo" width="180">
+</p>
+
+<h1 align="center">resticpal</h1>
 
 resticpal is an early-stage, Windows-focused companion for [restic](https://restic.net/). It will provide machine-wide file backups through a Windows service, a low-resource notification-area process, and an on-demand WinUI 3 application.
 
 The agreed product and architecture direction is recorded in [DESIGN.md](DESIGN.md).
+
+## Preview
+
+The current WinUI application provides native pages for choosing protected folders, connecting any restic-compatible repository, and configuring wake-aware backup behavior.
+
+### Backup sources
+
+![The resticpal backup sources page with folder controls and restic exclusion patterns](docs/screenshots/backup-sources.png)
+
+### Repository
+
+![The resticpal repository page with backend, append-only, credential, and advanced option controls](docs/screenshots/repository.png)
+
+### Schedule
+
+![The resticpal schedule page with backup interval, wake grace, wake-lock timeout, battery, and metered network settings](docs/screenshots/schedule.png)
 
 ## Repository layout
 
@@ -52,6 +72,7 @@ The first slice establishes:
 - a WinUI Schedule page for interval, wake grace, wake-lock timeout, battery, and metered-network behavior;
 - bounded SQLite run history containing only timestamps, outcomes, aggregate counts, sanitized codes, and snapshot identifiers;
 - read-only bounded history IPC for interactive users and a native WinUI History page;
+- self-contained WinUI publishing that carries compiled XAML and its runtime resource index into the MSI payload;
 - a build-validated per-machine x64 MSI containing the release service, tray, self-contained WinUI application, and pinned restic 0.19.1;
 - virtual-service-account registration, machine-data ACL authoring, service recovery, tray logon registration, and data-preserving uninstall behavior;
 - an elevated installed-service harness that drives configuration, credential provisioning, repository initialization, append-only validation, VSS backup, restart persistence, and uninstall through the production named pipe.
