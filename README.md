@@ -107,6 +107,19 @@ Use `-UseVss` from an elevated shell to test the exact production snapshot path.
 
 The elevated `.\scripts\Test-InstalledResticPal.ps1` harness installs the MSI only when it can prove there is no pre-existing resticpal installation or data directory, exercises the production service and local repository lifecycle, verifies data-preserving uninstall, and removes only its own synthetic state.
 
+For safer clean-machine testing, run that lifecycle in a disposable local Windows VM:
+
+```powershell
+# One time, from an elevated shell; restart if requested.
+.\scripts\Enable-WindowsSandbox.ps1
+
+# Normal development and agentic test runs.
+.\scripts\Build-Installer.ps1
+.\scripts\Start-WindowsSandboxTest.ps1
+```
+
+The Sandbox launcher waits for a machine-readable result and returns the guest transcript and installer logs under `artifacts\windows-sandbox`. Networking is disabled and the source tree is mounted read-only by default. See [the Windows Sandbox testing guide](docs/windows-sandbox-testing.md) for setup, isolation details, and options.
+
 ## For contributors
 
 - `crates/resticpal-core` — policy, scheduling, status, and restic command rules

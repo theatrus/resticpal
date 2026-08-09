@@ -10,7 +10,8 @@ mod state;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -62,7 +63,10 @@ fn main() -> ExitCode {
     match service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("could not start resticpal through the service dispatcher: {error}");
+            let message =
+                format!("could not start resticpal through the service dispatcher: {error}");
+            eprintln!("{message}");
+            record_service_startup_error(&message);
             ExitCode::FAILURE
         }
     }
@@ -92,10 +96,10 @@ fn console_smoke_test(arguments: &[OsString]) -> ExitCode {
 define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(arguments: Vec<OsString>) {
-    // A real logging sink will replace stderr before service installation is
-    // enabled. The SCM does not provide an interactive console.
     if let Err(error) = run_service(&arguments) {
-        eprintln!("resticpal service failed: {error}");
+        let message = format!("resticpal service failed: {error}");
+        eprintln!("{message}");
+        record_service_startup_error(&message);
     }
 }
 
@@ -698,6 +702,18 @@ fn program_data_root() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
         .join("ResticPal")
+}
+
+fn record_service_startup_error(message: &str) {
+    let data_root = program_data_root();
+    if fs::create_dir_all(&data_root).is_err() {
+        return;
+    }
+    let path = data_root.join("service-startup-errors.log");
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(file, "{} {message}", Utc::now().to_rfc3339());
 }
 
 fn credential_store() -> Option<DpapiSecretStore> {

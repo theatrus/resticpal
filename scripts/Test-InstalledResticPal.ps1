@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string] $MsiPath,
-    [switch] $KeepInstalled
+    [switch] $KeepInstalled,
+    [string] $ArtifactRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,11 +27,15 @@ $dataRoot = Join-Path $env:ProgramData 'ResticPal'
 $e2eRoot = Join-Path $dataRoot 'E2E'
 $sourceRoot = Join-Path $e2eRoot 'Source'
 $backupRoot = Join-Path $e2eRoot 'Repository'
-$artifactRoot = Join-Path $repositoryRoot 'artifacts\installer\e2e'
+if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
+    $ArtifactRoot = Join-Path $repositoryRoot 'artifacts\installer\e2e'
+}
+$artifactRoot = [IO.Path]::GetFullPath($ArtifactRoot)
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $installLog = Join-Path $artifactRoot "install-$timestamp.log"
 $uninstallLog = Join-Path $artifactRoot "uninstall-$timestamp.log"
 $script:requestId = 0L
+$protocolVersion = 3
 $installedByTest = $false
 $testReachedPersistenceCheck = $false
 
@@ -61,7 +66,7 @@ function Read-Exact([IO.Stream] $Stream, [int] $Count) {
 function Invoke-ResticPalRequest([hashtable] $Command) {
     $script:requestId += 1
     $request = [ordered]@{
-        protocol_version = 2
+        protocol_version = $protocolVersion
         request_id = $script:requestId
         command = $Command
     }
@@ -102,7 +107,7 @@ function Invoke-ResticPalRequest([hashtable] $Command) {
         $client.Dispose()
     }
 
-    if ($response.protocol_version -ne 2 -or $response.request_id -ne $script:requestId) {
+    if ($response.protocol_version -ne $protocolVersion -or $response.request_id -ne $script:requestId) {
         throw 'The service returned a mismatched IPC response.'
     }
     return $response.payload
@@ -200,11 +205,6 @@ try {
     Set-Content -LiteralPath (Join-Path $sourceRoot 'document.txt') -Value 'resticpal installed-service end-to-end data' -NoNewline
 
     Assert-Accepted @{
-        type = 'update_backup_sources'
-        paths = @($sourceRoot)
-        exclusions = @()
-    }
-    Assert-Accepted @{
         type = 'update_repository'
         display_name = 'Disposable installed-service repository'
         url = $backupRoot
@@ -230,7 +230,17 @@ try {
     Assert-Accepted @{ type = 'validate_repository' }
     Wait-RepositoryOperation 'validate' ([TimeSpan]::FromMinutes(2))
 
-    Assert-Accepted @{ type = 'run_backup_now' }
+    Assert-Accepted @{
+        type = 'update_backup_sources'
+        paths = @($sourceRoot)
+        exclusions = @()
+    }
+    $runRequest = Invoke-ResticPalRequest @{ type = 'run_backup_now' }
+    if ($runRequest.type -ne 'accepted' -and -not (
+        $runRequest.type -eq 'rejected' -and $runRequest.code -eq 'already_running'
+    )) {
+        throw "The service rejected 'run_backup_now': $($runRequest.code) $($runRequest.message)"
+    }
     $run = Wait-Backup ([TimeSpan]::FromMinutes(3))
     Write-Host "Backup snapshot $($run.snapshot_id) completed through the installed service."
 
