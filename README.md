@@ -47,9 +47,11 @@ The first slice establishes:
 - asynchronous create/connect repository flows with a hard timeout, service-owned restic execution, and append-only initialization enforcement;
 - a durable repository-validation gate tied to connection fields and credential references, preventing backups after unverified changes;
 - elevated, per-field policy-aware schedule configuration with atomic persistence and immediate scheduler reevaluation;
-- a WinUI Schedule page for interval, wake grace, wake-lock timeout, battery, and metered-network behavior.
+- a WinUI Schedule page for interval, wake grace, wake-lock timeout, battery, and metered-network behavior;
+- bounded SQLite run history containing only timestamps, outcomes, aggregate counts, sanitized codes, and snapshot identifiers;
+- read-only bounded history IPC for interactive users and a native WinUI History page.
 
-Credential provisioning through installer bootstrap/enrollment, automatic discovery for newly created profiles, direct-file configuration watching, installation, run-history persistence, and enrollment are not wired up yet. The executor fails closed when a referenced credential is absent, corrupt, or not a valid environment value, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
+Credential provisioning through installer bootstrap/enrollment, automatic discovery for newly created profiles, direct-file configuration watching, installation, and enrollment are not wired up yet. The executor fails closed when a referenced credential is absent, corrupt, or not a valid environment value, and packaging still needs to supply the pinned sibling `restic.exe`. Cancellation currently terminates the contained process job; graceful restic shutdown before escalation remains to be added. IPC currently uses bounded one-request/response connections; a later status-subscription channel will provide push updates.
 
 ## Build and test
 
@@ -77,6 +79,10 @@ cargo run -p resticpal-tray
 ## Repository modes
 
 `standard` repositories may eventually run configured client-side retention and maintenance. `append_only` repositories permit backup and approved inspection operations but reject prune, forget, rewrite, migration, destructive repair, and key-removal operations. Actual append-only protection must also be enforced by the storage service, proxy, or S3 policy/immutability configuration.
+
+## Backup history
+
+The service keeps the newest 200 backup attempts in `state.db` next to the machine configuration. Clients may request at most 100 records at once; the WinUI page requests the newest 50. Records intentionally exclude backup paths, filenames, repository URLs, credentials, raw restic output, and exception text. Database or history-write failures are reported locally but never fail or block a backup.
 
 ## License
 

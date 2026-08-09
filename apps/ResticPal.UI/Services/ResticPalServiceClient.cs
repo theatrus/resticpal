@@ -82,6 +82,29 @@ internal sealed class ResticPalServiceClient
         return new ServiceSnapshot(headline, description, canRun, canCancel);
     }
 
+    public async Task<IReadOnlyList<BackupRun>> GetRunHistoryAsync(
+        ushort limit = 50,
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(
+            new { type = "get_run_history", limit },
+            cancellationToken);
+        RequirePayloadType(payload, "run_history");
+        return payload.GetProperty("runs")
+            .EnumerateArray()
+            .Select(run => new BackupRun(
+                run.GetProperty("id").GetUInt64(),
+                run.GetProperty("started_at").GetDateTimeOffset(),
+                run.GetProperty("completed_at").GetDateTimeOffset(),
+                run.GetProperty("outcome").GetString() ?? "failed",
+                ReadOptionalString(run, "error_code"),
+                ReadOptionalUInt64(run, "files_processed"),
+                ReadOptionalUInt64(run, "bytes_processed"),
+                ReadOptionalUInt64(run, "data_added"),
+                ReadOptionalString(run, "snapshot_id")))
+            .ToArray();
+    }
+
     public async Task<CommandResult> RunBackupNowAsync(
         CancellationToken cancellationToken = default)
     {
@@ -341,6 +364,22 @@ internal sealed class ResticPalServiceClient
             .ToArray();
     }
 
+    private static string? ReadOptionalString(JsonElement value, string propertyName)
+    {
+        return value.TryGetProperty(propertyName, out JsonElement property)
+            && property.ValueKind == JsonValueKind.String
+                ? property.GetString()
+                : null;
+    }
+
+    private static ulong? ReadOptionalUInt64(JsonElement value, string propertyName)
+    {
+        return value.TryGetProperty(propertyName, out JsonElement property)
+            && property.ValueKind == JsonValueKind.Number
+                ? property.GetUInt64()
+                : null;
+    }
+
     private static RepositoryOperationStatus ReadRepositoryOperationStatus(JsonElement status)
     {
         string state = status.GetProperty("state").GetString() ?? "not_run";
@@ -406,6 +445,17 @@ internal sealed record ServiceSnapshot(
     bool CanCancelBackup);
 
 internal sealed record CommandResult(bool Accepted, string Message);
+
+internal sealed record BackupRun(
+    ulong Id,
+    DateTimeOffset StartedAt,
+    DateTimeOffset CompletedAt,
+    string Outcome,
+    string? ErrorCode,
+    ulong? FilesProcessed,
+    ulong? BytesProcessed,
+    ulong? DataAdded,
+    string? SnapshotId);
 
 internal sealed record BackupSourcesConfiguration(
     IReadOnlyList<string> Paths,

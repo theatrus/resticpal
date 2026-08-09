@@ -368,7 +368,7 @@ The WinUI application integrates NetSparkleUpdater. Until releases have Authenti
 
 - Structured logs with stable event IDs and correlation/run IDs.
 - Rotating local files plus important service lifecycle/failure events in Windows Event Log.
-- Bounded run history in SQLite.
+- Bounded run history in SQLite, retaining the newest 200 attempts and returning at most 100 records per local IPC request.
 - Audit events for configuration changes, policy revisions, enrollment/unenrollment, credentials changes, update attempts, manual run/cancel/defer actions, and service-account fallback.
 - Path and secret redaction occurs before persistence, not only in the UI.
 
@@ -427,7 +427,7 @@ The WinUI application integrates NetSparkleUpdater. Until releases have Authenti
 - Exact local and remote schema shapes and protocol serialization.
 - Concrete idle memory/CPU targets after the feasibility prototype.
 - Default prune cadence in standard/client-maintained mode.
-- Local history retention and notification thresholds.
+- Notification thresholds.
 - Exact minimum supported Windows 10 build.
 
 ## License

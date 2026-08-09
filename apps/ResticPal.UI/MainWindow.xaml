@@ -34,7 +34,7 @@
                     <SymbolIcon Symbol="Calendar" />
                 </NavigationViewItem.Icon>
             </NavigationViewItem>
-            <NavigationViewItem Content="History" Tag="history">
+            <NavigationViewItem x:Name="HistoryItem" Content="History" Tag="history">
                 <NavigationViewItem.Icon>
                     <SymbolIcon Symbol="Clock" />
                 </NavigationViewItem.Icon>
@@ -422,6 +422,100 @@
                         </StackPanel>
                     </Grid>
                 </ScrollViewer>
+
+                <Grid
+                    x:Name="HistoryPanel"
+                    Margin="32"
+                    MaxWidth="900"
+                    HorizontalAlignment="Stretch"
+                    RowSpacing="20"
+                    Visibility="Collapsed">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Grid ColumnSpacing="20">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Spacing="6">
+                            <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Backup history" />
+                            <TextBlock
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="Recent outcomes are stored locally without source paths, filenames, credentials, or raw restic output."
+                                TextWrapping="Wrap" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                            <Button
+                                x:Name="RefreshHistoryButton"
+                                Click="RefreshHistoryButton_Click"
+                                Content="Refresh" />
+                            <ProgressRing x:Name="HistoryProgress" IsActive="False" Width="24" Height="24" />
+                        </StackPanel>
+                    </Grid>
+
+                    <Grid Grid.Row="1">
+                        <Border
+                            x:Name="HistoryEmptyCard"
+                            Padding="28"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                            <StackPanel HorizontalAlignment="Center" Spacing="6">
+                                <FontIcon FontSize="28" Glyph="&#xE823;" />
+                                <TextBlock FontSize="17" FontWeight="SemiBold" Text="No backup runs yet" TextAlignment="Center" />
+                                <TextBlock
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Completed, failed, and cancelled backup attempts will appear here."
+                                    TextAlignment="Center"
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+
+                        <ListView
+                            x:Name="HistoryList"
+                            ItemsSource="{x:Bind BackupHistory}"
+                            SelectionMode="None"
+                            Visibility="Collapsed">
+                            <ListView.ItemTemplate>
+                                <DataTemplate>
+                                    <Border
+                                        Margin="0,0,0,10"
+                                        Padding="18"
+                                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                        BorderThickness="1"
+                                        CornerRadius="8">
+                                        <StackPanel Spacing="6">
+                                            <Grid ColumnSpacing="16">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock FontSize="16" FontWeight="SemiBold" Text="{Binding Headline}" />
+                                                <TextBlock
+                                                    Grid.Column="1"
+                                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                    Text="{Binding CompletedAtText}" />
+                                            </Grid>
+                                            <TextBlock
+                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                Text="{Binding Summary}"
+                                                TextWrapping="Wrap" />
+                                            <TextBlock
+                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                Text="{Binding Detail}"
+                                                TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Border>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+                    </Grid>
+                </Grid>
 
                 <StackPanel
                     x:Name="ComingSoonPanel"

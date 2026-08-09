@@ -16,7 +16,7 @@ use resticpal_core::schedule::{
     BackupTrigger, ScheduleBlocker, ScheduleDecision, SchedulerSnapshot, decide,
 };
 use resticpal_core::status::{
-    BackupPhase, BackupProgress, BackupState, ServiceStatus, WaitingReason,
+    BackupPhase, BackupProgress, BackupRunOutcome, BackupState, ServiceStatus, WaitingReason,
 };
 use resticpal_protocol::{
     BackupSourcesView, RepositoryOperationKind, RepositoryOperationStatus, RepositorySecretUpdate,
@@ -30,6 +30,7 @@ use thiserror::Error;
 use crate::conditions::SystemConditions;
 use crate::config_store::{ConfigStoreError, LocalConfigStore};
 use crate::executor::{BackupOutcome, BackupOutcomeKind, RepositoryOutcome, RepositoryOutcomeKind};
+use crate::history::{BackupHistoryStore, CompletedBackupRun, MAX_HISTORY_RESULTS};
 use crate::state::{ScheduleStateStore, ServiceStateSnapshot};
 
 const CONDITION_RETRY_SECONDS: u64 = 60;
@@ -71,6 +72,14 @@ struct RuntimeState {
     service_state: ServiceStateSnapshot,
 }
 
+#[derive(Default)]
+struct RuntimeStores {
+    state: Option<ScheduleStateStore>,
+    history: Option<BackupHistoryStore>,
+    config: Option<LocalConfigStore>,
+    credentials: Option<DpapiSecretStore>,
+}
+
 pub struct ServiceRuntime {
     config: RwLock<EffectiveConfig>,
     local_config: Mutex<LocalConfig>,
@@ -79,6 +88,7 @@ pub struct ServiceRuntime {
     credential_store: Option<DpapiSecretStore>,
     state: Mutex<RuntimeState>,
     state_store: Option<ScheduleStateStore>,
+    history_store: Option<BackupHistoryStore>,
     events: Sender<RuntimeEvent>,
 }
 
@@ -110,14 +120,18 @@ impl ServiceRuntime {
                 state
             }
         };
+        let history_store = Some(BackupHistoryStore::next_to_config(path));
         Ok(Self::from_resolved_with_state(
             resolved,
             local,
             events,
             service_state,
-            Some(state_store),
-            Some(config_store),
-            credential_store,
+            RuntimeStores {
+                state: Some(state_store),
+                history: history_store,
+                config: Some(config_store),
+                credentials: credential_store,
+            },
         ))
     }
 
@@ -128,9 +142,7 @@ impl ServiceRuntime {
             LocalConfig::default(),
             events,
             ServiceStateSnapshot::default(),
-            None,
-            None,
-            None,
+            RuntimeStores::default(),
         )
     }
 
@@ -139,10 +151,14 @@ impl ServiceRuntime {
         local_config: LocalConfig,
         events: Sender<RuntimeEvent>,
         service_state: ServiceStateSnapshot,
-        state_store: Option<ScheduleStateStore>,
-        config_store: Option<LocalConfigStore>,
-        credential_store: Option<DpapiSecretStore>,
+        stores: RuntimeStores,
     ) -> Self {
+        let RuntimeStores {
+            state: state_store,
+            history: history_store,
+            config: config_store,
+            credentials: credential_store,
+        } = stores;
         let now = Utc::now();
         let configured = resolved.effective.is_configured();
         let last_success = service_state.last_success;
@@ -202,6 +218,7 @@ impl ServiceRuntime {
                 service_state,
             }),
             state_store,
+            history_store,
             events,
         }
     }
@@ -236,6 +253,7 @@ impl ServiceRuntime {
                 service_state: ServiceStateSnapshot::default(),
             }),
             state_store: None,
+            history_store: None,
             events,
         }
     }
@@ -266,6 +284,7 @@ impl ServiceRuntime {
     fn finish_backup_at(&self, now: DateTime<Utc>, outcome: &BackupOutcome) {
         let interval_hours = self.config_read().schedule.interval_hours;
         let mut state = self.state_guard();
+        let started_at = state.status.last_attempt.unwrap_or(now);
         let succeeded = matches!(
             outcome.kind,
             BackupOutcomeKind::Succeeded | BackupOutcomeKind::SucceededWithWarnings
@@ -300,6 +319,33 @@ impl ServiceRuntime {
         state.status.progress = None;
         let service_state = state.service_state.clone();
         drop(state);
+
+        if let Some(store) = &self.history_store {
+            let (run_outcome, error_code) = match &outcome.kind {
+                BackupOutcomeKind::Succeeded => (BackupRunOutcome::Succeeded, None),
+                BackupOutcomeKind::SucceededWithWarnings => {
+                    (BackupRunOutcome::SucceededWithWarnings, None)
+                }
+                BackupOutcomeKind::Failed { code } => {
+                    (BackupRunOutcome::Failed, Some(code.clone()))
+                }
+                BackupOutcomeKind::Cancelled => (BackupRunOutcome::Cancelled, None),
+            };
+            let summary = outcome.summary.as_ref();
+            let run = CompletedBackupRun {
+                started_at,
+                completed_at: now,
+                outcome: run_outcome,
+                error_code,
+                files_processed: summary.map(|value| value.files_processed),
+                bytes_processed: summary.map(|value| value.bytes_processed),
+                data_added: summary.map(|value| value.data_added),
+                snapshot_id: summary.and_then(|value| value.snapshot_id.clone()),
+            };
+            if let Err(error) = store.append(run) {
+                eprintln!("could not persist backup history: {error}");
+            }
+        }
 
         if succeeded
             && let Some(store) = &self.state_store
@@ -407,6 +453,31 @@ impl ServiceRuntime {
             RequestCommand::GetStatus => ResponsePayload::Status {
                 status: self.status(),
             },
+            RequestCommand::GetRunHistory { limit } => {
+                let limit = usize::from(limit);
+                if !(1..=MAX_HISTORY_RESULTS).contains(&limit) {
+                    rejected(
+                        "invalid_history_limit",
+                        "History requests must contain a limit from 1 through 100.",
+                    )
+                } else if let Some(store) = &self.history_store {
+                    match store.recent(limit) {
+                        Ok(runs) => ResponsePayload::RunHistory { runs },
+                        Err(error) => {
+                            eprintln!("could not read backup history: {error}");
+                            rejected(
+                                "history_unavailable",
+                                "Backup history could not be read from local storage.",
+                            )
+                        }
+                    }
+                } else {
+                    rejected(
+                        "history_unavailable",
+                        "Backup history storage is not available.",
+                    )
+                }
+            }
             RequestCommand::GetBackupSources => {
                 if identity.is_elevated_administrator {
                     ResponsePayload::BackupSources {
@@ -2428,5 +2499,78 @@ mod tests {
             ResponsePayload::Rejected { ref code, .. } if code == "invalid_schedule"
         ));
         assert_eq!(runtime.config().schedule, before);
+    }
+
+    #[test]
+    fn completed_backup_history_is_sanitized_persisted_and_user_readable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        LocalConfigStore::new(&config_path)
+            .save(&LocalConfig {
+                backup: LocalBackupConfig {
+                    paths: Some(vec![PathBuf::from(r"C:\Data")]),
+                    exclusions: Some(Vec::new()),
+                },
+                repository: LocalRepositoryConfig {
+                    url: Some("local:C:/backup".to_owned()),
+                    ..LocalRepositoryConfig::default()
+                },
+                ..LocalConfig::default()
+            })
+            .expect("initial config");
+        let (events, receiver) = mpsc::channel();
+        let runtime = ServiceRuntime::load(&config_path, events).expect("runtime");
+        assert!(matches!(
+            runtime
+                .handle_request(Request::new(56, RequestCommand::RunBackupNow), USER)
+                .payload,
+            ResponsePayload::Accepted { .. }
+        ));
+        assert_eq!(receiver.recv().expect("run event"), RuntimeEvent::RunNow);
+        assert!(matches!(
+            runtime.evaluate_schedule(Utc::now(), available_conditions()),
+            ScheduleAction::Start { .. }
+        ));
+        runtime.finish_backup(&BackupOutcome::succeeded(BackupSummary {
+            files_processed: 12,
+            bytes_processed: 1_024,
+            data_added: 256,
+            snapshot_id: Some("abc123".to_owned()),
+        }));
+
+        let response = runtime.handle_request(
+            Request::new(57, RequestCommand::GetRunHistory { limit: 50 }),
+            USER,
+        );
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::RunHistory { ref runs }
+                if matches!(runs.as_slice(), [run]
+                    if run.outcome == BackupRunOutcome::Succeeded
+                        && run.files_processed == Some(12)
+                        && run.snapshot_id.as_deref() == Some("abc123"))
+        ));
+        drop(runtime);
+
+        let (events, _receiver) = mpsc::channel();
+        let restarted = ServiceRuntime::load(&config_path, events).expect("restarted runtime");
+        assert!(matches!(
+            restarted
+                .handle_request(
+                    Request::new(58, RequestCommand::GetRunHistory { limit: 1 }),
+                    USER,
+                )
+                .payload,
+            ResponsePayload::RunHistory { runs } if runs.len() == 1
+        ));
+        assert!(matches!(
+            restarted
+                .handle_request(
+                    Request::new(59, RequestCommand::GetRunHistory { limit: 0 }),
+                    USER,
+                )
+                .payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "invalid_history_limit"
+        ));
     }
 }

@@ -2,6 +2,7 @@ mod atomic_file;
 mod conditions;
 mod config_store;
 mod executor;
+mod history;
 mod power_request;
 mod runtime;
 mod state;

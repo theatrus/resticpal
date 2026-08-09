@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use resticpal_core::config::{RepositoryMode, SecretEnvironmentVariable};
-use resticpal_core::status::ServiceStatus;
+use resticpal_core::status::{BackupRunRecord, ServiceStatus};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -40,6 +40,9 @@ impl Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestCommand {
     GetStatus,
+    GetRunHistory {
+        limit: u16,
+    },
     GetBackupSources,
     DiscoverBackupSources,
     UpdateBackupSources {
@@ -107,6 +110,9 @@ impl Response {
 pub enum ResponsePayload {
     Status {
         status: ServiceStatus,
+    },
+    RunHistory {
+        runs: Vec<BackupRunRecord>,
     },
     BackupSources {
         configuration: BackupSourcesView,
@@ -317,6 +323,17 @@ mod tests {
     #[test]
     fn request_round_trips_through_bounded_framing() {
         let request = Request::new(42, RequestCommand::DeferBackup { minutes: 30 });
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &request).expect("request should serialize");
+        let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn bounded_history_request_round_trips() {
+        let request = Request::new(43, RequestCommand::GetRunHistory { limit: 50 });
         let mut bytes = Vec::new();
 
         write_frame(&mut bytes, &request).expect("request should serialize");
