@@ -64,6 +64,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 dotnet build ResticPal.slnx --configuration Debug
 ```
 
+An opt-in integration test exercises the service executor against a disposable local restic repository. The helper uses `restic.exe` from `PATH` when available; otherwise it downloads the pinned official Windows x64 test binary to a unique temporary directory and verifies its SHA-256 before use. It creates both its source data and encrypted repository under a temporary directory and removes all downloaded and generated files when it finishes:
+
+```powershell
+.\scripts\Test-LocalRestic.ps1
+```
+
+That non-elevated test verifies that the production invocation requests VSS, then removes only `--use-fs-snapshot` before starting restic. Run the exact production VSS path from an elevated developer shell or qualified service test environment:
+
+```powershell
+.\scripts\Test-LocalRestic.ps1 -UseVss
+```
+
+Pass `-ResticPath C:\path\to\restic.exe` to test a specific binary. The lifecycle covers missing-repository detection, initialization, password validation, append-only backups, snapshots/check inspection, and a second changed backup. Neither test writes a restic binary or repository into the working tree.
+
 Run a non-service smoke test for the service host:
 
 ```powershell

@@ -683,7 +683,8 @@ impl Drop for KillOnDropJob {
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     use resticpal_core::config::RepositoryMode;
@@ -722,6 +723,39 @@ mod tests {
             Arc::new(MapSecretResolver(secrets)),
             Arc::new(NoopWakeLockProvider),
         )
+    }
+
+    fn real_restic_executable() -> PathBuf {
+        let path = std::env::var_os("RESTICPAL_TEST_RESTIC")
+            .map(PathBuf::from)
+            .expect("set RESTICPAL_TEST_RESTIC to an absolute path to restic.exe");
+        assert!(path.is_absolute(), "RESTICPAL_TEST_RESTIC must be absolute");
+        assert!(path.is_file(), "RESTICPAL_TEST_RESTIC does not name a file");
+        path
+    }
+
+    fn real_restic_executor(executable: &Path, password: &str) -> ResticExecutor {
+        ResticExecutor::new(
+            executable.as_os_str().to_os_string(),
+            Arc::new(MapSecretResolver(BTreeMap::from([(
+                "integration-password".to_owned(),
+                password.to_owned(),
+            )]))),
+            Arc::new(NoopWakeLockProvider),
+        )
+    }
+
+    fn local_repository_config(repository: &Path, source: &Path) -> EffectiveConfig {
+        let mut config = EffectiveConfig::default();
+        config.repository.display_name = Some("Disposable integration repository".to_owned());
+        config.repository.url = Some(repository.to_string_lossy().into_owned());
+        config.repository.secret_refs.insert(
+            SecretEnvironmentVariable::ResticPassword,
+            "integration-password".to_owned(),
+        );
+        config.backup.paths = vec![source.to_path_buf()];
+        config.schedule.wake_lock_timeout_seconds = 60;
+        config
     }
 
     fn powershell_invocation(script: &str) -> ResticInvocation {
@@ -1008,5 +1042,136 @@ mod tests {
                 "forget" | "prune" | "rewrite"
             )
         }));
+    }
+
+    fn execute_real_backup(
+        runner: &ResticExecutor,
+        restic: &Path,
+        config: &EffectiveConfig,
+        cancellation: &CancellationToken,
+        use_vss: bool,
+    ) -> BackupOutcome {
+        if use_vss {
+            return runner.backup(config, cancellation, |_| {});
+        }
+
+        let mut invocation = ResticCommandBuilder::new(restic)
+            .backup(config)
+            .expect("real backup invocation");
+        let vss_flag = OsStr::new("--use-fs-snapshot");
+        let position = invocation
+            .arguments
+            .iter()
+            .position(|argument| argument == vss_flag)
+            .expect("production invocation must request VSS");
+        invocation.arguments.remove(position);
+        assert!(
+            !invocation
+                .arguments
+                .iter()
+                .any(|argument| argument == vss_flag)
+        );
+        runner.execute_invocation(
+            &invocation,
+            Duration::from_secs(config.schedule.wake_lock_timeout_seconds),
+            cancellation,
+            |_| {},
+        )
+    }
+
+    fn exercise_real_restic_local_repository(use_vss: bool) {
+        let restic = real_restic_executable();
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repository = temporary.path().join("repository");
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).expect("source directory");
+        fs::write(source.join("document.txt"), b"first version\n").expect("initial source file");
+
+        let mut config = local_repository_config(&repository, &source);
+        let runner = real_restic_executor(&restic, "correct horse battery staple");
+        let cancellation = CancellationToken::default();
+
+        assert_eq!(
+            runner
+                .repository_operation(&config, ResticOperation::Probe, &cancellation)
+                .kind,
+            RepositoryOutcomeKind::Failed {
+                code: "repository_not_found".to_owned()
+            }
+        );
+        assert_eq!(
+            runner
+                .repository_operation(&config, ResticOperation::Initialize, &cancellation)
+                .kind,
+            RepositoryOutcomeKind::Succeeded
+        );
+        assert_eq!(
+            runner
+                .repository_operation(&config, ResticOperation::Probe, &cancellation)
+                .kind,
+            RepositoryOutcomeKind::Succeeded
+        );
+
+        let wrong_password = real_restic_executor(&restic, "definitely wrong");
+        assert_eq!(
+            wrong_password
+                .repository_operation(&config, ResticOperation::Probe, &cancellation)
+                .kind,
+            RepositoryOutcomeKind::Failed {
+                code: "repository_validation_failed".to_owned()
+            }
+        );
+
+        config.repository.mode = RepositoryMode::AppendOnly;
+        let first = execute_real_backup(&runner, &restic, &config, &cancellation, use_vss);
+        assert_eq!(first.kind, BackupOutcomeKind::Succeeded);
+        let first_summary = first.summary.expect("first backup summary");
+        assert!(first_summary.files_processed >= 1);
+        assert!(first_summary.bytes_processed >= 14);
+        assert!(first_summary.data_added > 0);
+        assert!(first_summary.snapshot_id.is_some());
+
+        let builder = ResticCommandBuilder::new(&restic);
+        for operation in [ResticOperation::Snapshots, ResticOperation::Check] {
+            let invocation = builder
+                .inspection(&config, operation)
+                .expect("append-only inspection invocation");
+            assert_eq!(
+                runner
+                    .execute_repository_invocation(
+                        &invocation,
+                        Duration::from_secs(60),
+                        &cancellation,
+                    )
+                    .kind,
+                RepositoryOutcomeKind::Succeeded
+            );
+        }
+
+        fs::write(
+            source.join("document.txt"),
+            b"second version with changed content\n",
+        )
+        .expect("changed source file");
+        fs::write(source.join("another.txt"), b"another file\n").expect("second source file");
+        let second = execute_real_backup(&runner, &restic, &config, &cancellation, use_vss);
+        assert_eq!(second.kind, BackupOutcomeKind::Succeeded);
+        let second_summary = second.summary.expect("second backup summary");
+        assert!(second_summary.files_processed >= 2);
+        assert!(second_summary.data_added > 0);
+        assert!(second_summary.snapshot_id.is_some());
+        assert_ne!(first_summary.snapshot_id, second_summary.snapshot_id);
+    }
+
+    #[test]
+    #[ignore = "requires RESTICPAL_TEST_RESTIC and creates a disposable real repository"]
+    fn real_restic_local_repository_lifecycle_without_vss() {
+        exercise_real_restic_local_repository(false);
+    }
+
+    #[test]
+    #[ignore = "requires an elevated token, RESTICPAL_TEST_RESTIC, and VSS"]
+    fn real_restic_vss_local_repository_lifecycle() {
+        exercise_real_restic_local_repository(true);
     }
 }

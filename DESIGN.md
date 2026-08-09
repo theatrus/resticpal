@@ -448,7 +448,7 @@ The service-only execution boundary, shell-free command construction, typed opti
    - Sleep/resume event handling and two-hour power request.
    - Measure idle service/tray resource use.
 
-   The service host, named-pipe authorization, resume event, and timed power request exist. Installation/identity, real VSS coverage, OS-matrix qualification, and resource measurement remain.
+   The service host, named-pipe authorization, resume event, and timed power request exist. A real-restic disposable local-repository lifecycle is covered by an opt-in non-elevated test, and an exact VSS variant is available for elevated/service qualification. Installation/identity, successful elevated VSS qualification, OS-matrix qualification, and resource measurement remain.
 
 2. **Local vertical slice — functional development slice**
    - Rust service and tray.
@@ -474,7 +474,7 @@ The service-only execution boundary, shell-free command construction, typed opti
 
 ## Required test themes
 
-The current 94-test Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, policy precedence and locks, command construction, append-only authorization, configuration bounds, named-pipe framing/ACL/token checks, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, and SQLite history retention/redaction/restart behavior. The WinUI project is build-validated but does not yet have an automated UI test suite.
+The 109-test automated Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, policy precedence and locks, command construction, append-only authorization, configuration bounds, named-pipe framing/ACL/token checks, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, and SQLite history retention/redaction/restart behavior. Two additional ignored, opt-in real-restic tests create disposable local repositories: the normal developer variant removes only the VSS flag after asserting the production builder supplied it, while the exact production variant requires an elevated token with VSS access. The lifecycle verifies missing-repository detection, initialization, wrong-password rejection, probe, append-only backup, snapshots, check, and changed second-backup behavior. A PowerShell helper locates or checksum-verifies a pinned restic test binary without writing it into the repository. The WinUI project is build-validated but does not yet have an automated UI test suite.
 
 The following themes remain required as their corresponding product areas land:
 

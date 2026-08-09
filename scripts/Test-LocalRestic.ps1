@@ -1,0 +1,89 @@
+[CmdletBinding()]
+param(
+    [string] $ResticPath,
+    [switch] $UseVss
+)
+
+$ErrorActionPreference = 'Stop'
+$resticVersion = '0.19.1'
+$resticArchiveSha256 = 'da948ad707ed690426473aaba2046cd61f8f90f6f0e7dab6be0d5796531de67d'
+$downloadRoot = $null
+$previousResticPath = [Environment]::GetEnvironmentVariable('RESTICPAL_TEST_RESTIC', 'Process')
+$hadPreviousResticPath = Test-Path -LiteralPath Env:RESTICPAL_TEST_RESTIC
+$repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+
+try {
+    if ([string]::IsNullOrWhiteSpace($ResticPath)) {
+        $installedRestic = Get-Command restic.exe -CommandType Application -ErrorAction SilentlyContinue
+        if ($null -ne $installedRestic) {
+            $ResticPath = $installedRestic.Source
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ResticPath)) {
+        if (-not [Environment]::Is64BitOperatingSystem) {
+            throw 'The automatic test download currently supports only Windows x64.'
+        }
+
+        $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+        $downloadRoot = Join-Path $temporaryRoot ("resticpal-real-restic-{0}" -f [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $downloadRoot | Out-Null
+
+        $archiveName = "restic_{0}_windows_amd64.zip" -f $resticVersion
+        $archivePath = Join-Path $downloadRoot $archiveName
+        $downloadUri = "https://github.com/restic/restic/releases/download/v{0}/{1}" -f $resticVersion, $archiveName
+        Write-Host "Downloading restic $resticVersion for the disposable integration test..."
+        Invoke-WebRequest -UseBasicParsing -Uri $downloadUri -OutFile $archivePath
+
+        $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $resticArchiveSha256) {
+            throw "Downloaded restic archive has unexpected SHA-256: $actualHash"
+        }
+
+        Expand-Archive -LiteralPath $archivePath -DestinationPath $downloadRoot
+        $ResticPath = Join-Path $downloadRoot ("restic_{0}_windows_amd64.exe" -f $resticVersion)
+    }
+
+    $resolvedResticPath = (Resolve-Path -LiteralPath $ResticPath).Path
+    if (-not (Test-Path -LiteralPath $resolvedResticPath -PathType Leaf)) {
+        throw "Restic executable is not a file: $resolvedResticPath"
+    }
+
+    $versionOutput = & $resolvedResticPath version
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to execute restic at $resolvedResticPath"
+    }
+    Write-Host ($versionOutput -join [Environment]::NewLine)
+
+    $testName = if ($UseVss) {
+        'executor::tests::real_restic_vss_local_repository_lifecycle'
+    } else {
+        'executor::tests::real_restic_local_repository_lifecycle_without_vss'
+    }
+
+    [Environment]::SetEnvironmentVariable('RESTICPAL_TEST_RESTIC', $resolvedResticPath, 'Process')
+    Push-Location $repositoryRoot
+    try {
+        & cargo test -p resticpal-service $testName -- --ignored --exact --nocapture
+        if ($LASTEXITCODE -ne 0) {
+            throw "Local restic integration test failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        Pop-Location
+    }
+} finally {
+    if ($hadPreviousResticPath) {
+        [Environment]::SetEnvironmentVariable('RESTICPAL_TEST_RESTIC', $previousResticPath, 'Process')
+    } else {
+        [Environment]::SetEnvironmentVariable('RESTICPAL_TEST_RESTIC', $null, 'Process')
+    }
+
+    if ($null -ne $downloadRoot -and (Test-Path -LiteralPath $downloadRoot)) {
+        $resolvedDownloadRoot = [IO.Path]::GetFullPath($downloadRoot)
+        $resolvedTemporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+        if (-not $resolvedDownloadRoot.StartsWith($resolvedTemporaryRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to remove a download outside the temporary directory: $resolvedDownloadRoot"
+        }
+        Remove-Item -LiteralPath $resolvedDownloadRoot -Recurse -Force
+    }
+}
