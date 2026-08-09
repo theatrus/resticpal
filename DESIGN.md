@@ -1,8 +1,24 @@
 # resticpal product and architecture design
 
-Status: initial agreed direction, 2026-08-08
+Status: living design and implementation record, updated 2026-08-08
 
-This document records the initial product requirements and architecture decisions for **resticpal**, a friendly, Windows-focused wrapper around [restic](https://restic.net/). It is intended to be the source of truth for the first implementation. Items explicitly marked "open" or "proposed" still require validation.
+This document records the product requirements, architecture decisions, and current implementation boundary for **resticpal**, a friendly, Windows-focused wrapper around [restic](https://restic.net/). It is the source of truth for the first implementation. Items explicitly marked "open", "proposed", "planned", or "not yet implemented" still require work or validation.
+
+## Implementation status
+
+The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10. The automated baseline is 94 Rust tests plus a warning-free WinUI build. It is a development build, not an installable or production-qualified release.
+
+| Area | Implemented | Remaining |
+| --- | --- | --- |
+| Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, and append-only command authorization | Signed managed-policy ingestion, policy freshness/replay handling, and standard-mode retention execution |
+| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository credentials, atomic UI-driven configuration, repository create/validate, scheduler checkpoint, and bounded SQLite history | Installer-created service identity/ACL validation, direct-file watching, structured logs/audit, graceful cancellation before escalation, and production VSS testing |
+| Local IPC | Protocol v2, 1 MiB bounded frames, protected named pipe, client-token authorization, ordinary-user status/history/run/cancel/defer, and elevated configuration operations | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v2 |
+| Tray | Native Win32 notification icon, current status tooltip, run/cancel action, and elevated UI launch | Push-driven live icon updates, deferral UI, notifications, richer health icons, and startup registration |
+| WinUI application | Overview, backup sources, repository, schedule/power/network, and bounded backup-history pages | Diagnostics/logs, enrollment/managed-policy, updates/settings, accessibility and Windows 10 qualification |
+| Remote management | Typed managed-policy data model and lock-aware service/UI paths | Enrollment, device keys, signed policy cache, credential bootstrap, metadata/API schemas, and status delivery |
+| Distribution | x64 project targets and a NetSparkleUpdater package reference | Bundled pinned `restic.exe`, WiX MSI, service/tray registration, update UI/appcast verification, elevated updater, repair, and uninstall |
+
+Current durable state consists of atomic `config.toml`, DPAPI-protected credential files, `state.json` for scheduler/repository-verification state, and lazy `state.db` backup history. The history retains the newest 200 attempts and exposes at most 100 per IPC request; the WinUI page requests 50.
 
 ## Product summary
 
@@ -54,6 +70,8 @@ User session              +-- resticpal-tray.exe     Rust/Win32; always present
 On demand: resticpal-updater.exe       elevated update/bootstrap helper
 ```
 
+The service, tray, and WinUI projects in this diagram are implemented. The updater is still a planned process, and packaging does not yet install or register any of the components.
+
 ### `resticpal-service.exe`
 
 The Rust Windows service is the sole owner of:
@@ -70,23 +88,31 @@ The Rust Windows service is the sole owner of:
 
 No tray or UI process may invoke restic directly.
 
+The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler state, and backup history. Remote enrollment/reporting, structured logs, and update coordination remain planned. The service expects a fixed sibling `restic.exe`, but the repository does not yet package that binary.
+
 ### `resticpal-tray.exe`
 
-The persistent tray process uses native Win32 notification-area APIs from Rust. It should do no polling when an IPC subscription is healthy. It displays a small native menu, notifications, and the current health icon. Opening resticpal launches or activates the on-demand WinUI process.
+The persistent tray process uses native Win32 notification-area APIs from Rust. The current message-loop implementation fetches status at startup and when its menu or an action needs it; it has no background polling timer. It displays a native menu, opens the WinUI process through UAC, and requests run-now or cancellation. Push updates, notifications, deferral, and richer state-specific icons await the IPC subscription channel.
 
-The tray runs in each interactive user session. It may view machine backup status and request a one-run backup, deferral, or cancellation. Permanent configuration changes require elevation and service-side authorization.
+The installed design runs the tray in each interactive user session. It may view machine backup status and request a one-run backup, deferral, or cancellation. Permanent configuration changes require elevation and service-side authorization. Logon registration is not implemented yet.
 
 ### `resticpal-ui.exe`
 
-The C# WinUI 3 application provides the modern settings and status experience. It is not kept alive merely to own a tray icon. Initial pages are:
+The C# WinUI 3 application provides the modern settings and status experience. It is not kept alive merely to own a tray icon. Implemented pages are:
 
 - Overview
 - Backup sources and exclusions
 - Repository
 - Schedule, power, and network policy
-- History and diagnostics
+- Backup history
+
+Planned pages are:
+
+- Diagnostics and local logs
 - Enrollment and managed-policy state
 - Updates and application settings
+
+The current unpackaged x64 application uses Windows App SDK 2.3.1, targets .NET 10, and requires administrator elevation for the whole process because its primary job is machine configuration. A later pass may split read-only status/history from elevated mutations if avoiding the prompt materially improves daily use.
 
 ### Resource policy
 
@@ -108,17 +134,21 @@ The preferred identity is a dedicated virtual service account, `NT SERVICE\Resti
 
 If reliable file access or VSS cannot be achieved with the virtual account, the installer may offer or use LocalSystem as a documented fallback. LocalSystem is highly privileged, so the service command surface, binaries, configuration, named pipes, and update path must be tightly ACLed and validated.
 
+The service host and service-control handling exist, but the repository has no installer and has not yet validated the virtual account against real user ACLs, VSS, network shares, or cloud credentials on the supported Windows matrix. DPAPI data is intentionally bound to whichever identity runs the service, so changing that identity requires an explicit credential migration or reprovisioning design.
+
 ## IPC and authorization
 
-Service-to-client communication uses a versioned protocol over Windows named pipes.
+Service-to-client communication uses a versioned protocol over Windows named pipes. The implemented protocol is v2 over `\\.\pipe\ResticPal.v2` with one bounded request and response per connection.
 
 - The pipe security descriptor permits interactive users to read status.
 - The service inspects the connecting process token rather than trusting identity fields supplied in a message.
 - Administrative mutations require an elevated administrator token.
 - Ordinary users may request `run now`, defer one run, or cancel one run unless the applicable action is locked by managed policy.
 - The protocol exposes typed operations, not arbitrary executable paths, environment variables, or restic arguments.
-- Progress is pushed by subscription; clients do not continuously poll.
+- Progress is currently returned in status snapshots. A future subscription channel will push rate-limited status/progress changes without continuous polling.
 - Messages have explicit protocol versions and bounded sizes.
+
+The pipe DACL, connecting-token impersonation, elevated-administrator checks, frame bounds, request IDs, and exact protocol-version checks are implemented and covered by Windows tests. Configuration reads are currently administrator-only because they expose machine configuration such as source paths and repository URLs; ordinary users receive only the redacted canonical status and sanitized history.
 
 ## Backup scope
 
@@ -126,22 +156,21 @@ The primary use case is file-level backup of user data. This is not a bare-metal
 
 ### Default source discovery
 
-The service discovers existing and newly created local user profiles using Windows profile and known-folder information rather than assuming `C:\Users`. New profiles automatically receive the default folder template.
+The service currently discovers existing local user profiles through the Windows profile list rather than assuming `C:\Users`, then offers existing Desktop, Documents, Pictures, Videos, and Music directories. Automatic discovery when a new profile is created is planned; today an administrator reruns discovery from the UI.
 
-The proposed default template includes:
+The implemented discovery set includes:
 
 - Desktop
 - Documents
 - Pictures
 - Videos
 - Music
-- selected application/browser data where it is safe and useful
 
-Downloads and cloud-placeholder content are opt-in by default. All defaults can be changed locally or by managed policy. The UI supports adding/removing arbitrary paths and editing exclusions.
+Downloads, application/browser data, and cloud-placeholder handling are not automatically selected. All configured paths can be changed locally or eventually by managed policy. The implemented UI supports discovery, folder picking, adding/removing arbitrary absolute paths, and editing exclusions.
 
 ### VSS and metadata
 
-Backups use restic's Windows filesystem snapshot support by default so that locked files can be read from VSS. Restic's supported Windows metadata, including security descriptors and NTFS metadata, should be enabled/preserved where available. VSS improves consistency but does not turn the product into an application-aware or bare-metal backup system.
+The backup invocation enables restic's Windows filesystem snapshot support by default (`--use-fs-snapshot`) so locked files can be read through VSS. Restic's supported Windows metadata, including security descriptors and NTFS metadata, should be enabled/preserved where available. Real service-account VSS behavior and metadata restoration still require Windows 10/11 integration testing. VSS improves consistency but does not turn the product into an application-aware or bare-metal backup system.
 
 ## Scheduling, wake, power, and network
 
@@ -150,7 +179,7 @@ The scheduler is deadline-based rather than a single fixed wall-clock task.
 - Default cadence: once per day.
 - If a deadline is missed because the machine is asleep or off, the backup becomes overdue.
 - On resume, an overdue backup waits through a default five-minute grace period before starting.
-- Network-restored, schedule, startup, and resume triggers coalesce into a single pending run.
+- Manual, schedule, startup, resume, power, time-change, and periodic condition reevaluations coalesce into a single pending run. A dedicated network-change notification is not wired yet; blocked network conditions are reevaluated every minute.
 - Only one repository-mutating restic operation may run at a time.
 - Battery operation is allowed by default and configurable per field.
 - Metered-network operation is allowed by default and configurable per field.
@@ -159,15 +188,15 @@ The scheduler is deadline-based rather than a single fixed wall-clock task.
 
 While backup work is active, the service obtains a Windows system-required power request. The power request is always released when the run ends and has a hard two-hour safety limit. If a backup exceeds two hours, the power request expires but the backup itself may continue; backup runtime limits are a separate policy.
 
-Cancellation first requests graceful termination and then escalates after a bounded shutdown period. An interrupted run is recorded distinctly from a backup failure.
+Cancellation currently terminates the contained Windows Job Object and is recorded distinctly from a backup failure. Graceful restic shutdown followed by bounded escalation remains to be implemented.
 
 ## Repository support
 
-The application bundles restic and supports both creating a new repository and connecting to an existing repository.
+The service supports creating a new repository and connecting to an existing repository through service-owned, fixed restic operations. Bundling `restic.exe` is a packaging task that is not complete; development builds look for a sibling `restic.exe`.
 
 ### Backends
 
-The UI offers friendly, typed setup for common backends and an advanced form for the remaining backends supported by the bundled restic version. At minimum the configuration model must represent:
+The implemented UI offers friendly local/network and S3-compatible choices plus an advanced restic repository URL and bounded key/value options for the remaining backends. The configuration and credential models represent:
 
 - local and network paths;
 - REST server URLs;
@@ -176,11 +205,15 @@ The UI offers friendly, typed setup for common backends and an advanced form for
 - Azure, Google Cloud Storage, Backblaze B2, and other native restic backends;
 - rclone-backed repositories.
 
+Repository changes that affect connectivity invalidate a durable verification gate. Backups remain blocked until the service successfully runs the allowlisted connection test or repository initialization. Initialization has a hard timeout and is prohibited in append-only mode.
+
 Repository URLs and non-secret options may live in policy. Passwords, access keys, secret keys, tokens, and private key material live only in the protected credential store and are referenced by opaque secret IDs.
 
 The server may supply an S3 bucket configuration and encrypted credentials during enrollment or a later policy refresh. Managed settings remain typed and allowlisted. The server cannot send arbitrary restic command-line arguments.
 
 ### Bundled restic
+
+The command builder, executor boundary, sibling-binary lookup, bounded JSON parsing, and secret injection are implemented. Release pinning, binary verification, version capture, and distribution are not.
 
 - Ship a pinned, verified `restic.exe` with the application.
 - Disable or never expose `restic self-update`; restic updates arrive as part of a resticpal release.
@@ -202,7 +235,9 @@ In standard mode, resticpal may apply local retention and maintenance policy. Th
 - 12 monthly snapshots
 - 3 yearly snapshots
 
-Retention is configurable in the file and UI. The precise default prune cadence is still open; pruning should be scheduled separately from ordinary backup deadlines because it may be expensive.
+Retention will be configurable in the file and UI. The precise default prune cadence is still open; pruning should be scheduled separately from ordinary backup deadlines because it may be expensive.
+
+The retention values and policy-resolution model exist, but retention editing, `forget`, `prune`, and maintenance scheduling are not implemented. Consequently the current standard mode performs backups only.
 
 ### Append-only/server-maintained mode
 
@@ -218,6 +253,8 @@ In append-only mode, the backup client is intentionally not a repository adminis
 
 The client-side command restriction is defense in depth, not proof of append-only storage. Real protection must also be enforced by the repository service, proxy, S3 IAM/bucket policy, object immutability/versioning controls, or another storage-side mechanism. resticpal must label the mode as configured; it must not claim to have verified backend immutability unless a future backend-specific verification exists.
 
+The append-only authorization matrix is implemented in the core command builder and tested against initialization, forget, prune, rewrite, migration, destructive repair, and key removal. The repository UI labels append-only retention as server-managed, and the service rejects initialization in this mode.
+
 When a server maintains a repository that receives append-only client backups, its retention design should follow restic's append-only guidance, including careful use of time-window retention to avoid an untrusted client manipulating which snapshots appear newest.
 
 ## Configuration model
@@ -226,17 +263,17 @@ When a server maintains a repository that receives append-only client backups, i
 
 Machine state lives under `%ProgramData%\ResticPal` with service/admin-only ACLs where appropriate.
 
-| Item | Proposed location | Notes |
+| Item | Location | Current status |
 | --- | --- | --- |
-| Local configuration | `config.toml` | Human-editable, no secrets |
-| Managed policy cache | `managed-policy.json` | Signed, versioned, last-known-good |
-| Credential store | implementation-private | DPAPI/CNG protected and service-only |
-| Scheduler checkpoint | `state.json` | Last successful completion for restart-safe deadlines |
-| Run history | `state.db` | Bounded SQLite history |
-| Logs | `Logs\` | Structured, rotated, sanitized |
-| Bundled tools | under installation directory | Administrator/service write only |
+| Local configuration | `config.toml` | Implemented; typed TOML with no secrets, loaded at startup and replaced atomically for accepted UI/service changes |
+| Managed policy cache | `managed-policy.json` | Planned; signed, versioned, last-known-good |
+| Credential store | implementation-private `Credentials\` | Implemented for repository secrets with service-identity DPAPI, opaque references, restricted ACLs, and atomic replacement |
+| Scheduler checkpoint | `state.json` | Implemented; last success plus repository-validation identity/time for restart-safe scheduling |
+| Run history | `state.db` | Implemented lazily; SQLite, newest 200 attempts, sanitized and non-blocking |
+| Logs | `Logs\` | Planned; structured, rotated, sanitized |
+| Bundled tools | under installation directory | Planned; administrator/service write only |
 
-Direct edits to `config.toml` are watched, parsed, validated, and applied atomically. Invalid edits do not replace the last valid configuration and produce a clear local status error. The UI writes configuration through the service, not directly.
+The UI writes configuration through elevated typed service operations, not directly. Those writes validate a candidate effective configuration before atomically replacing `config.toml` and immediately reevaluating the scheduler. A directly edited file is validated at service startup, but live file watching and last-known-good recovery for invalid edits are not implemented yet.
 
 ### Effective policy and per-field locks
 
@@ -247,11 +284,17 @@ Effective configuration is calculated from:
 3. the last valid signed managed policy;
 4. transient one-run choices such as an allowed deferral.
 
-Managed policy marks individual fields as locked. A managed value overrides local configuration only for that field. The UI explains the source of each managed value and disables editing only where locked. Unknown fields are rejected or safely ignored according to schema-version rules; they never become raw restic arguments.
+Managed policy marks individual fields as locked. A managed value overrides local configuration only for that field. The complete UI will explain the source of each managed value and disable editing only where locked. Unknown fields are rejected or safely ignored according to schema-version rules; they never become raw restic arguments.
 
 Loss of server connectivity does not stop backups. The service continues with its last valid policy and reports that management connectivity is stale. Only a signed explicit disable policy may stop managed backups.
 
+The typed precedence/lock resolver and lock-aware service/UI mutation paths are implemented and tested. The running service currently resolves product defaults plus local configuration with no managed document; signed policy loading, freshness, caching, and runtime revision changes belong to the enrollment milestone.
+
 ## Credentials and device keys
+
+Repository credential storage is implemented with DPAPI under the service identity. Credential values cross only the protected administrator IPC request, are written under opaque collision-resistant references, are zeroized where practical, and never enter TOML or response views. Rotation commits the new configuration before retiring superseded credential files. Device enrollment keys and bootstrapped-secret decryption are not implemented.
+
+The target credential/device-key model is:
 
 - Repository secrets are encrypted at rest using Windows DPAPI or a non-exportable Windows CNG key, scoped so only the service identity can use them.
 - Protected files and registry entries also have service/admin-only ACLs; encryption does not replace access control.
@@ -261,6 +304,8 @@ Loss of server connectivity does not stop backups. The service continues with it
 - A local administrator may unenroll with an elevation prompt. Unenrollment removes management credentials and device enrollment state, records a local audit event, and does not delete repositories or existing backups.
 
 ## Enrollment and remote policy
+
+This section remains a proposed protocol. No bootstrap URL consumption, device identity, signed policy cache, policy/status HTTP client, metadata-file adapter, schemas, or fixtures are implemented yet.
 
 The installer offers an optional bootstrap URL field. Interactive entry is preferred because one-time URLs and tokens can leak through process listings, shell history, response logs, or MSI logs when passed on a command line.
 
@@ -300,7 +345,9 @@ The canonical state machine includes:
 - `paused` or administratively disabled
 - `service_unavailable` in clients that cannot reach the service
 
-The tray and UI expose:
+The implemented canonical service state includes all entries above except client-only `service_unavailable`. Waiting reasons currently cover wake grace, network, battery, metered network, policy backoff, and repository validation. Running status begins in preparation and moves to uploading when JSON progress arrives; finer scanning/finalizing/retention/checking phase reporting is still planned.
+
+The complete tray and UI status surface will expose:
 
 - current state, phase, start time, and bounded progress;
 - last attempt and last successful backup;
@@ -315,7 +362,11 @@ The tray and UI expose:
 
 Tray notifications should be useful rather than noisy: notify on an initial failure, repeated/stale protection, user action required, and recovery after a failure streak. Exact notification thresholds are proposed behavior and should be user configurable.
 
+The current local status protocol exposes redacted state, repository name/mode, last attempt/success, deadline/blocker, and bounded progress. The overview and tray reduce that to a friendly health summary and current progress. The WinUI History page exposes timestamps, duration, outcome, aggregate file/byte statistics, sanitized error code, and snapshot ID for the newest 50 records. Version, enrollment, update, detailed diagnostic, and notification surfaces remain planned.
+
 ## Remote status reporting
+
+Remote status reporting is not implemented. The following remains the agreed reporting contract for the enrollment milestone.
 
 Remote reporting occurs only when enrolled. The default cadence is:
 
@@ -343,7 +394,7 @@ Reports must not contain repository passwords, cloud credentials, enrollment tok
 
 ## Updates
 
-The WinUI application integrates NetSparkleUpdater. Until releases have Authenticode code signing:
+The WinUI project references NetSparkleUpdater 3.1.0, but no appcast, update-check UI, verification flow, or updater helper is wired yet. The intended behavior, until releases have Authenticode code signing, is:
 
 - updates are user-selected and user-initiated;
 - update metadata and packages require Ed25519 verification;
@@ -354,6 +405,10 @@ The WinUI application integrates NetSparkleUpdater. Until releases have Authenti
 - rollback or repair behavior must be designed before automatic installation is considered.
 
 ## Installer and deployment
+
+Installer and deployment work has not started. The following is the target packaging behavior:
+
+The development WinUI project currently declares `10.0.17763.0` (Windows 10 version 1809) as its target-platform minimum. That is a build setting, not yet a qualified support promise.
 
 - Per-machine x64 WiX MSI.
 - Target Windows 10 and Windows 11; the exact minimum Windows 10 build will be validated with the first WinUI/installer prototype.
@@ -366,65 +421,77 @@ The WinUI application integrates NetSparkleUpdater. Until releases have Authenti
 
 ## Logging and audit
 
-- Structured logs with stable event IDs and correlation/run IDs.
-- Rotating local files plus important service lifecycle/failure events in Windows Event Log.
-- Bounded run history in SQLite, retaining the newest 200 attempts and returning at most 100 records per local IPC request.
-- Audit events for configuration changes, policy revisions, enrollment/unenrollment, credentials changes, update attempts, manual run/cancel/defer actions, and service-account fallback.
-- Path and secret redaction occurs before persistence, not only in the UI.
+- Bounded run history is implemented in SQLite, retaining the newest 200 attempts and returning at most 100 records per local IPC request.
+- Run records persist only timestamps, outcomes, aggregate counts, allowlisted error/snapshot identifiers, and no source paths, filenames, repository URLs, raw output, credentials, or exception text. Identifiers are allowlisted again when read so a corrupted database cannot surface path-like data through IPC.
+- History I/O failure is logged to the service diagnostic stream and never blocks or fails a backup.
+- Structured rotating logs, stable event IDs, correlation/run IDs, Windows Event Log integration, and audit events are planned.
 
 ## Security boundaries
 
+The service-only execution boundary, shell-free command construction, typed option validation, bounded IPC/progress parsing, DPAPI credential references, and append-only operation checks are implemented. Filesystem ACL protection for installed binaries/configuration and update/policy signature boundaries still depend on the installer, enrollment, and updater milestones.
+
 - Only the service launches restic.
-- Executable paths are fixed and ACL-protected.
+- Installed executable paths will be fixed and ACL-protected; the current executor already fixes restic to the sibling application path.
 - Remote and local configuration are mapped to typed allowlisted arguments/options.
 - No shell command construction is used.
 - All paths, URLs, options, environment names, sizes, and message lengths are validated.
 - Managed repository configuration is powerful: an enrolled server can direct readable files to a repository it controls. Enrollment therefore represents an explicit administrator trust decision and must be clearly presented.
 - Append-only mode is enforced both by resticpal command policy and, for meaningful ransomware resistance, by the storage system.
-- Update signatures and policy signatures use distinct keys and trust purposes.
+- Update signatures and policy signatures will use distinct keys and trust purposes.
 
 ## Initial delivery milestones
 
-1. **Windows feasibility spike**
+1. **Windows feasibility spike — in progress**
    - Service installation and virtual-account identity.
    - Named-pipe authorization.
    - VSS backup of known folders on Windows 10 and Windows 11.
    - Sleep/resume event handling and two-hour power request.
    - Measure idle service/tray resource use.
 
-2. **Local vertical slice**
+   The service host, named-pipe authorization, resume event, and timed power request exist. Installation/identity, real VSS coverage, OS-matrix qualification, and resource measurement remain.
+
+2. **Local vertical slice — functional development slice**
    - Rust service and tray.
    - On-demand WinUI overview/settings shell.
    - Bundled restic, one repository, source selection, daily/wake scheduling, progress, cancellation, and history.
    - DPAPI/CNG secret storage.
 
-3. **Repository and policy breadth**
+   All listed application behaviors are implemented except release bundling of restic and production installation/qualification. Cancellation is currently immediate Job Object termination rather than graceful-first shutdown.
+
+3. **Repository and policy breadth — partially implemented**
    - Create/connect flows and typed common backends.
    - S3-compatible configuration.
    - Standard retention and append-only/server-maintained mode.
    - Configuration file reload and per-field managed locks.
 
-4. **Enrollment and reporting**
+   Create/connect, S3/advanced configuration, append-only enforcement, typed policy precedence, and per-field lock enforcement are implemented. Standard retention execution/UI, live file reload, and signed managed-policy ingestion remain.
+
+4. **Enrollment and reporting — not started**
    - Bootstrap flow, device identity, signed policy cache, encrypted secret bootstrap, metadata-file mode, status reports, schemas, fixtures, and protocol tests.
 
-5. **Packaging and updates**
+5. **Packaging and updates — package reference only**
    - WiX MSI, startup registration, upgrade/repair/uninstall behavior, NetSparkle appcast verification, and elevated atomic updater.
 
 ## Required test themes
 
-- Scheduler tests for shutdown, sleep, resume, clock changes, daylight-saving transitions, duplicate triggers, retry/backoff, battery, metered networks, and cancellation.
-- Policy tests for precedence, field locks, stale/offline policy, signature failure, rollback/replay attempts, schema changes, and atomic recovery.
-- Command-construction tests proving remote configuration cannot introduce arbitrary arguments or executables.
-- Append-only tests proving resticpal never schedules or exposes destructive maintenance commands and behaves correctly when the backend rejects deletes/overwrites.
-- S3 tests for endpoint variants, regions, bucket addressing, temporary credentials, rotation, and redaction.
-- Service security tests for pipe ACLs, impersonation/token checks, service binary/config ACLs, and privilege use.
+The current 94-test Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, policy precedence and locks, command construction, append-only authorization, configuration bounds, named-pipe framing/ACL/token checks, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, and SQLite history retention/redaction/restart behavior. The WinUI project is build-validated but does not yet have an automated UI test suite.
+
+The following themes remain required as their corresponding product areas land:
+
+- Scheduler tests for shutdown races, daylight-saving transitions, dedicated network-change events, and graceful cancellation escalation.
+- Policy tests for stale/offline signed policy, signature failure, rollback/replay attempts, schema evolution, and atomic cache recovery.
+- End-to-end command tests proving enrolled configuration cannot introduce arbitrary arguments or executables.
+- Append-only integration tests for storage-side delete/overwrite rejection.
+- S3 integration tests for endpoint variants, regions, bucket addressing, temporary credentials, and rotation.
+- Service security tests for installed binary/config ACLs, virtual-account privileges, and VSS access.
 - Update tests for signature failure, interrupted download/install, an active backup, rollback/repair, and restic version replacement.
 - Resource tests for long idle periods, repeated UI open/close, disconnected server/network, and large progress streams.
 
 ## Open implementation decisions
 
 - Whether the virtual service account is sufficient for reliable VSS and arbitrary configured user paths; LocalSystem is the fallback.
-- Exact local and remote schema shapes and protocol serialization.
+- Remote schema shapes, signature envelopes, and API/metadata serialization.
+- Local IPC subscription framing and compatibility policy beyond protocol v2.
 - Concrete idle memory/CPU targets after the feasibility prototype.
 - Default prune cadence in standard/client-maintained mode.
 - Notification thresholds.
