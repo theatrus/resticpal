@@ -959,10 +959,13 @@ dependencies = [
 name = "resticpal-tray"
 version = "1.0.1"
 dependencies = [
+ "base64",
+ "ed25519-dalek",
  "embed-resource",
  "resticpal-core",
  "resticpal-protocol",
  "resticpal-windows",
+ "ureq",
  "windows",
 ]
 
@@ -1373,6 +1376,7 @@ dependencies = [
  "serde_json",
  "ureq-proto",
  "utf8-zero",
+ "webpki-root-certs",
  "winreg 0.56.0",
 ]
 
@@ -1496,6 +1500,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "webpki-root-certs"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e4ffd8df1c57e87c325000a3d6ef93db75279dc3a231125aac571650f22b12a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

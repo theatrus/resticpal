@@ -12,6 +12,7 @@ public sealed partial class MainWindow : Window
     private readonly ResticPalServiceClient _service = new();
     private readonly ResticPalUpdateService _updates = new();
     private readonly bool _showOnboarding;
+    private readonly bool _showUpdates;
     private bool _sourcesLoaded;
     private bool _pathsLocked;
     private bool _exclusionsLocked;
@@ -50,9 +51,10 @@ public sealed partial class MainWindow : Window
     public ObservableCollection<BackupRunListItem> BackupHistory { get; } = new();
     public ObservableCollection<DiagnosticListItem> Diagnostics { get; } = new();
 
-    public MainWindow(bool showOnboarding = false)
+    public MainWindow(bool showOnboarding = false, bool showUpdates = false)
     {
         _showOnboarding = showOnboarding;
+        _showUpdates = showUpdates;
         InitializeComponent();
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "resticpal.ico"));
         Closed += (_, _) => _updates.Dispose();
@@ -66,6 +68,10 @@ public sealed partial class MainWindow : Window
         if (_showOnboarding || status?.State == "unconfigured")
         {
             ShowOnboarding();
+        }
+        if (_showUpdates)
+        {
+            ShowUpdates();
         }
         await CheckForUpdatesAsync(userInitiated: false);
     }
@@ -235,6 +241,12 @@ public sealed partial class MainWindow : Window
         FirstRunInfoBar.IsOpen = true;
         NavigationRoot.SelectedItem = NavigationRoot.SettingsItem;
         MarkOnboardingShown();
+    }
+
+    private void ShowUpdates()
+    {
+        NavigationRoot.SelectedItem = NavigationRoot.SettingsItem;
+        DispatcherQueue.TryEnqueue(() => UpdateCard.StartBringIntoView());
     }
 
     private static void MarkOnboardingShown()

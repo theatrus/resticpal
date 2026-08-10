@@ -1,26 +1,32 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::fs;
 use std::mem::size_of;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use ed25519_dalek::{Signature, VerifyingKey};
 use resticpal_core::status::BackupState;
 use resticpal_protocol::{Request, RequestCommand, Response, ResponsePayload};
 use resticpal_windows::named_pipe::{NamedPipeClient, NamedPipeError};
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW, ShellExecuteW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
     GetCursorPos, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, KillTimer, LR_DEFAULTCOLOR,
     LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MENU_ITEM_FLAGS, MSG,
-    MessageBoxW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, SetTimer,
-    TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-    WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow,
+    SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+    WS_OVERLAPPED,
 };
 use windows::core::{Error, Result, w};
 
@@ -30,14 +36,36 @@ const TRAY_ICON_ID: u32 = 1;
 const MENU_OPEN: usize = 1;
 const MENU_RUN_BACKUP: usize = 2;
 const MENU_EXIT: usize = 3;
+const MENU_UPDATE: usize = 4;
 const ONBOARDING_TIMER_ID: usize = 2;
 const ONBOARDING_RETRY_INTERVAL_MS: u32 = 1_000;
 const ONBOARDING_MAX_ATTEMPTS: u64 = 120;
+const UPDATE_TIMER_ID: usize = 3;
+const UPDATE_CHECK_INTERVAL_MS: u32 = 6 * 60 * 60 * 1_000;
+const UPDATE_AVAILABLE_MESSAGE: u32 = WM_APP + 2;
+const UPDATE_PROMPT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const UPDATE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_UPDATE_APPCAST_BYTES: usize = 256 * 1024;
+const MAX_UPDATE_SIGNATURE_BYTES: usize = 1024;
+const UPDATE_APPCAST_URL: &str =
+    "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml";
+const UPDATE_APPCAST_SIGNATURE_URL: &str =
+    "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml.signature";
+const UPDATE_PUBLIC_KEY: &str = include_str!("../../../config/update-public-key.txt");
 const MF_STRING: MENU_ITEM_FLAGS = MENU_ITEM_FLAGS(0);
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../../assets/resticpal.ico");
 const PREFERRED_TRAY_ICON_SIZE: u16 = 32;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static ONBOARDING_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+enum UiDestination {
+    Default,
+    Setup,
+    Updates,
+}
 
 struct TrayIcon {
     handle: HICON,
@@ -154,6 +182,16 @@ fn run() -> Result<()> {
             );
         }
     }
+    start_update_check(window);
+    // The timer consumes no CPU between the tray's bounded signed-feed checks.
+    unsafe {
+        SetTimer(
+            Some(window),
+            UPDATE_TIMER_ID,
+            UPDATE_CHECK_INTERVAL_MS,
+            None,
+        );
+    }
     run_message_loop()
 }
 
@@ -263,7 +301,10 @@ unsafe extern "system" fn window_proc(
         TRAY_CALLBACK => {
             match u32::try_from(lparam.0).unwrap_or_default() {
                 WM_LBUTTONDBLCLK => {
-                    let _ = launch_ui(window, false);
+                    let _ = launch_ui(window, UiDestination::Default);
+                }
+                NIN_BALLOONUSERCLICK => {
+                    let _ = launch_ui(window, UiDestination::Updates);
                 }
                 WM_RBUTTONUP => {
                     if let Err(error) = show_context_menu(window) {
@@ -287,9 +328,20 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == UPDATE_TIMER_ID => {
+            start_update_check(window);
+            LRESULT(0)
+        }
+        UPDATE_AVAILABLE_MESSAGE => {
+            if wparam.0 != 0 {
+                let _ = show_update_notification(window);
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             // SAFETY: harmless if the onboarding timer has already been removed.
             let _ = unsafe { KillTimer(Some(window), ONBOARDING_TIMER_ID) };
+            let _ = unsafe { KillTimer(Some(window), UPDATE_TIMER_ID) };
             remove_tray_icon(window);
             // SAFETY: called from the UI thread's window procedure.
             unsafe { PostQuitMessage(0) };
@@ -310,6 +362,9 @@ fn show_context_menu(window: HWND) -> Result<()> {
         // SAFETY: labels are static null-terminated strings and menu is valid.
         unsafe {
             AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("Open resticpal"))?;
+            if UPDATE_AVAILABLE.load(Ordering::Relaxed) {
+                AppendMenuW(menu, MF_STRING, MENU_UPDATE, w!("Update available…"))?;
+            }
             if backup_running {
                 AppendMenuW(menu, MF_STRING, MENU_RUN_BACKUP, w!("Cancel backup"))?;
             } else {
@@ -340,7 +395,10 @@ fn show_context_menu(window: HWND) -> Result<()> {
 
         match usize::try_from(command.0).unwrap_or_default() {
             MENU_OPEN => {
-                let _ = launch_ui(window, false);
+                let _ = launch_ui(window, UiDestination::Default);
+            }
+            MENU_UPDATE => {
+                let _ = launch_ui(window, UiDestination::Updates);
             }
             MENU_RUN_BACKUP => {
                 if backup_running {
@@ -363,7 +421,7 @@ fn show_context_menu(window: HWND) -> Result<()> {
     result.and(destroy_result)
 }
 
-fn launch_ui(window: HWND, show_onboarding: bool) -> bool {
+fn launch_ui(window: HWND, destination: UiDestination) -> bool {
     let Ok(mut executable) = std::env::current_exe() else {
         show_error(
             window,
@@ -373,10 +431,10 @@ fn launch_ui(window: HWND, show_onboarding: bool) -> bool {
     };
     executable.set_file_name("resticpal-ui.exe");
     let executable = wide_null(&executable.to_string_lossy());
-    let arguments = if show_onboarding {
-        w!("--setup")
-    } else {
-        w!("")
+    let arguments = match destination {
+        UiDestination::Default => w!(""),
+        UiDestination::Setup => w!("--setup"),
+        UiDestination::Updates => w!("--updates"),
     };
     // SAFETY: the executable path is live and null terminated. ShellExecute
     // handles the UAC consent flow required by the settings application.
@@ -414,7 +472,7 @@ fn maybe_launch_onboarding(window: HWND) -> bool {
     };
     if let ResponsePayload::Status { status } = response.payload {
         if should_launch_onboarding(marker_exists, &status.state) {
-            let _ = launch_ui(window, true);
+            let _ = launch_ui(window, UiDestination::Setup);
             return true;
         }
         return !matches!(status.state, BackupState::Waiting { .. });
@@ -432,6 +490,188 @@ fn onboarding_marker_path() -> Option<PathBuf> {
 
 fn should_launch_onboarding(marker_exists: bool, state: &BackupState) -> bool {
     !marker_exists && matches!(state, BackupState::Unconfigured)
+}
+
+fn start_update_check(window: HWND) {
+    if UPDATE_CHECK_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    let window_value = window.0 as isize;
+    std::thread::spawn(move || {
+        match check_for_update() {
+            Some(true) => {
+                UPDATE_AVAILABLE.store(true, Ordering::Relaxed);
+                let prompt = record_update_prompt_if_due(SystemTime::now());
+                // SAFETY: the integer originated from the live HWND. A posted
+                // message safely fails if the tray exits before the check.
+                let window = HWND(window_value as *mut core::ffi::c_void);
+                let _ = unsafe {
+                    PostMessageW(
+                        Some(window),
+                        UPDATE_AVAILABLE_MESSAGE,
+                        WPARAM(usize::from(prompt)),
+                        LPARAM(0),
+                    )
+                };
+            }
+            Some(false) => UPDATE_AVAILABLE.store(false, Ordering::Relaxed),
+            None => {}
+        }
+        UPDATE_CHECK_RUNNING.store(false, Ordering::Release);
+    });
+}
+
+fn check_for_update() -> Option<bool> {
+    let agent = update_http_agent();
+    let appcast = fetch_bounded(&agent, UPDATE_APPCAST_URL, MAX_UPDATE_APPCAST_BYTES)?;
+    let signature = fetch_bounded(
+        &agent,
+        UPDATE_APPCAST_SIGNATURE_URL,
+        MAX_UPDATE_SIGNATURE_BYTES,
+    )?;
+    let signature = std::str::from_utf8(&signature).ok()?;
+    if !verify_signed_document(&appcast, signature, UPDATE_PUBLIC_KEY) {
+        return None;
+    }
+
+    let appcast = std::str::from_utf8(&appcast).ok()?;
+    let available = extract_appcast_version(appcast)?;
+    let current = parse_product_version(env!("CARGO_PKG_VERSION"))?;
+    Some(available > current)
+}
+
+fn update_http_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(UPDATE_HTTP_TIMEOUT))
+        .tls_config(
+            TlsConfig::builder()
+                .provider(TlsProvider::NativeTls)
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .user_agent(concat!("resticpal/", env!("CARGO_PKG_VERSION")))
+        .build();
+    config.into()
+}
+
+fn fetch_bounded(agent: &ureq::Agent, url: &str, max_bytes: usize) -> Option<Vec<u8>> {
+    let mut response = agent.get(url).call().ok()?;
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(u64::try_from(max_bytes.checked_add(1)?).ok()?)
+        .read_to_vec()
+        .ok()?;
+    (body.len() <= max_bytes).then_some(body)
+}
+
+fn verify_signed_document(document: &[u8], signature: &str, public_key: &str) -> bool {
+    let Ok(public_key) = STANDARD.decode(public_key.trim()) else {
+        return false;
+    };
+    let public_key: [u8; 32] = match public_key.try_into() {
+        Ok(public_key) => public_key,
+        Err(_) => return false,
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&public_key) else {
+        return false;
+    };
+    let Ok(signature) = STANDARD.decode(signature.trim()) else {
+        return false;
+    };
+    let signature: [u8; 64] = match signature.try_into() {
+        Ok(signature) => signature,
+        Err(_) => return false,
+    };
+
+    verifying_key
+        .verify_strict(document, &Signature::from_bytes(&signature))
+        .is_ok()
+}
+
+fn extract_appcast_version(document: &str) -> Option<[u64; 3]> {
+    const OPEN: &str = "<sparkle:version>";
+    const CLOSE: &str = "</sparkle:version>";
+    let value_start = document.find(OPEN)?.checked_add(OPEN.len())?;
+    let value_end = value_start.checked_add(document.get(value_start..)?.find(CLOSE)?)?;
+    parse_product_version(document.get(value_start..value_end)?.trim())
+}
+
+fn parse_product_version(value: &str) -> Option<[u64; 3]> {
+    let mut components = value.split('.');
+    let version = [
+        parse_version_component(components.next()?)?,
+        parse_version_component(components.next()?)?,
+        parse_version_component(components.next()?)?,
+    ];
+    components.next().is_none().then_some(version)
+}
+
+fn parse_version_component(value: &str) -> Option<u64> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse().ok())
+        .flatten()
+}
+
+fn update_prompt_marker_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|root| {
+        PathBuf::from(root)
+            .join("resticpal")
+            .join("update-prompted")
+    })
+}
+
+fn record_update_prompt_if_due(now: SystemTime) -> bool {
+    let Some(path) = update_prompt_marker_path() else {
+        return true;
+    };
+    let last_prompt = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    if !update_prompt_is_due(now, last_prompt) {
+        return false;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, b"1");
+    true
+}
+
+fn update_prompt_is_due(now: SystemTime, last_prompt: Option<SystemTime>) -> bool {
+    last_prompt.is_none_or(|last| {
+        now.duration_since(last)
+            .is_ok_and(|elapsed| elapsed >= UPDATE_PROMPT_INTERVAL)
+    })
+}
+
+fn show_update_notification(window: HWND) -> Result<()> {
+    let mut data = NOTIFYICONDATAW {
+        cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>())
+            .expect("NOTIFYICONDATAW size fits in u32"),
+        hWnd: window,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_INFO,
+        dwInfoFlags: NIIF_INFO,
+        ..NOTIFYICONDATAW::default()
+    };
+    copy_wide("resticpal update available", &mut data.szInfoTitle);
+    copy_wide(
+        "A signed resticpal update is ready. Click to review and install it.",
+        &mut data.szInfo,
+    );
+    data.Anonymous.uTimeout = 10_000;
+
+    // SAFETY: data identifies the notification icon owned by the live window.
+    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const data) }.as_bool() {
+        Ok(())
+    } else {
+        Err(Error::from_thread())
+    }
 }
 
 fn send_backup_action(window: HWND, command: RequestCommand) {
@@ -589,6 +829,7 @@ fn wide_null(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
     fn embedded_tray_icon_contains_the_preferred_png_image() {
@@ -623,5 +864,68 @@ mod tests {
         assert!(should_launch_onboarding(false, &BackupState::Unconfigured));
         assert!(!should_launch_onboarding(true, &BackupState::Unconfigured));
         assert!(!should_launch_onboarding(false, &BackupState::Idle));
+    }
+
+    #[test]
+    fn update_prompt_is_bounded_to_once_per_day() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200_000);
+        assert!(update_prompt_is_due(now, None));
+        assert!(!update_prompt_is_due(
+            now,
+            Some(now - Duration::from_secs(60 * 60))
+        ));
+        assert!(update_prompt_is_due(
+            now,
+            Some(now - UPDATE_PROMPT_INTERVAL)
+        ));
+        assert!(!update_prompt_is_due(
+            now,
+            Some(now + Duration::from_secs(60))
+        ));
+    }
+
+    #[test]
+    fn appcast_versions_are_strictly_parsed_and_compared() {
+        let appcast = "<rss><sparkle:version>1.2.30</sparkle:version></rss>";
+        assert_eq!(extract_appcast_version(appcast), Some([1, 2, 30]));
+        assert!(extract_appcast_version(appcast).unwrap() > [1, 2, 3]);
+
+        assert_eq!(parse_product_version("1.0.1"), Some([1, 0, 1]));
+        assert_eq!(parse_product_version("1.0"), None);
+        assert_eq!(parse_product_version("1.0.1.0"), None);
+        assert_eq!(parse_product_version("1.0-beta"), None);
+        assert_eq!(extract_appcast_version("<rss />"), None);
+    }
+
+    #[test]
+    fn update_client_uses_windows_native_tls_and_platform_roots() {
+        let agent = update_http_agent();
+        let tls = agent.config().tls_config();
+
+        assert_eq!(tls.provider(), TlsProvider::NativeTls);
+        assert!(matches!(tls.root_certs(), RootCerts::PlatformVerifier));
+    }
+
+    #[test]
+    fn detached_update_signature_rejects_tampering() {
+        let signing_key = SigningKey::from_bytes(&[42; 32]);
+        let document = b"<rss><sparkle:version>1.0.2</sparkle:version></rss>";
+        let signature = signing_key.sign(document);
+        let signature = STANDARD.encode(signature.to_bytes());
+        let public_key = STANDARD.encode(signing_key.verifying_key().to_bytes());
+
+        assert!(verify_signed_document(document, &signature, &public_key));
+        assert!(!verify_signed_document(
+            b"<rss><sparkle:version>9.0.0</sparkle:version></rss>",
+            &signature,
+            &public_key
+        ));
+        assert!(!verify_signed_document(document, "not-base64", &public_key));
+    }
+
+    #[test]
+    #[ignore = "contacts the live signed release feed"]
+    fn live_signed_update_feed_is_valid() {
+        assert!(check_for_update().is_some());
     }
 }

@@ -273,6 +273,7 @@
                         </Border>
 
                         <Border
+                            x:Name="UpdateCard"
                             Grid.Row="3"
                             Padding="20"
                             Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"

@@ -16,6 +16,7 @@ use resticpal_core::status::ServiceStatus;
 use resticpal_windows::credentials::{CredentialStoreError, DpapiSecretStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use zeroize::Zeroizing;
 
 use crate::atomic_file::{self, AtomicFileError};
@@ -44,6 +45,12 @@ impl ManagementClient {
     pub fn new() -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(HTTP_TIMEOUT))
+            .tls_config(
+                TlsConfig::builder()
+                    .provider(TlsProvider::NativeTls)
+                    .root_certs(RootCerts::PlatformVerifier)
+                    .build(),
+            )
             // Never forward a device bearer token to a redirect target. Static
             // manifest operators should publish the final URL directly.
             .max_redirects(0)
@@ -438,6 +445,15 @@ mod tests {
     use std::thread;
 
     use resticpal_core::management::{MANAGEMENT_SCHEMA_VERSION, ManifestPayload};
+
+    #[test]
+    fn management_client_uses_windows_native_tls_and_platform_roots() {
+        let client = ManagementClient::new();
+        let tls = client.agent.config().tls_config();
+
+        assert_eq!(tls.provider(), TlsProvider::NativeTls);
+        assert!(matches!(tls.root_certs(), RootCerts::PlatformVerifier));
+    }
 
     #[test]
     fn plain_http_manifest_is_cached_for_offline_startup() {

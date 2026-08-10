@@ -13,10 +13,12 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
-        bool showOnboarding = args.Arguments
+        string[] arguments = args.Arguments
             .Split(' ', StringSplitOptions.RemoveEmptyEntries)
-            .Contains("--setup", StringComparer.OrdinalIgnoreCase);
-        _window = new MainWindow(showOnboarding);
+            .ToArray();
+        bool showOnboarding = arguments.Contains("--setup", StringComparer.OrdinalIgnoreCase);
+        bool showUpdates = arguments.Contains("--updates", StringComparer.OrdinalIgnoreCase);
+        _window = new MainWindow(showOnboarding, showUpdates);
         _window.Activate();
     }
 }
