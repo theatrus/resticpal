@@ -25,7 +25,13 @@ The MSI and generated appcast both derive their version from this synchronized p
 
 ## Prepare a release
 
-Commit and push the versioned release source, then wait for its successful `Windows CI` run on `main`. Push/manual runs use Azure OIDC and produce an Authenticode-signed `resticpal-windows-x64` artifact. Pull requests and forks remain buildable without signing access.
+Commit and push the versioned release source, then wait for its successful unsigned `Windows CI` validation on `main`. Ordinary pushes do not consume Trusted Signing quota. Request a signed artifact explicitly from the release commit:
+
+```powershell
+gh workflow run ci.yml --ref main
+```
+
+Wait for that manually dispatched run to succeed. Manual runs and pushed version tags use Azure OIDC and produce an Authenticode-signed `resticpal-windows-x64` artifact; ordinary `main` pushes, pull requests, and forks remain unsigned. As an alternative, pushing `v<version>` first triggers the signed path for that tag.
 
 Prepare the local release directory without publishing anything:
 
@@ -33,7 +39,7 @@ Prepare the local release directory without publishing anything:
 .\scripts\Publish-Release.ps1
 ```
 
-The script selects the successful CI run for the current commit, downloads its signed MSI, checks the StackFoundry LLC Authenticode identity, confirms the backed-up public key matches the key compiled into resticpal, generates and verifies `appcast.xml` plus `appcast.xml.signature`, and writes checksums below `artifacts/release/v<version>`.
+The script selects only a successful manual or matching `v<version>` tag run for the current commit, downloads its signed MSI, checks the StackFoundry LLC Authenticode identity, confirms the backed-up public key matches the key compiled into resticpal, generates and verifies `appcast.xml` plus `appcast.xml.signature`, and writes checksums below `artifacts/release/v<version>`. Pass `-RunId` to select an explicit signed run.
 
 Review those files. Then publish the GitHub release with reviewed Markdown notes:
 

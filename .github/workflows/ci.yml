@@ -3,6 +3,7 @@ name: Windows CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -51,7 +52,7 @@ jobs:
         run: dotnet build ResticPal.slnx --configuration Debug
 
   package:
-    name: Build signed MSI
+    name: Build Windows MSI
     needs: validate
     runs-on: windows-latest
     timeout-minutes: 45
@@ -62,16 +63,16 @@ jobs:
     # why this binds to an environment rather than a ref.
     environment: release
     env:
-      # Sign on pushes to main and on manual dispatch -- what gets published --
-      # but not on pull requests. Every merge lands on main, so nothing ships
-      # unsigned; a PR artifact is never installed by anyone, and signing each
-      # one would spend four signatures a run out of the Basic tier's 5,000 a
-      # month, most of it on dependency bumps.
+      # Ordinary main and pull-request builds validate the complete unsigned
+      # package without consuming Trusted Signing quota. Authenticode signing
+      # is reserved for a pushed release tag or an intentional manual run.
       #
       # The variable check keeps forks building, unsigned, rather than failing:
       # a fork has neither the variables nor access to the federated credential.
       SIGN_WINDOWS: >-
-        ${{ (github.event_name != 'pull_request' && vars.AZURE_CLIENT_ID != '')
+        ${{ ((github.event_name == 'push' && github.ref_type == 'tag')
+        || github.event_name == 'workflow_dispatch')
+        && vars.AZURE_CLIENT_ID != ''
         && 'true' || 'false' }}
     steps:
       - name: Check out source
@@ -270,8 +271,9 @@ jobs:
       - name: Upload Windows package
         uses: actions/upload-artifact@v7
         with:
-          # Signed when the signing variables are present; a fork build is
-          # still unsigned, hence the neutral name.
+          # Tag/manual artifacts are signed when the repository signing
+          # variables are present; ordinary CI and forks are unsigned, hence
+          # the neutral name.
           name: resticpal-windows-x64
           path: |
             artifacts/installer/output/*.msi

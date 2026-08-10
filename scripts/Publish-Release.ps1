@@ -34,15 +34,20 @@ if ($RunId -eq 0) {
     $runs = @(& gh run list `
         --repo theatrus/resticpal `
         --workflow ci.yml `
-        --branch main `
         --commit $head `
         --status success `
-        --limit 20 `
-        --json databaseId,headSha,conclusion | ConvertFrom-Json)
-    $run = $runs | Where-Object { $_.headSha -ceq $head -and $_.conclusion -eq 'success' } |
+        --limit 50 `
+        --json databaseId,headSha,headBranch,event,conclusion | ConvertFrom-Json)
+    $releaseTag = "v$Version"
+    $run = $runs | Where-Object {
+        $_.headSha -ceq $head -and
+        $_.conclusion -eq 'success' -and
+        ($_.event -eq 'workflow_dispatch' -or $_.headBranch -ceq $releaseTag)
+    } |
         Select-Object -First 1
     if ($null -eq $run) {
-        throw "No successful Windows CI run exists for commit $head."
+        throw ("No successful signed tag/manual Windows CI run exists for commit $head. " +
+               "Dispatch ci.yml manually or push tag $releaseTag, then try again.")
     }
     $RunId = [uint64]$run.databaseId
 }
