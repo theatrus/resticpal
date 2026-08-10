@@ -3,6 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::os::windows::io::AsRawHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,9 @@ use windows::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
     SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, WinBuiltinAdministratorsSid,
 };
-use windows::Win32::Storage::FileSystem::{PIPE_ACCESS_DUPLEX, ReadFile, WriteFile};
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, ImpersonateNamedPipeClient, NAMED_PIPE_MODE, PIPE_NOWAIT,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
@@ -45,6 +48,7 @@ pub struct ClientIdentity {
 pub struct NamedPipeServer {
     name: Vec<u16>,
     security: OwnedSecurityDescriptor,
+    first_instance: AtomicBool,
 }
 
 impl NamedPipeServer {
@@ -56,6 +60,7 @@ impl NamedPipeServer {
         Ok(Self {
             name: wide_null(name),
             security: OwnedSecurityDescriptor::new()?,
+            first_instance: AtomicBool::new(true),
         })
     }
 
@@ -87,12 +92,21 @@ impl NamedPipeServer {
 
     fn accept(&self) -> Result<PipeConnection, NamedPipeError> {
         let attributes = self.security.attributes();
+        // The first instance refuses to start if the pipe name already exists,
+        // so a process that squatted the name before the service booted is
+        // detected instead of silently trusted. Later instances in the serve
+        // loop omit the flag because the earlier instance has already closed.
+        let open_mode = if self.first_instance.swap(false, Ordering::Relaxed) {
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            PIPE_ACCESS_DUPLEX
+        };
         // SAFETY: the pipe name and security descriptor remain valid for the
         // lifetime of the created handle. Remote clients are explicitly rejected.
         let handle = unsafe {
             CreateNamedPipeW(
                 PCWSTR(self.name.as_ptr()),
-                PIPE_ACCESS_DUPLEX,
+                open_mode,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES,
                 PIPE_BUFFER_BYTES,
@@ -420,10 +434,18 @@ impl OwnedSecurityDescriptor {
         // Protected DACL: LocalSystem and elevated administrators have full
         // access; interactive users can read and write requests. The service
         // performs operation-level authorization after connection.
+        //
+        // Interactive users are granted 0x12019B rather than GENERIC_READ |
+        // GENERIC_WRITE. The pipe generic-write mapping folds in bit 0x4
+        // (FILE_CREATE_PIPE_INSTANCE), so `GW` would let any local user stand up
+        // a rogue instance of this pipe and intercept the elevated UI's
+        // secret-bearing requests. The explicit mask keeps read/write data,
+        // read/write attributes, read control, and synchronize while withholding
+        // create-instance, which stays limited to SYSTEM and administrators.
         // SAFETY: SDDL is static, and Windows allocates descriptor on success.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)"),
+                w!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;IU)"),
                 SDDL_REVISION_1,
                 &raw mut descriptor,
                 None,
