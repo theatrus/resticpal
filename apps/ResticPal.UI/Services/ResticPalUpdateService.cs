@@ -1,3 +1,4 @@
+using System.IO;
 using System.Reflection;
 using NetSparkleUpdater;
 using NetSparkleUpdater.Enums;
@@ -133,6 +134,14 @@ internal sealed class ResticPalUpdateService : IDisposable
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(closeApplication);
 
+        // The installer was verified when it downloaded, but it has since sat in
+        // a user-writable temp directory while the user decided whether to
+        // install. A non-elevated same-user process could have swapped it in
+        // that window. Re-verify the pinned Ed25519 signature of the exact file
+        // on disk before this elevated process launches it; an attacker without
+        // the private key cannot produce a file that passes.
+        VerifyDownloadedSignature(update);
+
         string? failure = null;
         bool InstallFailed(InstallUpdateFailureReason reason, string? _)
         {
@@ -165,6 +174,18 @@ internal sealed class ResticPalUpdateService : IDisposable
         {
             updater.InstallUpdateFailed -= InstallFailed;
             updater.CloseApplication -= CloseApplication;
+        }
+    }
+
+    private static void VerifyDownloadedSignature(DownloadedUpdate update)
+    {
+        string signature = update.Update.Item.DownloadSignature ?? string.Empty;
+        var checker = new Ed25519Checker(SecurityMode.Strict, UpdateTrust.PublicKey);
+        if (!File.Exists(update.Path)
+            || checker.VerifySignatureOfFile(signature, update.Path) != ValidationResult.Valid)
+        {
+            throw new InvalidOperationException(
+                "The downloaded update failed signature verification and will not be installed.");
         }
     }
 
