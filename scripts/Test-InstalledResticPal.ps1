@@ -328,10 +328,24 @@ try {
     if ($status.type -ne 'status' -or $status.status.state.state -ne 'unconfigured') {
         throw 'A fresh installed service did not report the expected unconfigured state.'
     }
+    $setupUiLaunchedAfterUpgrade = $false
+    $existingUiProcess = Get-Process -Name 'resticpal-ui' -ErrorAction SilentlyContinue |
+        Where-Object SessionId -eq $interactiveSessionId |
+        Select-Object -First 1
+    if ($null -ne $resolvedUpgradeFromMsiPath `
+        -and $null -eq $existingUiProcess `
+        -and (Test-Path -LiteralPath $onboardingMarker -PathType Leaf)) {
+        Start-Process -FilePath (Join-Path $installRoot 'resticpal-ui.exe') -ArgumentList '--setup'
+        $setupUiLaunchedAfterUpgrade = $true
+    }
     $uiProcess = Wait-InteractiveProcess 'resticpal-ui' ([TimeSpan]::FromSeconds(30))
     Wait-Path $onboardingMarker ([TimeSpan]::FromSeconds(30))
     $onboardingMarkerCreatedByTest = $true
-    Write-Host "First-run setup process $($uiProcess.Id) opened for bootstrap or local configuration."
+    if ($setupUiLaunchedAfterUpgrade) {
+        Write-Host "Upgrade preserved the first-run marker; explicit setup process $($uiProcess.Id) opened correctly."
+    } else {
+        Write-Host "First-run setup process $($uiProcess.Id) opened for bootstrap or local configuration."
+    }
     Stop-Process -Id $uiProcess.Id -Force
     $uiProcess.WaitForExit(10000) | Out-Null
     Start-Process -FilePath $startMenuShortcut
