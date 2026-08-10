@@ -596,9 +596,7 @@ fn finish_outcome(
     // summary is genuinely missing.
     let Some(summary) = parsed.summary else {
         return match status.code() {
-            Some(0) if parsed.invalid_message => {
-                BackupOutcome::failed("restic_output_invalid")
-            }
+            Some(0) if parsed.invalid_message => BackupOutcome::failed("restic_output_invalid"),
             Some(0) => BackupOutcome::failed("restic_summary_missing"),
             Some(code) => BackupOutcome::failed(
                 classify_stderr(stderr)
@@ -1026,8 +1024,7 @@ mod tests {
 
         // A status line larger than MAX_JSON_LINE_BYTES is dropped as oversized,
         // followed by a valid summary from a clean restic exit.
-        let mut output =
-            br#"{"message_type":"status","files_done":1,"note":""#.to_vec();
+        let mut output = br#"{"message_type":"status","files_done":1,"note":""#.to_vec();
         output.resize(output.len() + MAX_JSON_LINE_BYTES + 16, b'x');
         output.extend_from_slice(br#""}"#);
         output.push(b'\n');
@@ -1038,7 +1035,10 @@ mod tests {
         let (progress_tx, _progress_rx) = mpsc::sync_channel(1);
 
         let parsed = read_json_output(output.as_slice(), &progress_tx).expect("read output");
-        assert!(parsed.invalid_message, "oversized line marks invalid_message");
+        assert!(
+            parsed.invalid_message,
+            "oversized line marks invalid_message"
+        );
         assert!(parsed.summary.is_some(), "summary still parses");
 
         let outcome = finish_outcome(ExitStatus::from_raw(0), Ok(parsed), b"");
