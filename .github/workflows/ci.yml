@@ -1,0 +1,101 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
+
+      - name: Install pinned .NET SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build WinUI application
+        run: dotnet build ResticPal.slnx --configuration Debug
+
+  package:
+    name: Build unsigned MSI
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.0 --profile minimal
+
+      - name: Install pinned .NET SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 6.0.1
+          wix extension add -g WixToolset.Util.wixext/6.0.1
+
+      - name: Build and validate MSI
+        shell: pwsh
+        run: ./scripts/Build-Installer.ps1
+
+      - name: Inspect packaged payload
+        shell: pwsh
+        run: ./scripts/Test-InstallerPackage.ps1
+
+      - name: Generate SHA-256 checksums
+        shell: pwsh
+        run: |
+          $outputRoot = Join-Path $PWD 'artifacts/installer/output'
+          $lines = Get-ChildItem -LiteralPath $outputRoot -File |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash *$($_.Name)"
+            }
+          $lines | Set-Content -LiteralPath (Join-Path $outputRoot 'SHA256SUMS.txt') -Encoding ascii
+
+      - name: Upload unsigned Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: resticpal-windows-x64-unsigned
+          path: |
+            artifacts/installer/output/*.msi
+            artifacts/installer/output/*.wixpdb
+            artifacts/installer/output/SHA256SUMS.txt
+            LICENSE
+            THIRD-PARTY-NOTICES.md
+          if-no-files-found: error
+          retention-days: 14

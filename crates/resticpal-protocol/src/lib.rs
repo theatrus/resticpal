@@ -49,6 +49,9 @@ pub enum RequestCommand {
     GetRunHistory {
         limit: u16,
     },
+    GetDiagnostics {
+        limit: u16,
+    },
     GetBackupSources,
     DiscoverBackupSources,
     UpdateBackupSources {
@@ -72,6 +75,14 @@ pub enum RequestCommand {
         wake_lock_timeout_seconds: Option<u64>,
         allow_on_battery: Option<bool>,
         allow_metered_network: Option<bool>,
+    },
+    GetRetention,
+    UpdateRetention {
+        daily: Option<u32>,
+        weekly: Option<u32>,
+        monthly: Option<u32>,
+        yearly: Option<u32>,
+        prune_interval_days: Option<u32>,
     },
     RunBackupNow,
     CancelBackup,
@@ -135,6 +146,12 @@ pub enum ResponsePayload {
     },
     Schedule {
         configuration: ScheduleView,
+    },
+    Retention {
+        configuration: RetentionView,
+    },
+    Diagnostics {
+        entries: Vec<DiagnosticEntry>,
     },
     Accepted {
         message: String,
@@ -236,6 +253,44 @@ pub struct ScheduleView {
     pub wake_lock_timeout_seconds_locked: bool,
     pub allow_on_battery_locked: bool,
     pub allow_metered_network_locked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionView {
+    pub repository_mode: RepositoryMode,
+    pub daily: u32,
+    pub weekly: u32,
+    pub monthly: u32,
+    pub yearly: u32,
+    pub prune_interval_days: u32,
+    pub daily_locked: bool,
+    pub weekly_locked: bool,
+    pub monthly_locked: bool,
+    pub yearly_locked: bool,
+    pub prune_interval_days_locked: bool,
+    pub last_retention: Option<DateTime<Utc>>,
+    pub last_prune: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticLevel {
+    Information,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticEntry {
+    pub timestamp: DateTime<Utc>,
+    pub level: DiagnosticLevel,
+    pub event_id: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +412,17 @@ mod tests {
     #[test]
     fn bounded_history_request_round_trips() {
         let request = Request::new(43, RequestCommand::GetRunHistory { limit: 50 });
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &request).expect("request should serialize");
+        let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn bounded_diagnostics_request_round_trips() {
+        let request = Request::new(44, RequestCommand::GetDiagnostics { limit: 50 });
         let mut bytes = Vec::new();
 
         write_frame(&mut bytes, &request).expect("request should serialize");
@@ -526,6 +592,26 @@ mod tests {
                 wake_lock_timeout_seconds: Some(7_200),
                 allow_on_battery: Some(false),
                 allow_metered_network: Some(true),
+            },
+        );
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &request).expect("request should serialize");
+        let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn typed_retention_update_round_trips() {
+        let request = Request::new(
+            105,
+            RequestCommand::UpdateRetention {
+                daily: Some(14),
+                weekly: Some(8),
+                monthly: None,
+                yearly: None,
+                prune_interval_days: Some(14),
             },
         );
         let mut bytes = Vec::new();

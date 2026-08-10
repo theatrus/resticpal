@@ -139,7 +139,7 @@ function Wait-RepositoryOperation([string] $Operation, [TimeSpan] $Timeout) {
     throw "Timed out waiting for repository $Operation."
 }
 
-function Wait-Backup([TimeSpan] $Timeout) {
+function Wait-Backup([TimeSpan] $Timeout, [string] $PreviousSnapshotId = '') {
     $deadline = [DateTime]::UtcNow + $Timeout
     do {
         $payload = Invoke-ResticPalRequest @{ type = 'get_run_history'; limit = 10 }
@@ -148,6 +148,10 @@ function Wait-Backup([TimeSpan] $Timeout) {
         }
         if ($payload.runs.Count -gt 0) {
             $run = $payload.runs[0]
+            if (-not [string]::IsNullOrWhiteSpace($PreviousSnapshotId) -and $run.snapshot_id -eq $PreviousSnapshotId) {
+                Start-Sleep -Milliseconds 500
+                continue
+            }
             if ($run.outcome -ne 'succeeded') {
                 throw "Installed-service backup failed: $($run.outcome) $($run.error_code)"
             }
@@ -159,6 +163,22 @@ function Wait-Backup([TimeSpan] $Timeout) {
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'Timed out waiting for the installed-service backup.'
+}
+
+function Wait-DiagnosticEvents([string[]] $EventIds, [TimeSpan] $Timeout) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    do {
+        $payload = Invoke-ResticPalRequest @{ type = 'get_diagnostics'; limit = 100 }
+        if ($payload.type -ne 'diagnostics') {
+            throw 'The service did not return operational diagnostics.'
+        }
+        $observed = @($payload.entries.event_id)
+        if (@($EventIds | Where-Object { $observed -notcontains $_ }).Count -eq 0) {
+            return $payload
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for diagnostic events: $($EventIds -join ', ')"
 }
 
 if ($null -ne (Get-Service -Name ResticPal -ErrorAction SilentlyContinue)) {
@@ -242,7 +262,49 @@ try {
         throw "The service rejected 'run_backup_now': $($runRequest.code) $($runRequest.message)"
     }
     $run = Wait-Backup ([TimeSpan]::FromMinutes(3))
-    Write-Host "Backup snapshot $($run.snapshot_id) completed through the installed service."
+    Write-Host "Append-only backup snapshot $($run.snapshot_id) completed through the installed service."
+
+    $appendOnlyRetention = Invoke-ResticPalRequest @{ type = 'get_retention' }
+    if ($appendOnlyRetention.type -ne 'retention' -or $appendOnlyRetention.configuration.repository_mode -ne 'append_only') {
+        throw 'The installed service did not report server-managed append-only retention.'
+    }
+    $appendOnlyUpdate = Invoke-ResticPalRequest @{
+        type = 'update_retention'
+        daily = 14
+        weekly = $null
+        monthly = $null
+        yearly = $null
+        prune_interval_days = $null
+    }
+    if ($appendOnlyUpdate.type -ne 'rejected' -or $appendOnlyUpdate.code -ne 'retention_managed_by_server') {
+        throw 'The installed service allowed local retention changes in append-only mode.'
+    }
+
+    Assert-Accepted @{
+        type = 'update_repository'
+        display_name = $null
+        url = $null
+        mode = 'standard'
+        options = $null
+        secret_updates = @()
+    }
+    Set-Content -LiteralPath (Join-Path $sourceRoot 'second-document.txt') -Value 'standard retention end-to-end data' -NoNewline
+    Assert-Accepted @{ type = 'run_backup_now' }
+    $standardRun = Wait-Backup ([TimeSpan]::FromMinutes(3)) $run.snapshot_id
+    $retention = Invoke-ResticPalRequest @{ type = 'get_retention' }
+    if ($retention.type -ne 'retention' `
+        -or $retention.configuration.repository_mode -ne 'standard' `
+        -or $null -eq $retention.configuration.last_retention `
+        -or $null -eq $retention.configuration.last_prune `
+        -or $null -ne $retention.configuration.last_error) {
+        throw 'Standard-mode retention and prune state was not recorded after backup.'
+    }
+    $diagnostics = Wait-DiagnosticEvents @('retention.succeeded', 'backup.succeeded') ([TimeSpan]::FromSeconds(10))
+    $diagnosticJson = $diagnostics | ConvertTo-Json -Compress -Depth 12
+    if ($diagnosticJson.Contains($sourceRoot) -or $diagnosticJson.Contains($backupRoot)) {
+        throw 'Operational diagnostics disclosed a source or repository path.'
+    }
+    Write-Host "Standard backup snapshot $($standardRun.snapshot_id) completed with local retention and prune."
 
     Restart-Service -Name ResticPal -Force
     (Get-Service -Name ResticPal).WaitForStatus(
@@ -250,8 +312,13 @@ try {
         [TimeSpan]::FromSeconds(30)
     )
     $historyAfterRestart = Invoke-ResticPalRequest @{ type = 'get_run_history'; limit = 1 }
-    if ($historyAfterRestart.runs.Count -ne 1 -or $historyAfterRestart.runs[0].snapshot_id -ne $run.snapshot_id) {
+    if ($historyAfterRestart.runs.Count -ne 1 -or $historyAfterRestart.runs[0].snapshot_id -ne $standardRun.snapshot_id) {
         throw 'Backup history did not survive the installed service restart.'
+    }
+    $retentionAfterRestart = Invoke-ResticPalRequest @{ type = 'get_retention' }
+    if ($null -eq $retentionAfterRestart.configuration.last_retention `
+        -or $null -eq $retentionAfterRestart.configuration.last_prune) {
+        throw 'Retention state did not survive the installed service restart.'
     }
     $testReachedPersistenceCheck = $true
 } finally {

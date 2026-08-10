@@ -412,7 +412,11 @@ fn fetch_status_tooltip() -> std::result::Result<String, NamedPipeError> {
         | ResponsePayload::BackupSources { .. }
         | ResponsePayload::DiscoveredBackupSources { .. }
         | ResponsePayload::Repository { .. }
-        | ResponsePayload::Schedule { .. } => "resticpal: unexpected service response".to_owned(),
+        | ResponsePayload::Schedule { .. }
+        | ResponsePayload::Retention { .. }
+        | ResponsePayload::Diagnostics { .. } => {
+            "resticpal: unexpected service response".to_owned()
+        }
     })
 }
 

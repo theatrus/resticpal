@@ -16,6 +16,8 @@ pub const MAX_REPOSITORY_OPTIONS: usize = 64;
 pub const MAX_REPOSITORY_OPTION_VALUE_CHARACTERS: usize = 4 * 1_024;
 pub const MAX_SECRET_REFERENCE_BYTES: usize = 64;
 pub const MAX_SCHEDULE_INTERVAL_HOURS: u32 = 24 * 365;
+pub const MAX_RETENTION_COUNT: u32 = 10_000;
+pub const MAX_PRUNE_INTERVAL_DAYS: u32 = 365;
 pub const MAX_MANAGEMENT_URL_CHARACTERS: usize = 8 * 1_024;
 pub const MAX_MANAGEMENT_ID_CHARACTERS: usize = 256;
 pub const MIN_MANAGEMENT_REFRESH_MINUTES: u32 = 5;
@@ -105,6 +107,7 @@ pub struct LocalRetentionConfig {
     pub weekly: Option<u32>,
     pub monthly: Option<u32>,
     pub yearly: Option<u32>,
+    pub prune_interval_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,6 +398,29 @@ impl EffectiveConfig {
             }
         }
 
+        let retention = &self.retention;
+        if [
+            retention.daily,
+            retention.weekly,
+            retention.monthly,
+            retention.yearly,
+        ]
+        .iter()
+        .any(|count| *count > MAX_RETENTION_COUNT)
+        {
+            return Err(ConfigValidationError::InvalidRetentionCount);
+        }
+        if retention.daily == 0
+            && retention.weekly == 0
+            && retention.monthly == 0
+            && retention.yearly == 0
+        {
+            return Err(ConfigValidationError::EmptyRetentionPolicy);
+        }
+        if !(1..=MAX_PRUNE_INTERVAL_DAYS).contains(&retention.prune_interval_days) {
+            return Err(ConfigValidationError::InvalidPruneInterval);
+        }
+
         Ok(())
     }
 
@@ -446,6 +472,7 @@ pub struct RetentionConfig {
     pub weekly: u32,
     pub monthly: u32,
     pub yearly: u32,
+    pub prune_interval_days: u32,
 }
 
 impl Default for RetentionConfig {
@@ -455,6 +482,7 @@ impl Default for RetentionConfig {
             weekly: 5,
             monthly: 12,
             yearly: 3,
+            prune_interval_days: 7,
         }
     }
 }
@@ -552,6 +580,12 @@ pub enum ConfigValidationError {
     TooManyRepositoryOptions,
     #[error("secret reference IDs must contain 1-64 lowercase letters, digits, or hyphens")]
     InvalidSecretReference,
+    #[error("retention counts must be between zero and {MAX_RETENTION_COUNT}")]
+    InvalidRetentionCount,
+    #[error("retention must keep at least one daily, weekly, monthly, or yearly snapshot")]
+    EmptyRetentionPolicy,
+    #[error("prune interval must be between one and {MAX_PRUNE_INTERVAL_DAYS} days")]
+    InvalidPruneInterval,
 }
 
 #[cfg(test)]
@@ -571,6 +605,33 @@ mod tests {
         assert_eq!(config.retention.weekly, 5);
         assert_eq!(config.retention.monthly, 12);
         assert_eq!(config.retention.yearly, 3);
+        assert_eq!(config.retention.prune_interval_days, 7);
+    }
+
+    #[test]
+    fn retention_policy_is_bounded_and_never_empty() {
+        let mut config = EffectiveConfig::default();
+        config.retention.daily = MAX_RETENTION_COUNT + 1;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidRetentionCount)
+        );
+
+        config.retention.daily = 0;
+        config.retention.weekly = 0;
+        config.retention.monthly = 0;
+        config.retention.yearly = 0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::EmptyRetentionPolicy)
+        );
+
+        config.retention.daily = 1;
+        config.retention.prune_interval_days = 0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidPruneInterval)
+        );
     }
 
     #[test]

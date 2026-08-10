@@ -287,6 +287,69 @@ internal sealed class ResticPalServiceClient
             cancellationToken);
     }
 
+    public async Task<RetentionConfiguration> GetRetentionAsync(
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(new { type = "get_retention" }, cancellationToken);
+        RequirePayloadType(payload, "retention");
+        JsonElement configuration = payload.GetProperty("configuration");
+        return new RetentionConfiguration(
+            configuration.GetProperty("repository_mode").GetString() ?? "standard",
+            configuration.GetProperty("daily").GetUInt32(),
+            configuration.GetProperty("weekly").GetUInt32(),
+            configuration.GetProperty("monthly").GetUInt32(),
+            configuration.GetProperty("yearly").GetUInt32(),
+            configuration.GetProperty("prune_interval_days").GetUInt32(),
+            configuration.GetProperty("daily_locked").GetBoolean(),
+            configuration.GetProperty("weekly_locked").GetBoolean(),
+            configuration.GetProperty("monthly_locked").GetBoolean(),
+            configuration.GetProperty("yearly_locked").GetBoolean(),
+            configuration.GetProperty("prune_interval_days_locked").GetBoolean(),
+            ReadOptionalDateTimeOffset(configuration, "last_retention"),
+            ReadOptionalDateTimeOffset(configuration, "last_prune"),
+            ReadOptionalString(configuration, "last_error"));
+    }
+
+    public async Task<CommandResult> UpdateRetentionAsync(
+        uint? daily,
+        uint? weekly,
+        uint? monthly,
+        uint? yearly,
+        uint? pruneIntervalDays,
+        CancellationToken cancellationToken = default)
+    {
+        return await SendCommandAsync(
+            new
+            {
+                type = "update_retention",
+                daily,
+                weekly,
+                monthly,
+                yearly,
+                prune_interval_days = pruneIntervalDays,
+            },
+            cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<DiagnosticRecord>> GetDiagnosticsAsync(
+        ushort limit = 100,
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(
+            new { type = "get_diagnostics", limit },
+            cancellationToken);
+        RequirePayloadType(payload, "diagnostics");
+        return payload.GetProperty("entries")
+            .EnumerateArray()
+            .Select(entry => new DiagnosticRecord(
+                entry.GetProperty("timestamp").GetDateTimeOffset(),
+                entry.GetProperty("level").GetString() ?? "information",
+                entry.GetProperty("event_id").GetString() ?? "service.unknown",
+                entry.GetProperty("message").GetString() ?? "Service event.",
+                ReadOptionalString(entry, "code")))
+            .ToArray();
+    }
+
     private static async Task<CommandResult> SendCommandAsync(
         object command,
         CancellationToken cancellationToken)
@@ -431,6 +494,17 @@ internal sealed class ResticPalServiceClient
                 : null;
     }
 
+    private static DateTimeOffset? ReadOptionalDateTimeOffset(
+        JsonElement value,
+        string propertyName)
+    {
+        return value.TryGetProperty(propertyName, out JsonElement property)
+            && property.ValueKind == JsonValueKind.String
+            && property.TryGetDateTimeOffset(out DateTimeOffset timestamp)
+                ? timestamp
+                : null;
+    }
+
     private static RepositoryOperationStatus ReadRepositoryOperationStatus(JsonElement status)
     {
         string state = status.GetProperty("state").GetString() ?? "not_run";
@@ -550,6 +624,29 @@ internal sealed record ScheduleConfiguration(
     bool WakeLockTimeoutSecondsLocked,
     bool AllowOnBatteryLocked,
     bool AllowMeteredNetworkLocked);
+
+internal sealed record RetentionConfiguration(
+    string RepositoryMode,
+    uint Daily,
+    uint Weekly,
+    uint Monthly,
+    uint Yearly,
+    uint PruneIntervalDays,
+    bool DailyLocked,
+    bool WeeklyLocked,
+    bool MonthlyLocked,
+    bool YearlyLocked,
+    bool PruneIntervalDaysLocked,
+    DateTimeOffset? LastRetention,
+    DateTimeOffset? LastPrune,
+    string? LastError);
+
+internal sealed record DiagnosticRecord(
+    DateTimeOffset Timestamp,
+    string Level,
+    string EventId,
+    string Message,
+    string? Code);
 
 internal sealed record RepositorySecretUpdate(
     [property: JsonPropertyName("action")] string Action,

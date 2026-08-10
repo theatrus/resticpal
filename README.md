@@ -57,12 +57,13 @@ All three policy transport paths now have an end-to-end implementation. A one-ti
 - Machine-wide Rust service with startup, resume, power, time-change, and shutdown handling
 - Daily/deadline scheduling, wake grace, battery/network gates, retries, and a two-hour wake-lock safety default
 - Native Rust/Win32 tray status with run-now and cancellation actions
-- On-demand WinUI 3 setup for sources, repository, schedule, status, and backup history
+- On-demand WinUI 3 setup for sources, repository, schedule, retention, status, backup history, and redacted diagnostics
 - Typed, per-field managed policy resolution and UI lock enforcement
 - Plain HTTP/HTTPS manifests, signed Ed25519 manifests, rollback/freshness checks, and offline last-known-good policy
 - Authenticated, bounded device status reporting that cannot make a backup fail
 - Local, S3-compatible, REST, and advanced restic repository configuration
 - Append-only command authorization enforced before process launch
+- Standard-mode snapshot retention after successful backups, with a separate configurable prune cadence
 - DPAPI-encrypted, service-owned credential storage with protected ACLs and opaque references
 - Direct restic execution inside a kill-on-close Windows Job Object, bounded JSON progress, and sanitized outcomes
 - Durable repository validation, scheduler state, and privacy-bounded SQLite run history
@@ -119,6 +120,8 @@ For safer clean-machine testing, run that lifecycle in a disposable local Window
 ```
 
 The Sandbox launcher waits for a machine-readable result and returns the guest transcript and installer logs under `artifacts\windows-sandbox`. Networking is disabled and the source tree is mounted read-only by default. See [the Windows Sandbox testing guide](docs/windows-sandbox-testing.md) for setup, isolation details, and options.
+
+GitHub Actions runs the same Rust and WinUI validation, then builds, validates, administratively extracts, and smoke-tests an x64 MSI. CI artifacts are intentionally named `resticpal-windows-x64-unsigned` and include SHA-256 checksums; code signing and signed update metadata are not part of this workflow yet. The installed-service Windows Sandbox lifecycle remains a local test because GitHub-hosted runners do not expose the nested Sandbox environment used by the harness.
 
 ## For contributors
 

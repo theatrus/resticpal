@@ -188,6 +188,53 @@ impl ResticCommandBuilder {
             secret_environment: config.repository.secret_refs.clone(),
         })
     }
+
+    pub fn retention(
+        &self,
+        config: &EffectiveConfig,
+        operation: ResticOperation,
+    ) -> Result<ResticInvocation, InvocationError> {
+        if !matches!(operation, ResticOperation::Forget | ResticOperation::Prune) {
+            return Err(InvocationError::NotRetentionOperation(operation));
+        }
+        authorize_operation(config.repository.mode, operation)?;
+        config.validate()?;
+        let repository = config
+            .repository
+            .url
+            .as_ref()
+            .ok_or(InvocationError::MissingRepository)?;
+
+        let mut arguments = repository_options(config);
+        match operation {
+            ResticOperation::Forget => {
+                arguments.extend([
+                    "forget".into(),
+                    "--keep-daily".into(),
+                    config.retention.daily.to_string().into(),
+                    "--keep-weekly".into(),
+                    config.retention.weekly.to_string().into(),
+                    "--keep-monthly".into(),
+                    config.retention.monthly.to_string().into(),
+                    "--keep-yearly".into(),
+                    config.retention.yearly.to_string().into(),
+                ]);
+            }
+            ResticOperation::Prune => arguments.push("prune".into()),
+            _ => unreachable!("operation was checked above"),
+        }
+
+        Ok(ResticInvocation {
+            operation,
+            executable: self.executable.clone(),
+            arguments,
+            environment: BTreeMap::from([(
+                OsString::from("RESTIC_REPOSITORY"),
+                OsString::from(repository),
+            )]),
+            secret_environment: config.repository.secret_refs.clone(),
+        })
+    }
 }
 
 pub fn authorize_operation(
@@ -227,6 +274,8 @@ pub enum InvocationError {
     NotInspectionOperation(ResticOperation),
     #[error("{0:?} is not a repository setup operation")]
     NotRepositorySetupOperation(ResticOperation),
+    #[error("{0:?} is not a retention operation")]
+    NotRetentionOperation(ResticOperation),
 }
 
 #[cfg(test)]
@@ -349,5 +398,57 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn standard_retention_builds_separate_forget_and_prune_invocations() {
+        let config = configured(RepositoryMode::Standard);
+        let builder = ResticCommandBuilder::new("restic.exe");
+        let forget = builder
+            .retention(&config, ResticOperation::Forget)
+            .expect("forget");
+        let arguments: Vec<_> = forget
+            .arguments
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            arguments,
+            [
+                "--option",
+                "s3.region=us-west-2",
+                "forget",
+                "--keep-daily",
+                "7",
+                "--keep-weekly",
+                "5",
+                "--keep-monthly",
+                "12",
+                "--keep-yearly",
+                "3",
+            ]
+        );
+
+        let prune = builder
+            .retention(&config, ResticOperation::Prune)
+            .expect("prune");
+        assert_eq!(
+            prune.arguments,
+            ["--option", "s3.region=us-west-2", "prune"].map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn append_only_builder_rejects_retention() {
+        let config = configured(RepositoryMode::AppendOnly);
+        let result =
+            ResticCommandBuilder::new("restic.exe").retention(&config, ResticOperation::Forget);
+        assert!(matches!(
+            result,
+            Err(InvocationError::ForbiddenByRepositoryMode {
+                mode: RepositoryMode::AppendOnly,
+                operation: ResticOperation::Forget
+            })
+        ));
     }
 }

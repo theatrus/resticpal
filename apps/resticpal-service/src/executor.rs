@@ -33,6 +33,7 @@ use crate::power_request::TimedSystemPowerRequest;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REPOSITORY_OPERATION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
+const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_PENDING_PROGRESS_EVENTS: usize = 16;
 const INHERITED_ENVIRONMENT: &[&str] = &[
     "SystemRoot",
@@ -173,6 +174,56 @@ impl ResticExecutor {
         self.execute_repository_invocation(&invocation, REPOSITORY_OPERATION_TIMEOUT, cancellation)
     }
 
+    pub fn retention(
+        &self,
+        config: &EffectiveConfig,
+        prune_due: bool,
+        cancellation: &CancellationToken,
+    ) -> RetentionOutcome {
+        let timeout = Duration::from_secs(config.schedule.wake_lock_timeout_seconds);
+        let builder = ResticCommandBuilder::new(self.executable.as_ref());
+        let forget = match builder.retention(config, ResticOperation::Forget) {
+            Ok(invocation) => invocation,
+            Err(_) => return RetentionOutcome::failed("retention_forbidden"),
+        };
+        match self
+            .execute_repository_invocation(&forget, timeout, cancellation)
+            .kind
+        {
+            RepositoryOutcomeKind::Succeeded => {}
+            RepositoryOutcomeKind::Cancelled => return RetentionOutcome::cancelled(),
+            RepositoryOutcomeKind::Failed { code } => {
+                return RetentionOutcome::failed(if code == "repository_operation_failed" {
+                    "retention_forget_failed"
+                } else {
+                    &code
+                });
+            }
+        }
+        if !prune_due {
+            return RetentionOutcome::succeeded(false);
+        }
+
+        let prune = match builder.retention(config, ResticOperation::Prune) {
+            Ok(invocation) => invocation,
+            Err(_) => return RetentionOutcome::failed("retention_forbidden"),
+        };
+        match self
+            .execute_repository_invocation(&prune, timeout, cancellation)
+            .kind
+        {
+            RepositoryOutcomeKind::Succeeded => RetentionOutcome::succeeded(true),
+            RepositoryOutcomeKind::Cancelled => RetentionOutcome::cancelled(),
+            RepositoryOutcomeKind::Failed { code } => {
+                RetentionOutcome::failed(if code == "repository_operation_failed" {
+                    "retention_prune_failed"
+                } else {
+                    &code
+                })
+            }
+        }
+    }
+
     fn execute_repository_invocation(
         &self,
         invocation: &ResticInvocation,
@@ -217,7 +268,7 @@ impl ResticExecutor {
             None => return RepositoryOutcome::failed("restic_output_unavailable"),
         };
         let stdout_thread = thread::spawn(move || drain(stdout));
-        let stderr_thread = thread::spawn(move || drain(stderr));
+        let stderr_thread = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
         let started = Instant::now();
         let mut cancelled = false;
         let mut timed_out = false;
@@ -241,7 +292,7 @@ impl ResticExecutor {
             }
         };
         let _ = stdout_thread.join();
-        let _ = stderr_thread.join();
+        let stderr = stderr_thread.join().unwrap_or_default();
 
         if cancelled {
             return RepositoryOutcome::cancelled();
@@ -257,8 +308,10 @@ impl ResticExecutor {
             return RepositoryOutcome::succeeded();
         }
 
+        let classified = classify_stderr(&stderr);
         let code = match (invocation.operation, status.code()) {
             (ResticOperation::Probe, Some(10)) => "repository_not_found",
+            (_, _) if classified.is_some() => classified.expect("classification was checked"),
             (ResticOperation::Probe, _) => "repository_validation_failed",
             (ResticOperation::Initialize, _) => "repository_initialization_failed",
             _ => "repository_operation_failed",
@@ -312,7 +365,7 @@ impl ResticExecutor {
         };
         let (output_tx, output_rx) = mpsc::sync_channel(MAX_PENDING_PROGRESS_EVENTS);
         let stdout_thread = thread::spawn(move || read_json_output(stdout, &output_tx));
-        let stderr_thread = thread::spawn(move || drain(stderr));
+        let stderr_thread = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
 
         let mut cancelled = false;
         let status = loop {
@@ -335,7 +388,7 @@ impl ResticExecutor {
         };
 
         let output_result = stdout_thread.join().unwrap_or(Err(OutputReadError));
-        let _ = stderr_thread.join();
+        let stderr = stderr_thread.join().unwrap_or_default();
         collect_progress_events(&output_rx, &mut on_progress);
         if cancelled {
             return BackupOutcome::cancelled();
@@ -344,7 +397,7 @@ impl ResticExecutor {
             Ok(status) => status,
             Err(()) => return BackupOutcome::failed("restic_wait_failed"),
         };
-        finish_outcome(status, output_result)
+        finish_outcome(status, output_result, &stderr)
     }
 
     fn resolve_secrets(
@@ -400,6 +453,7 @@ pub struct BackupSummary {
 pub struct BackupOutcome {
     pub kind: BackupOutcomeKind,
     pub summary: Option<BackupSummary>,
+    pub warning_code: Option<String>,
 }
 
 impl BackupOutcome {
@@ -407,13 +461,15 @@ impl BackupOutcome {
         Self {
             kind: BackupOutcomeKind::Succeeded,
             summary: Some(summary),
+            warning_code: None,
         }
     }
 
-    pub(crate) fn warnings(summary: BackupSummary) -> Self {
+    pub(crate) fn warnings(summary: BackupSummary, code: impl Into<String>) -> Self {
         Self {
             kind: BackupOutcomeKind::SucceededWithWarnings,
             summary: Some(summary),
+            warning_code: Some(code.into()),
         }
     }
 
@@ -421,6 +477,7 @@ impl BackupOutcome {
         Self {
             kind: BackupOutcomeKind::Failed { code: code.into() },
             summary: None,
+            warning_code: None,
         }
     }
 
@@ -428,7 +485,19 @@ impl BackupOutcome {
         Self {
             kind: BackupOutcomeKind::Cancelled,
             summary: None,
+            warning_code: None,
         }
+    }
+
+    pub(crate) fn with_warning(mut self, code: impl Into<String>) -> Self {
+        if matches!(
+            self.kind,
+            BackupOutcomeKind::Succeeded | BackupOutcomeKind::SucceededWithWarnings
+        ) {
+            self.kind = BackupOutcomeKind::SucceededWithWarnings;
+            self.warning_code = Some(code.into());
+        }
+        self
     }
 }
 
@@ -474,9 +543,44 @@ pub enum RepositoryOutcomeKind {
     Cancelled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionOutcome {
+    pub kind: RetentionOutcomeKind,
+}
+
+impl RetentionOutcome {
+    fn succeeded(pruned: bool) -> Self {
+        Self {
+            kind: RetentionOutcomeKind::Succeeded { pruned },
+        }
+    }
+
+    fn failed(code: &str) -> Self {
+        Self {
+            kind: RetentionOutcomeKind::Failed {
+                code: code.to_owned(),
+            },
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            kind: RetentionOutcomeKind::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetentionOutcomeKind {
+    Succeeded { pruned: bool },
+    Failed { code: String },
+    Cancelled,
+}
+
 fn finish_outcome(
     status: ExitStatus,
     output_result: Result<ParsedOutput, OutputReadError>,
+    stderr: &[u8],
 ) -> BackupOutcome {
     if status.code() == Some(130) {
         return BackupOutcome::cancelled();
@@ -491,15 +595,74 @@ fn finish_outcome(
     let Some(summary) = parsed.summary else {
         return match status.code() {
             Some(0) => BackupOutcome::failed("restic_summary_missing"),
-            Some(code) => BackupOutcome::failed(format!("restic_exit_{code}")),
+            Some(code) => BackupOutcome::failed(
+                classify_stderr(stderr)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("restic_exit_{code}")),
+            ),
             None => BackupOutcome::failed("restic_terminated"),
         };
     };
     match status.code() {
         Some(0) => BackupOutcome::succeeded(summary),
-        Some(3) => BackupOutcome::warnings(summary),
-        Some(code) => BackupOutcome::failed(format!("restic_exit_{code}")),
+        Some(3) => BackupOutcome::warnings(summary, "restic_partial_source"),
+        Some(code) => BackupOutcome::failed(
+            classify_stderr(stderr)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("restic_exit_{code}")),
+        ),
         None => BackupOutcome::failed("restic_terminated"),
+    }
+}
+
+fn read_bounded(mut reader: impl Read, limit: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(limit.min(8 * 1024));
+    let _ = reader
+        .by_ref()
+        .take(u64::try_from(limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut output);
+    drain(reader);
+    output
+}
+
+fn classify_stderr(stderr: &[u8]) -> Option<&'static str> {
+    let message = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if message.contains("access denied")
+        || message.contains("permission denied")
+        || message.contains("insufficient privilege")
+    {
+        Some("restic_permission_denied")
+    } else if message.contains("shadow copy")
+        || message.contains("volume shadow")
+        || message.contains("vss")
+    {
+        Some("restic_vss_unavailable")
+    } else if message.contains("already locked")
+        || message.contains("repository is locked")
+        || message.contains("unable to create lock")
+    {
+        Some("restic_repository_locked")
+    } else if message.contains("unauthorized")
+        || message.contains("authentication failed")
+        || message.contains("invalid access key")
+        || message.contains("wrong password")
+    {
+        Some("restic_authentication_failed")
+    } else if message.contains("connection refused")
+        || message.contains("connection reset")
+        || message.contains("timed out")
+        || message.contains("timeout")
+        || message.contains("no such host")
+        || message.contains("name resolution")
+    {
+        Some("restic_repository_unreachable")
+    } else if message.contains("no such file or directory")
+        || message.contains("cannot find the path")
+        || message.contains("path does not exist")
+    {
+        Some("restic_source_unavailable")
+    } else {
+        None
     }
 }
 
@@ -803,6 +966,23 @@ mod tests {
     }
 
     #[test]
+    fn stderr_is_reduced_to_allowlisted_diagnostic_codes() {
+        assert_eq!(
+            classify_stderr(br"open C:\Users\Yann\private.txt: Access denied"),
+            Some("restic_permission_denied")
+        );
+        assert_eq!(
+            classify_stderr(b"repository is already locked exclusively"),
+            Some("restic_repository_locked")
+        );
+        assert_eq!(
+            classify_stderr(b"dial tcp: connection refused"),
+            Some("restic_repository_unreachable")
+        );
+        assert_eq!(classify_stderr(b"arbitrary secret output"), None);
+    }
+
+    #[test]
     fn progress_floods_are_dropped_without_losing_the_summary() {
         let mut output = Vec::new();
         for _ in 0..1_000 {
@@ -954,6 +1134,10 @@ mod tests {
         );
 
         assert_eq!(outcome.kind, BackupOutcomeKind::SucceededWithWarnings);
+        assert_eq!(
+            outcome.warning_code.as_deref(),
+            Some("restic_partial_source")
+        );
         assert_eq!(
             outcome.summary.expect("summary").snapshot_id.as_deref(),
             Some("partial")
@@ -1118,7 +1302,7 @@ mod tests {
                 .repository_operation(&config, ResticOperation::Probe, &cancellation)
                 .kind,
             RepositoryOutcomeKind::Failed {
-                code: "repository_validation_failed".to_owned()
+                code: "restic_authentication_failed".to_owned()
             }
         );
 
@@ -1161,6 +1345,12 @@ mod tests {
         assert!(second_summary.data_added > 0);
         assert!(second_summary.snapshot_id.is_some());
         assert_ne!(first_summary.snapshot_id, second_summary.snapshot_id);
+
+        config.repository.mode = RepositoryMode::Standard;
+        assert_eq!(
+            runner.retention(&config, true, &cancellation).kind,
+            RetentionOutcomeKind::Succeeded { pruned: true }
+        );
     }
 
     #[test]

@@ -10,15 +10,15 @@ The repository now contains a buildable x64 Windows vertical slice using Rust 1.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, append-only command authorization, versioned manifest and enrollment payloads, strict Ed25519 envelopes, X25519/HKDF/ChaCha20-Poly1305 secret bootstrap, freshness, and replay checks | Standard-mode retention execution and schema evolution beyond v1 |
-| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository and enrollment credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler checkpoint, bounded SQLite history, bounded shutdown outcome draining, plain/signed manifest fetching, last-known-good cache, runtime policy application, bounded status delivery, one-time enrollment/rotation, unenrollment, and Sandbox-qualified LocalSystem/VSS execution | Windows 10/11 matrix ACL/VSS qualification, direct-file watching, structured logs/audit, and graceful cancellation before escalation |
+| Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, standard-mode retention/prune cadence, append-only command authorization, versioned manifest and enrollment payloads, strict Ed25519 envelopes, X25519/HKDF/ChaCha20-Poly1305 secret bootstrap, freshness, and replay checks | Schema evolution beyond v1 and graceful-first maintenance cancellation |
+| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository and enrollment credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler/retention checkpoint, bounded SQLite history, bounded redacted diagnostic logs, bounded shutdown outcome draining, plain/signed manifest fetching, last-known-good cache, runtime policy application, bounded status delivery, one-time enrollment/rotation, unenrollment, and Sandbox-qualified LocalSystem/VSS execution | Windows 10/11 matrix ACL/VSS qualification, direct-file watching, diagnostic export/audit, and graceful cancellation before escalation |
 | Local IPC | Protocol v3, 1 MiB bounded frames, bounded per-connection I/O, protected named pipe, client-token authorization, ordinary-user status/history/run/cancel/defer, and elevated configuration/enrollment operations | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v3 |
 | Tray | Native Win32 notification icon, current status tooltip, run/cancel action, and elevated UI launch | Push-driven live icon updates, deferral UI, notifications, richer health icons, and startup registration |
-| WinUI application | Overview, backup sources, repository, schedule/power/network, bounded backup history, and managed enrollment/rotation/unenrollment pages | Diagnostics/logs, updates/settings, accessibility and Windows 10 qualification |
+| WinUI application | Overview, backup sources, repository, schedule/power/network, standard/server-managed retention, bounded backup history, redacted diagnostics, and managed enrollment/rotation/unenrollment pages | Updates/settings, accessibility and Windows 10 qualification |
 | Remote management | Plain HTTP/HTTPS manifest mode without reporting; signed HTTPS manifest mode with pinned Ed25519 key, atomic cache, replay/freshness checks, authenticated status delivery; one-time signed enrollment with encrypted credentials; adjacent server with signed manifests, bounded SQLite status, and admin-only maintenance jobs | Conditional requests, enrollment audit/rate limits, and production deployment hardening |
-| Distribution | Per-machine x64 WiX MSI, pinned restic 0.19.1, statically linked Rust CRT, self-contained WinUI payload, LocalSystem service/recovery authoring, ProgramData and bootstrap registry ACL authoring, optional hidden bootstrap property, tray logon registration, data-preserving uninstall, notices, and disposable Sandbox E2E harness | Windows 10/11 installer/VSS matrix, interactive installer bootstrap dialog, Start Menu integration, code signing, complete license generation, update UI/appcast verification, elevated updater, and upgrade/repair matrix |
+| Distribution | Per-machine x64 WiX MSI, pinned restic 0.19.1, statically linked Rust CRT, self-contained WinUI payload, LocalSystem service/recovery authoring, ProgramData and bootstrap registry ACL authoring, optional hidden bootstrap property, tray logon registration, data-preserving uninstall, notices, disposable Sandbox E2E harness, and unsigned GitHub CI package artifacts with checksums | Windows 10/11 installer/VSS matrix, interactive installer bootstrap dialog, Start Menu integration, code signing, complete license generation, update UI/appcast verification, elevated updater, and upgrade/repair matrix |
 
-Current durable state consists of atomic `config.toml`, DPAPI-protected credential files, `state.json` for scheduler/repository-verification state, and lazy `state.db` backup history. The history retains the newest 200 attempts and exposes at most 100 per IPC request; the WinUI page requests 50.
+Current durable state consists of atomic `config.toml`, DPAPI-protected credential files, `state.json` for scheduler/retention/repository-verification state, lazy `state.db` backup history, and rotating structured service logs. The history retains the newest 200 attempts and exposes at most 100 per IPC request; the WinUI page requests 50. Diagnostics rotate at 1 MiB with three archives and expose at most 200 entries per elevated IPC request; the WinUI page requests 100.
 
 ## Product summary
 
@@ -88,7 +88,7 @@ The Rust Windows service is the sole owner of:
 
 No tray or UI process may invoke restic directly.
 
-The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler state, backup history, managed-manifest fetching/caching, runtime policy refresh, authenticated status delivery, and one-time managed enrollment/rotation/unenrollment. Structured logs and update coordination remain planned. The service expects a fixed sibling `restic.exe`; the development MSI now supplies a checksum-verified pinned binary at that location.
+The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler and retention state, backup history, bounded redacted structured diagnostics, managed-manifest fetching/caching, runtime policy refresh, authenticated status delivery, and one-time managed enrollment/rotation/unenrollment. Update coordination remains planned. The service expects a fixed sibling `restic.exe`; the development MSI now supplies a checksum-verified pinned binary at that location.
 
 ### `resticpal-tray.exe`
 
@@ -228,10 +228,11 @@ In standard mode, resticpal may apply local retention and maintenance policy. Th
 - 5 weekly snapshots
 - 12 monthly snapshots
 - 3 yearly snapshots
+- prune unreferenced data every 7 days
 
-Retention will be configurable in the file and UI. The precise default prune cadence is still open; pruning should be scheduled separately from ordinary backup deadlines because it may be expensive.
+Retention is configurable in the file and UI. After each successful standard-mode backup, the service runs an independently constructed `forget` operation with the effective keep counts. It runs a separate `prune` operation only when the persisted seven-day cadence is due because pruning may be expensive.
 
-The retention values and policy-resolution model exist, but retention editing, `forget`, `prune`, and maintenance scheduling are not implemented. Consequently the current standard mode performs backups only.
+Retention counts and prune cadence are bounded, resolved per field, and honor managed-policy locks. Maintenance uses the same cancellation and bounded wake-lock model as backup execution. A maintenance failure is recorded as a sanitized warning and does not misreport the already-created backup snapshot as failed.
 
 ### Append-only/server-maintained mode
 
@@ -341,7 +342,7 @@ The canonical state machine includes:
 - `paused` or administratively disabled
 - `service_unavailable` in clients that cannot reach the service
 
-The implemented canonical service state includes all entries above except client-only `service_unavailable`. Waiting reasons currently cover wake grace, network, battery, metered network, policy backoff, and repository validation. Running status begins in preparation and moves to uploading when JSON progress arrives; finer scanning/finalizing/retention/checking phase reporting is still planned.
+The implemented canonical service state includes all entries above except client-only `service_unavailable`. Waiting reasons currently cover wake grace, network, battery, metered network, policy backoff, and repository validation. Running status begins in preparation, moves to uploading when JSON progress arrives, and enters retention while standard-mode maintenance runs; finer scanning/finalizing/checking phase reporting is still planned.
 
 The complete tray and UI status surface will expose:
 
@@ -358,7 +359,7 @@ The complete tray and UI status surface will expose:
 
 Tray notifications should be useful rather than noisy: notify on an initial failure, repeated/stale protection, user action required, and recovery after a failure streak. Exact notification thresholds are proposed behavior and should be user configurable.
 
-The current local status protocol exposes redacted state, repository name/mode, last attempt/success, deadline/blocker, bounded progress, and redacted management enrollment state. The overview and tray reduce backup state to a friendly health summary and current progress. The WinUI History page exposes timestamps, duration, outcome, aggregate file/byte statistics, sanitized error code, and snapshot ID for the newest 50 records; Settings provides enrollment, rotation, and unenrollment. Version, update, detailed diagnostic, and notification surfaces remain planned.
+The current local status protocol exposes redacted state, repository name/mode, last attempt/success, deadline/blocker, bounded progress, retention configuration/state, bounded structured diagnostics, and redacted management enrollment state. The overview and tray reduce backup state to a friendly health summary and current progress. The WinUI History page exposes timestamps, duration, outcome, aggregate file/byte statistics, sanitized error code, and snapshot ID for the newest 50 records; Diagnostics exposes the newest 100 fixed-message events to an administrator without paths or raw restic output; Settings provides enrollment, rotation, and unenrollment. Version, update, diagnostic export, and notification surfaces remain planned.
 
 ## Remote status reporting
 
@@ -472,7 +473,7 @@ The service-only execution boundary, shell-free command construction, typed opti
    - Standard retention and append-only/server-maintained mode.
    - Configuration file reload and per-field managed locks.
 
-   Create/connect, S3/advanced configuration, append-only enforcement, typed policy precedence, per-field lock enforcement, plain/signed manifest ingestion, and live remote policy application are implemented. Standard client-side retention UI/execution and live local-file reload remain.
+   Create/connect, S3/advanced configuration, append-only enforcement, typed policy precedence, per-field lock enforcement, plain/signed manifest ingestion, live remote policy application, and standard client-side retention UI/execution are implemented. Live local-file reload remains.
 
 4. **Enrollment and reporting — functional alpha**
    Plain-file mode, signed-envelope verification, replay/freshness checks, atomic cache fallback, authenticated status delivery, one-time bootstrap, generated device identity, encrypted secret bootstrap, installer staging, UI enrollment/rotation/unenrollment, schemas, tests, and the companion server are implemented. Conditional requests, audit retention, rate limits, and production deployment hardening remain.
@@ -480,11 +481,11 @@ The service-only execution boundary, shell-free command construction, typed opti
 5. **Packaging and updates — installer prototype**
    - WiX MSI, startup registration, upgrade/repair/uninstall behavior, NetSparkle appcast verification, and elevated atomic updater.
 
-   The x64 MSI, service/tray registration, bundled restic, data-preserving uninstall authoring, validation, and E2E harness exist. Privileged execution, upgrade/repair qualification, installer UX/bootstrap, signing, and the updater remain.
+   The x64 MSI, service/tray registration, bundled restic, data-preserving uninstall authoring, validation, Sandbox E2E harness, and unsigned GitHub CI package workflow exist. Windows-version/VSS and upgrade/repair qualification, installer UX/bootstrap, signing, and the updater remain.
 
 ## Required test themes
 
-The automated Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, policy precedence and locks, command construction, append-only authorization, configuration bounds, signed-manifest tampering/expiry/replay, plain-HTTP fetch and offline cache recovery, named-pipe framing/ACL/token checks, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, and SQLite history retention/redaction/restart behavior. The server baseline covers constant-time token authentication, API manifest/status round trips, bounded SQLite state, configuration allowlists, and maintenance environment isolation. Two additional ignored, opt-in real-restic tests create disposable local repositories. The MSI is release-build, ICE, administrative-image, payload-hash, restic-version, and packaged-service console validated. The elevated installed-service lifecycle is implemented but still awaiting execution across the local UAC boundary. The WinUI project is build-validated but does not yet have an automated UI test suite.
+The automated Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, policy precedence and locks, standard retention/prune construction and state, append-only authorization, configuration bounds, bounded/redacted diagnostics, signed-manifest tampering/expiry/replay, plain-HTTP fetch and offline cache recovery, named-pipe framing/ACL/token checks, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, and SQLite history retention/redaction/restart behavior. The server baseline covers constant-time token authentication, API manifest/status round trips, bounded SQLite state, configuration allowlists, and maintenance environment isolation. Two ignored, opt-in real-restic tests create disposable local repositories; the non-VSS path also executes real `forget` and `prune`. The MSI is release-build, ICE, administrative-image, payload-hash, restic-version, and packaged-service console validated. The elevated installed-service lifecycle passed in a disposable Windows 11 Sandbox on build 26100. The WinUI project is build-validated but does not yet have an automated UI test suite.
 
 The following themes remain required as their corresponding product areas land:
 

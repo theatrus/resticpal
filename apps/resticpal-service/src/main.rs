@@ -1,6 +1,7 @@
 mod atomic_file;
 mod conditions;
 mod config_store;
+mod diagnostics;
 mod executor;
 mod history;
 mod management;
@@ -30,6 +31,7 @@ use executor::{
 };
 use resticpal_core::restic::ResticOperation;
 use resticpal_core::status::BackupState;
+use resticpal_protocol::DiagnosticLevel;
 use resticpal_protocol::RepositoryOperationKind;
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::{DEFAULT_PIPE_NAME, NamedPipeServer};
@@ -177,6 +179,12 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
             ))
         }
     };
+    runtime.record_diagnostic(
+        DiagnosticLevel::Information,
+        "service.started",
+        "The resticpal service started.",
+        None,
+    );
     match staged_bootstrap_url() {
         Ok(Some(url)) => match runtime.enroll_bootstrap(&url) {
             Ok(()) => {
@@ -224,6 +232,13 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
         executor,
         event_tx,
         &status_handle,
+    );
+
+    runtime.record_diagnostic(
+        DiagnosticLevel::Information,
+        "service.stopped",
+        "The resticpal service stopped.",
+        None,
     );
 
     status_handle.set_service_status(ScmServiceStatus {
@@ -583,9 +598,24 @@ fn start_backup_worker(
         .name("resticpal-backup".to_owned())
         .spawn(move || {
             let config = runtime.config();
-            let outcome = executor.backup(&config, &cancellation, |progress| {
+            runtime.record_diagnostic(
+                DiagnosticLevel::Information,
+                "backup.started",
+                "Backup started.",
+                None,
+            );
+            let mut outcome = executor.backup(&config, &cancellation, |progress| {
                 runtime.update_progress(progress);
             });
+            if matches!(
+                &outcome.kind,
+                executor::BackupOutcomeKind::Succeeded
+                    | executor::BackupOutcomeKind::SucceededWithWarnings
+            ) && let Some(plan) = runtime.begin_retention(Utc::now())
+            {
+                let retention = executor.retention(&config, plan.prune_due, &cancellation);
+                outcome = runtime.finish_retention(outcome, &retention, Utc::now());
+            }
             let _ = events.send(RuntimeEvent::BackupFinished(outcome));
         })
 }

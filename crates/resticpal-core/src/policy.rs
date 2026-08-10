@@ -69,6 +69,7 @@ pub struct ManagedRetentionPolicy {
     pub weekly: Option<Managed<u32>>,
     pub monthly: Option<Managed<u32>>,
     pub yearly: Option<Managed<u32>>,
+    pub prune_interval_days: Option<Managed<u32>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +99,7 @@ pub enum PolicyField {
     RetentionWeekly,
     RetentionMonthly,
     RetentionYearly,
+    RetentionPruneIntervalDays,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +286,13 @@ pub fn resolve_config(
                 &defaults.retention.yearly,
                 local.retention.yearly.as_ref(),
                 managed_retention.yearly.as_ref(),
+                &mut fields,
+            ),
+            prune_interval_days: choose(
+                PolicyField::RetentionPruneIntervalDays,
+                &defaults.retention.prune_interval_days,
+                local.retention.prune_interval_days.as_ref(),
+                managed_retention.prune_interval_days.as_ref(),
                 &mut fields,
             ),
         },

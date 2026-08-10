@@ -21,9 +21,9 @@ use resticpal_core::status::{
     BackupPhase, BackupProgress, BackupRunOutcome, BackupState, ServiceStatus, WaitingReason,
 };
 use resticpal_protocol::{
-    BackupSourcesView, ManagementView, RepositoryOperationKind, RepositoryOperationStatus,
-    RepositorySecretUpdate, RepositoryView, Request, RequestCommand, Response, ResponsePayload,
-    ScheduleView,
+    BackupSourcesView, DiagnosticLevel, ManagementView, RepositoryOperationKind,
+    RepositoryOperationStatus, RepositorySecretUpdate, RepositoryView, Request, RequestCommand,
+    Response, ResponsePayload, RetentionView, ScheduleView,
 };
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::ClientIdentity;
@@ -32,7 +32,11 @@ use thiserror::Error;
 
 use crate::conditions::SystemConditions;
 use crate::config_store::{ConfigStoreError, LocalConfigStore};
-use crate::executor::{BackupOutcome, BackupOutcomeKind, RepositoryOutcome, RepositoryOutcomeKind};
+use crate::diagnostics::{DiagnosticLog, MAX_DIAGNOSTIC_RESULTS};
+use crate::executor::{
+    BackupOutcome, BackupOutcomeKind, RepositoryOutcome, RepositoryOutcomeKind, RetentionOutcome,
+    RetentionOutcomeKind,
+};
 use crate::history::{BackupHistoryStore, CompletedBackupRun, MAX_HISTORY_RESULTS};
 use crate::management::{
     ManagementClient, PendingEnrollment, remove_management_cache, save_enrollment_cache,
@@ -68,6 +72,11 @@ pub enum ScheduleAction {
     Start { trigger: BackupTrigger },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPlan {
+    pub prune_due: bool,
+}
+
 struct RuntimeState {
     status: ServiceStatus,
     resumed_at: Option<DateTime<Utc>>,
@@ -85,6 +94,7 @@ struct RuntimeStores {
     history: Option<BackupHistoryStore>,
     config: Option<LocalConfigStore>,
     credentials: Option<DpapiSecretStore>,
+    diagnostics: Option<DiagnosticLog>,
 }
 
 pub struct ServiceRuntime {
@@ -96,6 +106,7 @@ pub struct ServiceRuntime {
     state: Mutex<RuntimeState>,
     state_store: Option<ScheduleStateStore>,
     history_store: Option<BackupHistoryStore>,
+    diagnostics: Option<DiagnosticLog>,
     events: Sender<RuntimeEvent>,
 }
 
@@ -119,6 +130,7 @@ impl ServiceRuntime {
         managed_policy: Option<&ManagedPolicy>,
     ) -> Result<Self, RuntimeInitError> {
         let config_store = LocalConfigStore::new(path);
+        let diagnostics = DiagnosticLog::next_to_config(path);
         let local = config_store.load()?;
         let resolved = resolve_config(&EffectiveConfig::default(), &local, managed_policy)?;
         let state_store = ScheduleStateStore::next_to_config(path);
@@ -128,6 +140,12 @@ impl ServiceRuntime {
                 eprintln!(
                     "could not load service state next to {}: {error}; repository validation will be required",
                     path.display()
+                );
+                let _ = diagnostics.record(
+                    DiagnosticLevel::Warning,
+                    "state.load_failed",
+                    "Service state could not be loaded; repository validation is required.",
+                    Some("state_load_failed"),
                 );
                 let mut state = ServiceStateSnapshot::default();
                 if resolved.effective.repository.url.is_some() {
@@ -147,6 +165,7 @@ impl ServiceRuntime {
                 history: history_store,
                 config: Some(config_store),
                 credentials: credential_store,
+                diagnostics: Some(diagnostics),
             },
         ))
     }
@@ -178,6 +197,7 @@ impl ServiceRuntime {
             history: history_store,
             config: config_store,
             credentials: credential_store,
+            diagnostics,
         } = stores;
         let now = Utc::now();
         let configured = resolved.effective.is_configured();
@@ -241,6 +261,7 @@ impl ServiceRuntime {
             }),
             state_store,
             history_store,
+            diagnostics,
             events,
         }
     }
@@ -251,6 +272,13 @@ impl ServiceRuntime {
         credential_store: Option<DpapiSecretStore>,
     ) -> Self {
         let now = Utc::now();
+        let diagnostics = DiagnosticLog::next_to_config(path);
+        let _ = diagnostics.record(
+            DiagnosticLevel::Error,
+            "configuration.invalid",
+            "The service configuration is invalid.",
+            Some("configuration_invalid"),
+        );
         Self {
             config: RwLock::new(EffectiveConfig::default()),
             local_config: Mutex::new(LocalConfig::default()),
@@ -281,7 +309,20 @@ impl ServiceRuntime {
             }),
             state_store: Some(ScheduleStateStore::next_to_config(path)),
             history_store: Some(BackupHistoryStore::next_to_config(path)),
+            diagnostics: Some(diagnostics),
             events,
+        }
+    }
+
+    pub fn record_diagnostic(
+        &self,
+        level: DiagnosticLevel,
+        event_id: &'static str,
+        message: &'static str,
+        code: Option<&str>,
+    ) {
+        if let Some(log) = &self.diagnostics {
+            let _ = log.record(level, event_id, message, code);
         }
     }
 
@@ -320,6 +361,94 @@ impl ServiceRuntime {
                 phase: BackupPhase::Uploading,
             };
             status.progress = Some(progress);
+        }
+    }
+
+    pub fn begin_retention(&self, now: DateTime<Utc>) -> Option<RetentionPlan> {
+        let (repository_mode, prune_interval_days) = {
+            let config = self.config_read();
+            (config.repository.mode, config.retention.prune_interval_days)
+        };
+        if repository_mode != RepositoryMode::Standard {
+            return None;
+        }
+        let prune_interval = Duration::days(i64::from(prune_interval_days));
+        let mut state = self.state_guard();
+        state.status.state = BackupState::Running {
+            phase: BackupPhase::Retention,
+        };
+        state.status.state_since = now;
+        state.status.progress = None;
+        let prune_due = state
+            .service_state
+            .last_prune
+            .is_none_or(|last_prune| now.signed_duration_since(last_prune) >= prune_interval);
+        drop(state);
+        self.record_diagnostic(
+            DiagnosticLevel::Information,
+            "retention.started",
+            "Snapshot retention started.",
+            None,
+        );
+        Some(RetentionPlan { prune_due })
+    }
+
+    pub fn finish_retention(
+        &self,
+        backup: BackupOutcome,
+        retention: &RetentionOutcome,
+        now: DateTime<Utc>,
+    ) -> BackupOutcome {
+        let mut state = self.state_guard();
+        let warning = match &retention.kind {
+            RetentionOutcomeKind::Succeeded { pruned } => {
+                state.service_state.last_retention = Some(now);
+                if *pruned {
+                    state.service_state.last_prune = Some(now);
+                }
+                state.service_state.last_retention_error = None;
+                None
+            }
+            RetentionOutcomeKind::Failed { code } => {
+                state.service_state.last_retention_error = Some(code.clone());
+                Some(code.clone())
+            }
+            RetentionOutcomeKind::Cancelled => {
+                state.service_state.last_retention_error = Some("retention_cancelled".to_owned());
+                Some("retention_cancelled".to_owned())
+            }
+        };
+        let service_state = state.service_state.clone();
+        drop(state);
+        let save_failed = self
+            .state_store
+            .as_ref()
+            .is_some_and(|store| store.save(&service_state).is_err());
+
+        if let Some(code) = warning.as_deref() {
+            self.record_diagnostic(
+                DiagnosticLevel::Warning,
+                "retention.failed",
+                "Snapshot retention did not complete.",
+                Some(code),
+            );
+            backup.with_warning(code)
+        } else if save_failed {
+            self.record_diagnostic(
+                DiagnosticLevel::Warning,
+                "retention.state_save_failed",
+                "Retention completed but its state could not be saved.",
+                Some("retention_state_save_failed"),
+            );
+            backup.with_warning("retention_state_save_failed")
+        } else {
+            self.record_diagnostic(
+                DiagnosticLevel::Information,
+                "retention.succeeded",
+                "Snapshot retention completed successfully.",
+                None,
+            );
+            backup
         }
     }
 
@@ -369,9 +498,10 @@ impl ServiceRuntime {
         if let Some(store) = &self.history_store {
             let (run_outcome, error_code) = match &outcome.kind {
                 BackupOutcomeKind::Succeeded => (BackupRunOutcome::Succeeded, None),
-                BackupOutcomeKind::SucceededWithWarnings => {
-                    (BackupRunOutcome::SucceededWithWarnings, None)
-                }
+                BackupOutcomeKind::SucceededWithWarnings => (
+                    BackupRunOutcome::SucceededWithWarnings,
+                    outcome.warning_code.clone(),
+                ),
                 BackupOutcomeKind::Failed { code } => {
                     (BackupRunOutcome::Failed, Some(code.clone()))
                 }
@@ -398,6 +528,32 @@ impl ServiceRuntime {
             && let Err(error) = store.save(&service_state)
         {
             eprintln!("could not persist the last successful backup time: {error}");
+        }
+        match &outcome.kind {
+            BackupOutcomeKind::Succeeded => self.record_diagnostic(
+                DiagnosticLevel::Information,
+                "backup.succeeded",
+                "Backup completed successfully.",
+                None,
+            ),
+            BackupOutcomeKind::SucceededWithWarnings => self.record_diagnostic(
+                DiagnosticLevel::Warning,
+                "backup.warning",
+                "Backup completed with warnings.",
+                outcome.warning_code.as_deref(),
+            ),
+            BackupOutcomeKind::Failed { code } => self.record_diagnostic(
+                DiagnosticLevel::Error,
+                "backup.failed",
+                "Backup failed.",
+                Some(code),
+            ),
+            BackupOutcomeKind::Cancelled => self.record_diagnostic(
+                DiagnosticLevel::Information,
+                "backup.cancelled",
+                "Backup was cancelled.",
+                None,
+            ),
         }
     }
 
@@ -540,6 +696,30 @@ impl ServiceRuntime {
                     )
                 }
             }
+            RequestCommand::GetDiagnostics { limit } => {
+                let limit = usize::from(limit);
+                if !identity.is_elevated_administrator {
+                    administrator_required()
+                } else if !(1..=MAX_DIAGNOSTIC_RESULTS).contains(&limit) {
+                    rejected(
+                        "invalid_diagnostics_limit",
+                        "Diagnostics requests must contain a limit from 1 through 200.",
+                    )
+                } else if let Some(log) = &self.diagnostics {
+                    match log.recent(limit) {
+                        Ok(entries) => ResponsePayload::Diagnostics { entries },
+                        Err(_) => rejected(
+                            "diagnostics_unavailable",
+                            "Operational diagnostics could not be read from local storage.",
+                        ),
+                    }
+                } else {
+                    rejected(
+                        "diagnostics_unavailable",
+                        "Operational diagnostics storage is not available.",
+                    )
+                }
+            }
             RequestCommand::GetBackupSources => {
                 if identity.is_elevated_administrator {
                     ResponsePayload::BackupSources {
@@ -611,6 +791,29 @@ impl ServiceRuntime {
                 wake_lock_timeout_seconds,
                 allow_on_battery,
                 allow_metered_network,
+                identity,
+            ),
+            RequestCommand::GetRetention => {
+                if identity.is_elevated_administrator {
+                    ResponsePayload::Retention {
+                        configuration: self.retention_view(),
+                    }
+                } else {
+                    administrator_required()
+                }
+            }
+            RequestCommand::UpdateRetention {
+                daily,
+                weekly,
+                monthly,
+                yearly,
+                prune_interval_days,
+            } => self.update_retention(
+                daily,
+                weekly,
+                monthly,
+                yearly,
+                prune_interval_days,
                 identity,
             ),
             RequestCommand::RunBackupNow => {
@@ -1157,6 +1360,27 @@ impl ServiceRuntime {
             },
         };
         Self::apply_configuration_status(&mut state, &config, completed_at);
+        drop(state);
+        match &outcome.kind {
+            RepositoryOutcomeKind::Succeeded => self.record_diagnostic(
+                DiagnosticLevel::Information,
+                "repository.operation_succeeded",
+                "Repository operation completed successfully.",
+                None,
+            ),
+            RepositoryOutcomeKind::Failed { code } => self.record_diagnostic(
+                DiagnosticLevel::Error,
+                "repository.operation_failed",
+                "Repository operation failed.",
+                Some(code),
+            ),
+            RepositoryOutcomeKind::Cancelled => self.record_diagnostic(
+                DiagnosticLevel::Information,
+                "repository.operation_cancelled",
+                "Repository operation was cancelled.",
+                None,
+            ),
+        }
     }
 
     fn schedule_view(&self) -> ScheduleView {
@@ -1174,6 +1398,135 @@ impl ServiceRuntime {
             allow_on_battery_locked: self.field_locked(PolicyField::ScheduleAllowOnBattery),
             allow_metered_network_locked: self
                 .field_locked(PolicyField::ScheduleAllowMeteredNetwork),
+        }
+    }
+
+    fn retention_view(&self) -> RetentionView {
+        let (last_retention, last_prune, last_error) = {
+            let state = self.state_guard();
+            (
+                state.service_state.last_retention,
+                state.service_state.last_prune,
+                state.service_state.last_retention_error.clone(),
+            )
+        };
+        let config = self.config_read();
+        RetentionView {
+            repository_mode: config.repository.mode,
+            daily: config.retention.daily,
+            weekly: config.retention.weekly,
+            monthly: config.retention.monthly,
+            yearly: config.retention.yearly,
+            prune_interval_days: config.retention.prune_interval_days,
+            daily_locked: self.field_locked(PolicyField::RetentionDaily),
+            weekly_locked: self.field_locked(PolicyField::RetentionWeekly),
+            monthly_locked: self.field_locked(PolicyField::RetentionMonthly),
+            yearly_locked: self.field_locked(PolicyField::RetentionYearly),
+            prune_interval_days_locked: self.field_locked(PolicyField::RetentionPruneIntervalDays),
+            last_retention,
+            last_prune,
+            last_error,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_retention(
+        &self,
+        daily: Option<u32>,
+        weekly: Option<u32>,
+        monthly: Option<u32>,
+        yearly: Option<u32>,
+        prune_interval_days: Option<u32>,
+        identity: ClientIdentity,
+    ) -> ResponsePayload {
+        if !identity.is_elevated_administrator {
+            return administrator_required();
+        }
+        if self.config_read().repository.mode == RepositoryMode::AppendOnly {
+            return rejected(
+                "retention_managed_by_server",
+                "Retention for an append-only repository is managed by the server.",
+            );
+        }
+        if daily.is_none()
+            && weekly.is_none()
+            && monthly.is_none()
+            && yearly.is_none()
+            && prune_interval_days.is_none()
+        {
+            return rejected(
+                "no_configuration_changes",
+                "No retention changes were supplied.",
+            );
+        }
+        if daily.is_some() && self.field_locked(PolicyField::RetentionDaily)
+            || weekly.is_some() && self.field_locked(PolicyField::RetentionWeekly)
+            || monthly.is_some() && self.field_locked(PolicyField::RetentionMonthly)
+            || yearly.is_some() && self.field_locked(PolicyField::RetentionYearly)
+            || prune_interval_days.is_some()
+                && self.field_locked(PolicyField::RetentionPruneIntervalDays)
+        {
+            return rejected(
+                "managed_field_locked",
+                "One or more retention fields are locked by managed policy.",
+            );
+        }
+
+        let mut candidate = self.local_config_guard().clone();
+        let mut effective = self.config();
+        if let Some(value) = daily {
+            candidate.retention.daily = Some(value);
+            effective.retention.daily = value;
+        }
+        if let Some(value) = weekly {
+            candidate.retention.weekly = Some(value);
+            effective.retention.weekly = value;
+        }
+        if let Some(value) = monthly {
+            candidate.retention.monthly = Some(value);
+            effective.retention.monthly = value;
+        }
+        if let Some(value) = yearly {
+            candidate.retention.yearly = Some(value);
+            effective.retention.yearly = value;
+        }
+        if let Some(value) = prune_interval_days {
+            candidate.retention.prune_interval_days = Some(value);
+            effective.retention.prune_interval_days = value;
+        }
+        if let Err(error) = effective.validate() {
+            return rejected("invalid_retention", &error.to_string());
+        }
+        let runtime_state = self.state_guard();
+        if matches!(runtime_state.status.state, BackupState::Running { .. }) {
+            return rejected(
+                "backup_running",
+                "Wait for the active backup to finish before changing retention.",
+            );
+        }
+        if matches!(
+            runtime_state.repository_operation,
+            RepositoryOperationStatus::Running { .. }
+        ) {
+            return rejected(
+                "repository_operation_running",
+                "Wait for the repository operation to finish before changing retention.",
+            );
+        }
+        if let Some(store) = &self.config_store
+            && store.save(&candidate).is_err()
+        {
+            return rejected(
+                "configuration_save_failed",
+                "The local configuration could not be saved.",
+            );
+        }
+        drop(runtime_state);
+        *self.local_config_guard() = candidate;
+        *self.config_write() = effective;
+        let _ = self.events.send(RuntimeEvent::ConfigurationChanged);
+        ResponsePayload::Accepted {
+            message: "Retention policy updated.".to_owned(),
         }
     }
 
@@ -3076,6 +3429,159 @@ mod tests {
             ResponsePayload::Rejected { ref code, .. } if code == "invalid_schedule"
         ));
         assert_eq!(runtime.config().schedule, before);
+    }
+
+    #[test]
+    fn retention_updates_are_admin_only_bounded_and_live() {
+        let (runtime, events) = runtime(true);
+        let update = || RequestCommand::UpdateRetention {
+            daily: Some(14),
+            weekly: Some(8),
+            monthly: Some(18),
+            yearly: Some(5),
+            prune_interval_days: Some(14),
+        };
+        assert!(matches!(
+            runtime.handle_request(Request::new(70, update()), USER).payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+        ));
+        assert!(matches!(
+            runtime
+                .handle_request(Request::new(71, update()), ADMIN)
+                .payload,
+            ResponsePayload::Accepted { .. }
+        ));
+        assert_eq!(
+            events.recv().expect("configuration event"),
+            RuntimeEvent::ConfigurationChanged
+        );
+        assert_eq!(runtime.config().retention.daily, 14);
+        assert_eq!(runtime.config().retention.prune_interval_days, 14);
+
+        let invalid = runtime.handle_request(
+            Request::new(
+                72,
+                RequestCommand::UpdateRetention {
+                    daily: Some(0),
+                    weekly: Some(0),
+                    monthly: Some(0),
+                    yearly: Some(0),
+                    prune_interval_days: None,
+                },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(
+            invalid.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "invalid_retention"
+        ));
+    }
+
+    #[test]
+    fn append_only_retention_is_server_managed() {
+        let (runtime, _events) = runtime(true);
+        runtime.config_write().repository.mode = RepositoryMode::AppendOnly;
+        assert_eq!(runtime.begin_retention(Utc::now()), None);
+        let view = runtime.handle_request(Request::new(73, RequestCommand::GetRetention), ADMIN);
+        assert!(matches!(
+            view.payload,
+            ResponsePayload::Retention {
+                configuration: RetentionView {
+                    repository_mode: RepositoryMode::AppendOnly,
+                    ..
+                }
+            }
+        ));
+        let update = runtime.handle_request(
+            Request::new(
+                74,
+                RequestCommand::UpdateRetention {
+                    daily: Some(30),
+                    weekly: None,
+                    monthly: None,
+                    yearly: None,
+                    prune_interval_days: None,
+                },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(
+            update.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "retention_managed_by_server"
+        ));
+    }
+
+    #[test]
+    fn standard_retention_transitions_phase_and_preserves_backup_success_as_warning() {
+        let (runtime, _events) = runtime(true);
+        assert!(matches!(
+            runtime.evaluate_schedule(Utc::now(), available_conditions()),
+            ScheduleAction::Start { .. }
+        ));
+        let now = Utc::now();
+        assert_eq!(
+            runtime.begin_retention(now),
+            Some(RetentionPlan { prune_due: true })
+        );
+        assert!(matches!(
+            runtime.status().state,
+            BackupState::Running {
+                phase: BackupPhase::Retention
+            }
+        ));
+        let backup = BackupOutcome::succeeded(BackupSummary {
+            files_processed: 1,
+            bytes_processed: 2,
+            data_added: 3,
+            snapshot_id: Some("snapshot".to_owned()),
+        });
+        let retention = RetentionOutcome {
+            kind: RetentionOutcomeKind::Failed {
+                code: "retention_prune_failed".to_owned(),
+            },
+        };
+        let outcome = runtime.finish_retention(backup, &retention, now);
+        assert_eq!(outcome.kind, BackupOutcomeKind::SucceededWithWarnings);
+        assert_eq!(
+            outcome.warning_code.as_deref(),
+            Some("retention_prune_failed")
+        );
+    }
+
+    #[test]
+    fn diagnostics_are_admin_only_and_never_return_raw_details() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        LocalConfigStore::new(&config_path)
+            .save(&LocalConfig::default())
+            .expect("initial config");
+        let (events, _receiver) = mpsc::channel();
+        let runtime = ServiceRuntime::load(&config_path, events).expect("runtime");
+        runtime.record_diagnostic(
+            DiagnosticLevel::Error,
+            "backup.failed",
+            "Backup failed.",
+            Some("Access denied: C:\\Users\\Private"),
+        );
+        assert!(matches!(
+            runtime
+                .handle_request(
+                    Request::new(75, RequestCommand::GetDiagnostics { limit: 10 }),
+                    USER,
+                )
+                .payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+        ));
+        let response = runtime.handle_request(
+            Request::new(76, RequestCommand::GetDiagnostics { limit: 10 }),
+            ADMIN,
+        );
+        let serialized = format!("{response:?}");
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Diagnostics { .. }
+        ));
+        assert!(!serialized.contains(r"C:\Users\Private"));
     }
 
     #[test]

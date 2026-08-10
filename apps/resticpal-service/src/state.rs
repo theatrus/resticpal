@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::atomic_file::{self, AtomicFileError};
 
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_STATE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -41,11 +41,14 @@ impl ScheduleStateStore {
             return Err(StateStoreError::TooLarge);
         }
         let state: PersistedScheduleState = serde_json::from_slice(&contents)?;
-        if state.schema_version != STATE_SCHEMA_VERSION {
+        if !matches!(state.schema_version, 1 | STATE_SCHEMA_VERSION) {
             return Err(StateStoreError::UnsupportedSchema(state.schema_version));
         }
         Ok(ServiceStateSnapshot {
             last_success: state.last_success,
+            last_retention: state.last_retention,
+            last_prune: state.last_prune,
+            last_retention_error: state.last_retention_error,
             repository_validation_required: state.repository_validation_required,
             verified_repository: state.verified_repository,
             repository_verified_at: state.repository_verified_at,
@@ -56,6 +59,9 @@ impl ScheduleStateStore {
         let mut contents = serde_json::to_vec_pretty(&PersistedScheduleState {
             schema_version: STATE_SCHEMA_VERSION,
             last_success: state.last_success,
+            last_retention: state.last_retention,
+            last_prune: state.last_prune,
+            last_retention_error: state.last_retention_error.clone(),
             repository_validation_required: state.repository_validation_required,
             verified_repository: state.verified_repository.clone(),
             repository_verified_at: state.repository_verified_at,
@@ -72,6 +78,9 @@ impl ScheduleStateStore {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServiceStateSnapshot {
     pub last_success: Option<DateTime<Utc>>,
+    pub last_retention: Option<DateTime<Utc>>,
+    pub last_prune: Option<DateTime<Utc>>,
+    pub last_retention_error: Option<String>,
     repository_validation_required: bool,
     verified_repository: Option<RepositoryIdentity>,
     repository_verified_at: Option<DateTime<Utc>>,
@@ -133,6 +142,12 @@ impl RepositoryIdentity {
 struct PersistedScheduleState {
     schema_version: u32,
     last_success: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_retention: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_prune: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_retention_error: Option<String>,
     #[serde(default)]
     repository_validation_required: bool,
     #[serde(default)]
@@ -207,6 +222,23 @@ mod tests {
         state.last_success = Some(second);
         store.save(&state).expect("replacement save");
         assert_eq!(store.load().expect("load"), state);
+    }
+
+    #[test]
+    fn retention_state_round_trips_without_a_schema_break() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ScheduleStateStore::next_to_config(&directory.path().join("config.toml"));
+        let now = Utc::now();
+        let state = ServiceStateSnapshot {
+            last_retention: Some(now),
+            last_prune: Some(now),
+            last_retention_error: Some("retention_prune_failed".to_owned()),
+            ..ServiceStateSnapshot::default()
+        };
+
+        store.save(&state).expect("retention state");
+
+        assert_eq!(store.load().expect("retention state loads"), state);
     }
 
     #[test]
