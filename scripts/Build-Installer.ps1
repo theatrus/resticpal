@@ -10,8 +10,9 @@ param(
     # would carry no publisher identity.
     [switch] $StageOnly,
 
-    # Package an already-staged (and by then signed) payload. Skips the build
-    # and staging so the signatures applied in between are not overwritten.
+    # Package an already-staged payload, signed first only for release builds.
+    # Skips the build and staging so any signatures applied in between are not
+    # overwritten.
     [switch] $PackageOnly
 )
 if ($StageOnly -and $PackageOnly) {

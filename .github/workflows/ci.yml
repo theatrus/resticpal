@@ -93,10 +93,10 @@ jobs:
           dotnet tool install --global wix --version 6.0.1
           wix extension add -g WixToolset.Util.wixext/6.0.1
 
-      # Stage the payload, sign it, then package. Signing only the MSI would
-      # seal unsigned executables inside a signed installer: the service, the
-      # tray, the UI and restic are what a user actually runs, and they would
-      # carry no publisher identity at all.
+      # Stage the payload, optionally sign it for a tag/manual run, then
+      # package. Signing only the MSI would seal unsigned executables inside a
+      # signed installer: the service, tray, UI and restic are what a user
+      # actually runs, and they would carry no publisher identity at all.
       - name: Stage installer payload
         shell: pwsh
         run: ./scripts/Build-Installer.ps1 -StageOnly
@@ -167,7 +167,7 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-      - name: Package the signed payload into the MSI
+      - name: Package the staged payload into the MSI
         shell: pwsh
         run: ./scripts/Build-Installer.ps1 -PackageOnly
 
