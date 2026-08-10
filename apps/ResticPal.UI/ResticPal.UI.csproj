@@ -16,10 +16,22 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <InformationalVersion>1.0.0</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <AssemblyTitle>resticpal</AssemblyTitle>
+    <Description>Friendly, resilient Windows backups powered by restic.</Description>
+    <Company>StackFoundry LLC</Company>
+    <Product>resticpal</Product>
+    <Copyright>Copyright © 2026 Yann Ramin</Copyright>
   </PropertyGroup>
 
   <ItemGroup>
     <Manifest Include="$(ApplicationManifest)" />
+    <EmbeddedResource Include="..\..\config\update-public-key.txt"
+                      LogicalName="ResticPal.UpdatePublicKey" />
     <Content Include="..\..\assets\resticpal.ico" Link="resticpal.ico"
              CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Include="..\..\assets\resticpal-logo.png" Link="resticpal-logo.png"

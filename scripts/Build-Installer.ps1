@@ -20,13 +20,16 @@ if ($StageOnly -and $PackageOnly) {
 
 $ErrorActionPreference = 'Stop'
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$manifestText = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Cargo.toml') -Raw
+$versionMatch = [Regex]::Match($manifestText, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"\s*$')
+if (-not $versionMatch.Success) {
+    throw 'Unable to determine the workspace version from Cargo.toml.'
+}
+$sourceVersion = $versionMatch.Groups['version'].Value
 if ([string]::IsNullOrWhiteSpace($Version)) {
-    $manifestText = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Cargo.toml') -Raw
-    $versionMatch = [Regex]::Match($manifestText, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"\s*$')
-    if (-not $versionMatch.Success) {
-        throw 'Unable to determine the workspace version from Cargo.toml.'
-    }
-    $Version = $versionMatch.Groups['version'].Value
+    $Version = $sourceVersion
+} elseif ($Version -cne $sourceVersion) {
+    throw "Installer version $Version does not match workspace version $sourceVersion."
 }
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "Installer version must have three numeric parts: $Version"
@@ -48,6 +51,68 @@ function Reset-GeneratedDirectory([string] $Path) {
         Remove-Item -LiteralPath $resolvedPath -Recurse -Force
     }
     New-Item -ItemType Directory -Path $resolvedPath | Out-Null
+}
+
+function Set-MsiFileLanguageNeutral(
+    [string] $DatabasePath,
+    [string[]] $FileIds
+) {
+    # Windows App SDK 2.3 marks two runtime DLLs with every supported LCID.
+    # That comma-separated value exceeds MSI's File.Language column even
+    # though the binaries and resources are valid. WiX has no per-file
+    # override for harvested version metadata, so normalize only those two
+    # authored rows before ICE validation and before the MSI is signed.
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $null
+    try {
+        $database = $installer.GetType().InvokeMember(
+            'OpenDatabase',
+            'InvokeMethod',
+            $null,
+            $installer,
+            @($DatabasePath, 1))
+        foreach ($fileId in $FileIds) {
+            $updateSql = "UPDATE `File` SET `Language`='0' WHERE `File`='$fileId'"
+            $updateView = $database.GetType().InvokeMember(
+                'OpenView', 'InvokeMethod', $null, $database, @($updateSql))
+            try {
+                $updateView.GetType().InvokeMember(
+                    'Execute', 'InvokeMethod', $null, $updateView, $null) | Out-Null
+            } finally {
+                $updateView.GetType().InvokeMember(
+                    'Close', 'InvokeMethod', $null, $updateView, $null) | Out-Null
+                [Runtime.InteropServices.Marshal]::FinalReleaseComObject($updateView) | Out-Null
+            }
+
+            $selectSql = "SELECT `Language` FROM `File` WHERE `File`='$fileId'"
+            $selectView = $database.GetType().InvokeMember(
+                'OpenView', 'InvokeMethod', $null, $database, @($selectSql))
+            $record = $null
+            try {
+                $selectView.GetType().InvokeMember(
+                    'Execute', 'InvokeMethod', $null, $selectView, $null) | Out-Null
+                $record = $selectView.GetType().InvokeMember(
+                    'Fetch', 'InvokeMethod', $null, $selectView, $null)
+                if ($null -eq $record -or $record.StringData(1) -cne '0') {
+                    throw "Could not normalize MSI language metadata for $fileId."
+                }
+            } finally {
+                if ($null -ne $record) {
+                    [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) | Out-Null
+                }
+                $selectView.GetType().InvokeMember(
+                    'Close', 'InvokeMethod', $null, $selectView, $null) | Out-Null
+                [Runtime.InteropServices.Marshal]::FinalReleaseComObject($selectView) | Out-Null
+            }
+        }
+        $database.GetType().InvokeMember(
+            'Commit', 'InvokeMethod', $null, $database, $null) | Out-Null
+    } finally {
+        if ($null -ne $database) {
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) | Out-Null
+        }
+        [Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) | Out-Null
+    }
 }
 
 foreach ($tool in @('cargo', 'dotnet', 'wix')) {
@@ -77,6 +142,10 @@ try {
         --configuration Release `
         --runtime win-x64 `
         --self-contained true `
+        -p:Version=$Version `
+        -p:AssemblyVersion="$Version.0" `
+        -p:FileVersion="$Version.0" `
+        -p:InformationalVersion=$Version `
         -p:SatelliteResourceLanguages=en-US `
         --output $stageRoot
     if ($LASTEXITCODE -ne 0) {
@@ -150,6 +219,10 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "WiX build failed with exit code $LASTEXITCODE"
     }
+
+    Set-MsiFileLanguageNeutral `
+        -DatabasePath $msiPath `
+        -FileIds @('WinUiXamlRuntime', 'WinUiXamlPhoneRuntime')
 
     & wix msi validate $msiPath -pdb ([IO.Path]::ChangeExtension($msiPath, '.wixpdb'))
     if ($LASTEXITCODE -ne 0) {

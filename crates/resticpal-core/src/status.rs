@@ -26,6 +26,7 @@ pub enum WaitingReason {
     Battery,
     MeteredNetwork,
     RepositoryValidation,
+    Update,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

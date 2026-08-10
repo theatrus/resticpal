@@ -684,6 +684,7 @@
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
 
                         <StackPanel Spacing="6">
@@ -739,6 +740,53 @@
                             IsOpen="True"
                             Message="Removing management keeps repository credentials and existing backups on this PC. It removes the reporting token, device identity key, and cached managed policy."
                             Severity="Informational" />
+
+                        <Border
+                            Grid.Row="3"
+                            Padding="20"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                            <StackPanel Spacing="14">
+                                <StackPanel Spacing="4">
+                                    <TextBlock FontSize="17" FontWeight="SemiBold" Text="Application updates" />
+                                    <TextBlock
+                                        x:Name="UpdateStatusDescription"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        Text="Updates are checked against a strictly signed resticpal release feed."
+                                        TextWrapping="Wrap" />
+                                </StackPanel>
+                                <ProgressBar
+                                    x:Name="UpdateDownloadProgress"
+                                    Maximum="100"
+                                    Minimum="0"
+                                    Visibility="Collapsed" />
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <Button
+                                        x:Name="CheckForUpdatesButton"
+                                        Click="CheckForUpdatesButton_Click"
+                                        Content="Check for updates" />
+                                    <Button
+                                        x:Name="DownloadUpdateButton"
+                                        Click="DownloadUpdateButton_Click"
+                                        Content="Download update"
+                                        Style="{StaticResource AccentButtonStyle}"
+                                        Visibility="Collapsed" />
+                                    <Button
+                                        x:Name="InstallUpdateButton"
+                                        Click="InstallUpdateButton_Click"
+                                        Content="Install update"
+                                        Style="{StaticResource AccentButtonStyle}"
+                                        Visibility="Collapsed" />
+                                    <ProgressRing x:Name="UpdateProgress" IsActive="False" Width="24" Height="24" />
+                                </StackPanel>
+                                <TextBlock
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Installing requires administrator approval. A backup already in progress is never interrupted; installation waits until resticpal is idle."
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
                     </Grid>
                 </ScrollViewer>
             </Grid>

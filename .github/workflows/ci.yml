@@ -37,6 +37,10 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Verify product version consistency
+        shell: pwsh
+        run: ./scripts/Test-VersionConsistency.ps1
+
       - name: Test Rust workspace
         run: cargo test --workspace --locked
 

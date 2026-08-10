@@ -89,6 +89,9 @@ pub enum RequestCommand {
     DeferBackup {
         minutes: u32,
     },
+    PrepareForUpdate {
+        hold_seconds: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +426,17 @@ mod tests {
     #[test]
     fn bounded_diagnostics_request_round_trips() {
         let request = Request::new(44, RequestCommand::GetDiagnostics { limit: 50 });
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &request).expect("request should serialize");
+        let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn bounded_update_preparation_round_trips() {
+        let request = Request::new(45, RequestCommand::PrepareForUpdate { hold_seconds: 900 });
         let mut bytes = Vec::new();
 
         write_frame(&mut bytes, &request).expect("request should serialize");

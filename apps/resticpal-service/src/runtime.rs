@@ -47,6 +47,8 @@ const CONDITION_RETRY_SECONDS: u64 = 60;
 const INITIAL_FAILURE_RETRY_MINUTES: i64 = 5;
 const MAX_FAILURE_BACKOFF_EXPONENT: u32 = 6;
 const MAX_SECRET_UPDATES: usize = 16;
+const MIN_UPDATE_HOLD_SECONDS: u32 = 60;
+const MAX_UPDATE_HOLD_SECONDS: u32 = 30 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
@@ -81,6 +83,8 @@ struct RuntimeState {
     status: ServiceStatus,
     resumed_at: Option<DateTime<Utc>>,
     not_before: Option<DateTime<Utc>>,
+    update_hold_until: Option<DateTime<Utc>>,
+    update_hold_previous_status: Option<(BackupState, Option<DateTime<Utc>>)>,
     manual_requested: bool,
     consecutive_failures: u32,
     repository_operation: RepositoryOperationStatus,
@@ -253,6 +257,8 @@ impl ServiceRuntime {
                 status,
                 resumed_at: None,
                 not_before: None,
+                update_hold_until: None,
+                update_hold_previous_status: None,
                 manual_requested: false,
                 consecutive_failures: 0,
                 repository_operation,
@@ -301,6 +307,8 @@ impl ServiceRuntime {
                 },
                 resumed_at: None,
                 not_before: None,
+                update_hold_until: None,
+                update_hold_previous_status: None,
                 manual_requested: false,
                 consecutive_failures: 0,
                 repository_operation: RepositoryOperationStatus::NotRun,
@@ -567,11 +575,37 @@ impl ServiceRuntime {
         conditions: SystemConditions,
     ) -> ScheduleAction {
         let config = self.config();
+        let mut state = self.state_guard();
+        if state
+            .update_hold_until
+            .is_some_and(|deadline| deadline > now)
+        {
+            transition_state(
+                &mut state.status,
+                BackupState::Waiting {
+                    reason: WaitingReason::Update,
+                },
+                now,
+            );
+            state.status.next_deadline = state.update_hold_until;
+            return ScheduleAction::None;
+        }
+        state.update_hold_until = None;
+        if let Some((previous_state, previous_deadline)) = state.update_hold_previous_status.take()
+            && matches!(
+                state.status.state,
+                BackupState::Waiting {
+                    reason: WaitingReason::Update
+                }
+            )
+        {
+            state.status.state = previous_state;
+            state.status.state_since = now;
+            state.status.next_deadline = previous_deadline;
+        }
         if !config.is_configured() {
             return ScheduleAction::None;
         }
-
-        let mut state = self.state_guard();
         if state.management_operation_active {
             return ScheduleAction::None;
         }
@@ -833,6 +867,14 @@ impl ServiceRuntime {
                     let mut state = self.state_guard();
                     if matches!(state.status.state, BackupState::Running { .. }) {
                         rejected("already_running", "A backup is already running.")
+                    } else if state
+                        .update_hold_until
+                        .is_some_and(|deadline| deadline > Utc::now())
+                    {
+                        rejected(
+                            "update_pending",
+                            "A resticpal update is about to start. Try again after it finishes.",
+                        )
                     } else {
                         state.manual_requested = true;
                         state.not_before = None;
@@ -890,6 +932,9 @@ impl ServiceRuntime {
                         self.send_event(RuntimeEvent::Deferred, "Backup deferred.")
                     }
                 }
+            }
+            RequestCommand::PrepareForUpdate { hold_seconds } => {
+                self.prepare_for_update(hold_seconds, identity)
             }
         };
 
@@ -1241,6 +1286,15 @@ impl ServiceRuntime {
         }
 
         let mut state = self.state_guard();
+        if state
+            .update_hold_until
+            .is_some_and(|deadline| deadline > Utc::now())
+        {
+            return rejected(
+                "update_pending",
+                "A resticpal update is about to start. Try again after it finishes.",
+            );
+        }
         if matches!(state.status.state, BackupState::Running { .. }) {
             return rejected(
                 "backup_running",
@@ -1306,6 +1360,63 @@ impl ServiceRuntime {
                 }
                 RepositoryOperationKind::Initialize => "Repository creation started.".to_owned(),
             },
+        }
+    }
+
+    fn prepare_for_update(&self, hold_seconds: u32, identity: ClientIdentity) -> ResponsePayload {
+        if !identity.is_elevated_administrator {
+            return administrator_required();
+        }
+        if !(MIN_UPDATE_HOLD_SECONDS..=MAX_UPDATE_HOLD_SECONDS).contains(&hold_seconds) {
+            return rejected(
+                "invalid_update_hold",
+                "The update hold must be between one and 30 minutes.",
+            );
+        }
+
+        let now = Utc::now();
+        let mut state = self.state_guard();
+        if matches!(state.status.state, BackupState::Running { .. }) {
+            return rejected(
+                "backup_running",
+                "Wait for the active backup to finish before installing the update.",
+            );
+        }
+        if matches!(
+            state.repository_operation,
+            RepositoryOperationStatus::Running { .. }
+        ) || state.management_operation_active
+        {
+            return rejected(
+                "operation_running",
+                "Wait for the current repository or management operation to finish.",
+            );
+        }
+
+        let deadline = now
+            .checked_add_signed(Duration::seconds(i64::from(hold_seconds)))
+            .unwrap_or(now);
+        if state
+            .update_hold_until
+            .is_none_or(|existing_deadline| existing_deadline <= now)
+        {
+            state.update_hold_previous_status =
+                Some((state.status.state.clone(), state.status.next_deadline));
+        }
+        state.update_hold_until = Some(deadline);
+        state.manual_requested = false;
+        state.resumed_at = None;
+        transition_state(
+            &mut state.status,
+            BackupState::Waiting {
+                reason: WaitingReason::Update,
+            },
+            now,
+        );
+        state.status.next_deadline = Some(deadline);
+
+        ResponsePayload::Accepted {
+            message: "Backups are held briefly while the update starts.".to_owned(),
         }
     }
 
@@ -2349,6 +2460,94 @@ mod tests {
             .next_deadline
             .expect("deferral sets a deadline");
         assert!(deadline >= before + Duration::minutes(30));
+    }
+
+    #[test]
+    fn update_preparation_is_admin_only_bounded_and_blocks_new_backup_work() {
+        let (runtime, _events) = runtime(true);
+
+        let user_response = runtime.handle_request(
+            Request::new(46, RequestCommand::PrepareForUpdate { hold_seconds: 900 }),
+            USER,
+        );
+        assert!(matches!(
+            user_response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+        ));
+
+        let invalid_response = runtime.handle_request(
+            Request::new(47, RequestCommand::PrepareForUpdate { hold_seconds: 59 }),
+            ADMIN,
+        );
+        assert!(matches!(
+            invalid_response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "invalid_update_hold"
+        ));
+
+        let accepted = runtime.handle_request(
+            Request::new(48, RequestCommand::PrepareForUpdate { hold_seconds: 60 }),
+            ADMIN,
+        );
+        assert!(matches!(accepted.payload, ResponsePayload::Accepted { .. }));
+        assert!(matches!(
+            runtime.status().state,
+            BackupState::Waiting {
+                reason: WaitingReason::Update
+            }
+        ));
+
+        let run_now = runtime.handle_request(Request::new(49, RequestCommand::RunBackupNow), USER);
+        assert!(matches!(
+            run_now.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "update_pending"
+        ));
+        assert_eq!(
+            runtime.evaluate_schedule(Utc::now(), available_conditions()),
+            ScheduleAction::None
+        );
+
+        let deadline = runtime.status().next_deadline.expect("update deadline");
+        assert!(matches!(
+            runtime.evaluate_schedule(deadline + Duration::seconds(1), available_conditions()),
+            ScheduleAction::Start { .. }
+        ));
+    }
+
+    #[test]
+    fn update_preparation_rejects_an_active_backup() {
+        let (runtime, _events) = runtime(true);
+        runtime.state_guard().status.state = BackupState::Running {
+            phase: BackupPhase::Uploading,
+        };
+
+        let response = runtime.handle_request(
+            Request::new(50, RequestCommand::PrepareForUpdate { hold_seconds: 900 }),
+            ADMIN,
+        );
+
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "backup_running"
+        ));
+    }
+
+    #[test]
+    fn expired_update_preparation_restores_an_unconfigured_status() {
+        let (runtime, _events) = runtime(false);
+        let response = runtime.handle_request(
+            Request::new(51, RequestCommand::PrepareForUpdate { hold_seconds: 60 }),
+            ADMIN,
+        );
+        assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+
+        let deadline = runtime.status().next_deadline.expect("update deadline");
+        assert_eq!(
+            runtime.evaluate_schedule(deadline + Duration::seconds(1), available_conditions()),
+            ScheduleAction::None
+        );
+        let status = runtime.status();
+        assert!(matches!(status.state, BackupState::Unconfigured));
+        assert_eq!(status.next_deadline, None);
     }
 
     #[test]

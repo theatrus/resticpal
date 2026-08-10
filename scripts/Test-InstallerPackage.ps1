@@ -13,6 +13,14 @@ if ([string]::IsNullOrWhiteSpace($MsiPath)) {
     $MsiPath = $candidates[0].FullName
 }
 $resolvedMsiPath = (Resolve-Path -LiteralPath $MsiPath).Path
+$versionMatch = [Regex]::Match(
+    [IO.Path]::GetFileName($resolvedMsiPath),
+    '^resticpal-(?<version>\d+\.\d+\.\d+)-x64\.msi$')
+if (-not $versionMatch.Success) {
+    throw "The MSI file name does not contain the expected product version: $resolvedMsiPath"
+}
+$productVersion = $versionMatch.Groups['version'].Value
+$fileVersion = "$productVersion.0"
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'artifacts'))
 $testRoot = Join-Path $artifactRoot ("installer\package-test-{0}" -f [Guid]::NewGuid().ToString('N'))
 $adminImageRoot = Join-Path $testRoot 'image'
@@ -77,6 +85,19 @@ try {
     )) {
         if (-not (Test-Path -LiteralPath (Join-Path $installImage $fileName) -PathType Leaf)) {
             throw "Administrative image is missing $fileName"
+        }
+    }
+
+    foreach ($fileName in @('resticpal-service.exe', 'resticpal-tray.exe', 'resticpal-ui.exe')) {
+        $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo(
+            (Join-Path $installImage $fileName))
+        $versionMismatch = (
+            $versionInfo.FileVersion -cne $fileVersion -or
+            $versionInfo.ProductVersion -cne $productVersion
+        )
+        if ($versionMismatch) {
+            throw ("$fileName version mismatch: file=$($versionInfo.FileVersion), " +
+                   "product=$($versionInfo.ProductVersion), expected=$productVersion")
         }
     }
 

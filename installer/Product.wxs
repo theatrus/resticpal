@@ -23,7 +23,30 @@
     <Feature Id="Complete" Title="resticpal" Level="1" AllowAdvertise="no">
       <Files Directory="INSTALLFOLDER" Include="$(StageDir)\**">
         <Exclude Files="$(StageDir)\resticpal-service.exe" />
+        <!-- These multilingual Windows App SDK binaries list enough LCIDs to
+             overflow MSI's File.Language column. Author them explicitly as
+             language-neutral; their embedded resources remain unchanged. -->
+        <Exclude Files="$(StageDir)\Microsoft.ui.xaml.dll" />
+        <Exclude Files="$(StageDir)\Microsoft.UI.Xaml.Phone.dll" />
       </Files>
+
+      <Component Id="WinUiXamlRuntimeComponent"
+                 Guid="6980A227-AFF1-42DC-8924-D20E088B076A"
+                 Directory="INSTALLFOLDER">
+        <File Id="WinUiXamlRuntime"
+              Source="$(StageDir)\Microsoft.ui.xaml.dll"
+              DefaultLanguage="0"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="WinUiXamlPhoneRuntimeComponent"
+                 Guid="904CE951-FF48-46DB-B7B9-D70286467C04"
+                 Directory="INSTALLFOLDER">
+        <File Id="WinUiXamlPhoneRuntime"
+              Source="$(StageDir)\Microsoft.UI.Xaml.Phone.dll"
+              DefaultLanguage="0"
+              KeyPath="yes" />
+      </Component>
 
       <Component Id="ServiceComponent"
                  Guid="5606D705-0482-413E-B476-B81CA4A0BCF2"

@@ -6,17 +6,17 @@ This document records the product requirements, architecture decisions, and curr
 
 ## Implementation status
 
-The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The active automated baseline is 124 passing client tests plus eight passing tests in the adjacent `resticpal-server` repository and a warning-free WinUI build. The MSI is build/ICE/admin-image validated, and its installed LocalSystem service and VSS backup path pass in a disposable Windows 11 Sandbox; the wider Windows 10/11 matrix is not yet production-qualified.
+The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The active automated baseline is 141 passing client tests plus eight passing tests in the adjacent `resticpal-server` repository and a warning-free WinUI build. The MSI is build/ICE/admin-image validated, and its installed LocalSystem service and VSS backup path pass in a disposable Windows 11 Sandbox; the wider Windows 10/11 matrix is not yet production-qualified.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
 | Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, standard-mode retention/prune cadence, append-only command authorization, versioned manifest and enrollment payloads, strict Ed25519 envelopes, X25519/HKDF/ChaCha20-Poly1305 secret bootstrap, freshness, and replay checks | Schema evolution beyond v1 and graceful-first maintenance cancellation |
 | Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository and enrollment credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler/retention checkpoint, bounded SQLite history, bounded redacted diagnostic logs, bounded shutdown outcome draining, plain/signed manifest fetching, last-known-good cache, runtime policy application, bounded status delivery, one-time enrollment/rotation, unenrollment, and Sandbox-qualified LocalSystem/VSS execution | Windows 10/11 matrix ACL/VSS qualification, direct-file watching, diagnostic export/audit, and graceful cancellation before escalation |
-| Local IPC | Protocol v3, 1 MiB bounded frames, bounded per-connection I/O, protected named pipe, client-token authorization, ordinary-user status/history/run/cancel/defer, and elevated configuration/enrollment operations | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v3 |
+| Local IPC | Protocol v3, 1 MiB bounded frames, bounded per-connection I/O, protected named pipe, client-token authorization, ordinary-user status/history/run/cancel/defer, elevated configuration/enrollment operations, and bounded elevated update preparation that refuses active work | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v3 |
 | Tray | Native Win32 notification icon, current status tooltip, run/cancel action, and elevated UI launch | Push-driven live icon updates, deferral UI, notifications, richer health icons, and startup registration |
-| WinUI application | Overview, backup sources, repository, schedule/power/network, standard/server-managed retention, bounded backup history, redacted diagnostics, and managed enrollment/rotation/unenrollment pages | Updates/settings, accessibility and Windows 10 qualification |
+| WinUI application | Overview, backup sources, repository, schedule/power/network, standard/server-managed retention, bounded backup history, redacted diagnostics, managed enrollment/rotation/unenrollment, and strict signed-update check/download/install controls | Accessibility, update notification outside the on-demand UI, and Windows 10 qualification |
 | Remote management | Plain HTTP/HTTPS manifest mode without reporting; signed HTTPS manifest mode with pinned Ed25519 key, atomic cache, replay/freshness checks, authenticated status delivery; one-time signed enrollment with encrypted credentials; adjacent server with signed manifests, bounded SQLite status, and admin-only maintenance jobs | Conditional requests, enrollment audit/rate limits, and production deployment hardening |
-| Distribution | Per-machine x64 WiX MSI, pinned restic 0.19.1, statically linked Rust CRT, self-contained WinUI payload, LocalSystem service/recovery authoring, ProgramData and bootstrap registry ACL authoring, optional hidden bootstrap property, tray logon registration, data-preserving uninstall, notices, disposable Sandbox E2E harness, and unsigned GitHub CI package artifacts with checksums | Windows 10/11 installer/VSS matrix, interactive installer bootstrap dialog, Start Menu integration, code signing, complete license generation, update UI/appcast verification, elevated updater, and upgrade/repair matrix |
+| Distribution | Synchronized 1.0.0 product version, per-machine x64 WiX MSI, pinned restic 0.19.1, statically linked/versioned Rust payload, self-contained/versioned WinUI payload, LocalSystem service/recovery authoring, ProgramData and bootstrap registry ACL authoring, optional hidden bootstrap property, tray logon registration, data-preserving uninstall, notices, disposable Sandbox E2E harness, Azure Authenticode signing, strict Ed25519 NetSparkle client, locally held release key, signed-appcast/release tooling, and signed GitHub CI package artifacts with checksums | Windows 10/11 installer/VSS/update matrix, interactive installer bootstrap dialog, Start Menu integration, complete license generation, release publication qualification, rollback recovery, and upgrade/repair matrix |
 
 Current durable state consists of atomic `config.toml`, DPAPI-protected credential files, `state.json` for scheduler/retention/repository-verification state, lazy `state.db` backup history, and rotating structured service logs. The history retains the newest 200 attempts and exposes at most 100 per IPC request; the WinUI page requests 50. Diagnostics rotate at 1 MiB with three archives and expose at most 200 entries per elevated IPC request; the WinUI page requests 100.
 
@@ -47,7 +47,7 @@ The first release is Windows x64. A macOS implementation and a restore UI may co
 - A large multi-tenant backup SaaS. The optional companion server remains small, self-hostable, and separable from standalone/plain-file operation.
 - macOS support.
 - ARM64 packages.
-- Fully unattended updates while releases lack an Authenticode code-signing certificate.
+- Fully unattended updates; installation remains an explicit administrator choice.
 
 ## Process architecture
 
@@ -67,10 +67,10 @@ User session              +-- resticpal-tray.exe     Rust/Win32; always present
                                       +-- resticpal-ui.exe
                                           C# / WinUI 3; on demand
 
-On demand: resticpal-updater.exe       elevated update/bootstrap helper
+On demand: signed MSI major upgrade    launched by the elevated WinUI application
 ```
 
-The service, tray, and WinUI projects in this diagram are implemented. The development MSI packages them with restic and authors service/tray registration. The updater remains a planned process, and privileged installer behavior still requires local and OS-matrix qualification.
+The service, tray, and WinUI projects in this diagram are implemented. The development MSI packages them with restic and authors service/tray registration. The WinUI client now checks, downloads, verifies, and launches NetSparkle-signed MSI updates; interrupted upgrades, rollback, and the wider Windows OS matrix still require qualification.
 
 ### `resticpal-service.exe`
 
@@ -88,7 +88,7 @@ The Rust Windows service is the sole owner of:
 
 No tray or UI process may invoke restic directly.
 
-The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler and retention state, backup history, bounded redacted structured diagnostics, managed-manifest fetching/caching, runtime policy refresh, authenticated status delivery, and one-time managed enrollment/rotation/unenrollment. Update coordination remains planned. The service expects a fixed sibling `restic.exe`; the development MSI now supplies a checksum-verified pinned binary at that location.
+The current service implements configuration/policy resolution, scheduling, system-condition gates, restic execution, repository setup/validation, DPAPI credentials, scheduler and retention state, backup history, bounded redacted structured diagnostics, managed-manifest fetching/caching, runtime policy refresh, authenticated status delivery, one-time managed enrollment/rotation/unenrollment, and bounded backup-safe update coordination. The service expects a fixed sibling `restic.exe`; the development MSI now supplies a checksum-verified pinned binary at that location.
 
 ### `resticpal-tray.exe`
 
@@ -104,10 +104,8 @@ The C# WinUI 3 application provides the modern settings and status experience. I
 - Backup sources and exclusions
 - Repository
 - Schedule, power, and network policy
+- Retention
 - Backup history
-
-Planned pages are:
-
 - Diagnostics and local logs
 - Enrollment and managed-policy state
 - Updates and application settings
@@ -359,7 +357,7 @@ The complete tray and UI status surface will expose:
 
 Tray notifications should be useful rather than noisy: notify on an initial failure, repeated/stale protection, user action required, and recovery after a failure streak. Exact notification thresholds are proposed behavior and should be user configurable.
 
-The current local status protocol exposes redacted state, repository name/mode, last attempt/success, deadline/blocker, bounded progress, retention configuration/state, bounded structured diagnostics, and redacted management enrollment state. The overview and tray reduce backup state to a friendly health summary and current progress. The WinUI History page exposes timestamps, duration, outcome, aggregate file/byte statistics, sanitized error code, and snapshot ID for the newest 50 records; Diagnostics exposes the newest 100 fixed-message events to an administrator without paths or raw restic output; Settings provides enrollment, rotation, and unenrollment. Version, update, diagnostic export, and notification surfaces remain planned.
+The current local status protocol exposes redacted state, repository name/mode, last attempt/success, deadline/blocker, bounded progress, retention configuration/state, bounded structured diagnostics, and redacted management enrollment state. The overview and tray reduce backup state to a friendly health summary and current progress. The WinUI History page exposes timestamps, duration, outcome, aggregate file/byte statistics, sanitized error code, and snapshot ID for the newest 50 records; Diagnostics exposes the newest 100 fixed-message events to an administrator without paths or raw restic output; Settings provides enrollment, rotation, unenrollment, installed-version display, and signed update controls. Diagnostic export and notification surfaces remain planned.
 
 ## Remote status reporting
 
@@ -391,15 +389,19 @@ Reports must not contain repository passwords, cloud credentials, enrollment tok
 
 ## Updates
 
-The WinUI project references NetSparkleUpdater 3.1.0, but no appcast, update-check UI, verification flow, or updater helper is wired yet. The intended behavior, until releases have Authenticode code signing, is:
+The WinUI application integrates NetSparkleUpdater 3.1.0 against a stable GitHub Releases appcast URL. NetSparkle runs with strict Ed25519 verification, checks quietly when the settings UI opens, supports an explicit user check, and exposes user-selected download and installation with progress. The MSI and its service, tray, UI, and bundled restic payload are separately Authenticode-signed as StackFoundry LLC in trusted GitHub builds.
+
+The update key is distinct from all resticpal-server policy/enrollment keys. Its private and public backup files live under `~/Dropbox/resticpal/keys/updates`; only the public key is committed and compiled into the Authenticode-signed WinUI executable. The private key is never stored in the repository or GitHub Secrets. A pinned NetSparkle appcast tool and local release script download an Authenticode-signed CI artifact, reject an unexpected publisher or version, generate and verify the appcast/MSI Ed25519 signatures, and optionally publish a reviewed GitHub release.
+
+Current behavior is:
 
 - updates are user-selected and user-initiated;
 - update metadata and packages require Ed25519 verification;
-- the UI warns that Windows may display an unsigned-publisher or SmartScreen prompt;
-- applying an update requires UAC elevation;
-- an update never replaces binaries during an active backup; it waits or asks the user to cancel/defer;
-- the elevated updater stops the service, replaces the application and bundled restic atomically, restarts the service, and reports the outcome;
-- rollback or repair behavior must be designed before automatic installation is considered.
+- applying an update requires the elevated settings application and Windows Installer;
+- before launching the MSI, the service rejects an update while a backup, repository operation, or management operation is active;
+- an accepted preparation holds new backup/repository work for a bounded period while the MSI starts, and automatically expires if installation is cancelled;
+- WiX major-upgrade behavior stops the service, replaces the signed application and bundled restic payload, and restarts the service;
+- rollback, interrupted-upgrade recovery, and repair behavior remain to be qualified before automatic installation is considered.
 
 ## Installer and deployment
 
@@ -424,7 +426,7 @@ The development WinUI project currently declares `10.0.17763.0` (Windows 10 vers
 - Target Windows 10 and Windows 11; the exact minimum Windows 10 build will be validated with the first WinUI/installer prototype.
 - Qualify LocalSystem source access, ProgramData ACL behavior, VSS, repair, same/major upgrades, and reboot/restart cases across supported Windows 10/11 builds.
 - Add a Start Menu entry and installer UI.
-- Install an updater after its trust and rollback design is implemented.
+- Qualify signed NetSparkle download/install, cancelled UAC, interrupted MSI, rollback, and repair behavior on the supported OS matrix.
 - Offers initial local setup or optional enrollment by bootstrap URL.
 - Add an explicit uninstall choice for removing local configuration and credentials; default uninstall remains data-preserving.
 
@@ -437,7 +439,7 @@ The development WinUI project currently declares `10.0.17763.0` (Windows 10 vers
 
 ## Security boundaries
 
-The service-only execution boundary, shell-free command construction, typed option validation, bounded IPC/progress parsing, DPAPI credential references, append-only operation checks, and initial MSI ACL authoring are implemented. Installed ACL behavior still needs elevated qualification, and update/policy signature boundaries still depend on the enrollment and updater milestones.
+The service-only execution boundary, shell-free command construction, typed option validation, bounded IPC/progress parsing, DPAPI credential references, append-only operation checks, initial MSI ACL authoring, Authenticode payload signing, and distinct policy/update Ed25519 trust roots are implemented. Installed ACL and update recovery behavior still need wider elevated qualification.
 
 - Only the service launches restic.
 - Installed executable paths will be fixed and ACL-protected; the current executor already fixes restic to the sibling application path.
@@ -446,7 +448,7 @@ The service-only execution boundary, shell-free command construction, typed opti
 - All paths, URLs, options, environment names, sizes, and message lengths are validated.
 - Managed repository configuration is powerful: an enrolled server can direct readable files to a repository it controls. Enrollment therefore represents an explicit administrator trust decision and must be clearly presented.
 - Append-only mode is enforced both by resticpal command policy and, for meaningful ransomware resistance, by the storage system.
-- Update signatures and policy signatures will use distinct keys and trust purposes.
+- Update signatures and policy signatures use distinct keys and trust purposes.
 
 ## Initial delivery milestones
 
@@ -478,10 +480,10 @@ The service-only execution boundary, shell-free command construction, typed opti
 4. **Enrollment and reporting — functional alpha**
    Plain-file mode, signed-envelope verification, replay/freshness checks, atomic cache fallback, authenticated status delivery, one-time bootstrap, generated device identity, encrypted secret bootstrap, installer staging, UI enrollment/rotation/unenrollment, schemas, tests, and the companion server are implemented. Conditional requests, audit retention, rate limits, and production deployment hardening remain.
 
-5. **Packaging and updates — installer prototype**
+5. **Packaging and updates — functional signed alpha**
    - WiX MSI, startup registration, upgrade/repair/uninstall behavior, NetSparkle appcast verification, and elevated atomic updater.
 
-   The x64 MSI, service/tray registration, bundled restic, data-preserving uninstall authoring, validation, Sandbox E2E harness, and unsigned GitHub CI package workflow exist. Windows-version/VSS and upgrade/repair qualification, installer UX/bootstrap, signing, and the updater remain.
+   The x64 MSI, service/tray registration, bundled restic, synchronized version resources, data-preserving uninstall authoring, validation, Sandbox E2E harness, Azure-signed GitHub CI artifact, strict NetSparkle client, separate backed-up update key, signed-appcast tooling, and backup-safe update preparation exist. Windows-version/VSS/update and upgrade/repair/rollback qualification plus installer UX/bootstrap remain.
 
 ## Required test themes
 
@@ -509,7 +511,7 @@ The following themes remain required as their corresponding product areas land:
 
 ## License
 
-resticpal will use the BSD 2-Clause license with:
+resticpal uses the BSD 2-Clause license with:
 
 ```text
 Copyright (c) 2026 Yann Ramin

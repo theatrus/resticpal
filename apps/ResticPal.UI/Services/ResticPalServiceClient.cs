@@ -46,6 +46,11 @@ internal sealed class ResticPalServiceClient
                 "Test the saved repository connection before backups can continue.",
                 false,
                 false),
+            "waiting" when waitingReason == "update" => (
+                "Update starting",
+                "Backups are held briefly while a resticpal update starts.",
+                false,
+                false),
             "waiting" => (
                 "Backup waiting",
                 "The service is waiting for its scheduling conditions.",
@@ -145,6 +150,15 @@ internal sealed class ResticPalServiceClient
         CancellationToken cancellationToken = default)
     {
         return await SendCommandAsync(new { type = "cancel_backup" }, cancellationToken);
+    }
+
+    public async Task<CommandResult> PrepareForUpdateAsync(
+        uint holdSeconds = 900,
+        CancellationToken cancellationToken = default)
+    {
+        return await SendCommandAsync(
+            new { type = "prepare_for_update", hold_seconds = holdSeconds },
+            cancellationToken);
     }
 
     public async Task<BackupSourcesConfiguration> GetBackupSourcesAsync(
