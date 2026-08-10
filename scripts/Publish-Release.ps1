@@ -118,8 +118,14 @@ if ($Publish) {
     }
 
     $tag = "v$Version"
-    & gh release view $tag --repo theatrus/resticpal *> $null
-    if ($LASTEXITCODE -eq 0) {
+    $existingReleases = @(& gh release list `
+        --repo theatrus/resticpal `
+        --limit 100 `
+        --json tagName | ConvertFrom-Json)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Checking existing GitHub releases failed.'
+    }
+    if ($existingReleases.tagName -contains $tag) {
         throw "GitHub release $tag already exists."
     }
 
