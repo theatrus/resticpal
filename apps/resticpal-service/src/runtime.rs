@@ -666,6 +666,13 @@ impl ServiceRuntime {
 
     pub fn next_evaluation_delay(&self, now: DateTime<Utc>) -> StdDuration {
         let state = self.state_guard();
+        // While a management operation runs, evaluate_schedule returns early
+        // without refreshing next_deadline. If that deadline is already in the
+        // past the loop would otherwise wake with a zero delay and busy-spin for
+        // the whole (up to 30s network) operation; poll at a bounded cadence.
+        if state.management_operation_active {
+            return StdDuration::from_secs(CONDITION_RETRY_SECONDS);
+        }
         if matches!(
             state.status.state,
             BackupState::Waiting {
