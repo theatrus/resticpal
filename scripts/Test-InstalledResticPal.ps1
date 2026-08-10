@@ -341,6 +341,25 @@ try {
     $uiProcess = Wait-InteractiveProcess 'resticpal-ui' ([TimeSpan]::FromSeconds(30))
     Wait-Path $onboardingMarker ([TimeSpan]::FromSeconds(30))
     $onboardingMarkerCreatedByTest = $true
+    Start-Sleep -Seconds 2
+    $onboardingUiProcesses = @(Get-Process -Name 'resticpal-ui' -ErrorAction SilentlyContinue |
+        Where-Object SessionId -eq $interactiveSessionId)
+    if ($onboardingUiProcesses.Count -ne 1) {
+        throw "Expected one first-run settings process, found $($onboardingUiProcesses.Count)."
+    }
+
+    $duplicateUiProcess = Start-Process `
+        -FilePath (Join-Path $installRoot 'resticpal-ui.exe') `
+        -ArgumentList '--setup' `
+        -PassThru
+    if (-not $duplicateUiProcess.WaitForExit(10000)) {
+        throw 'A duplicate settings launch did not yield to the existing window.'
+    }
+    $remainingUiProcesses = @(Get-Process -Name 'resticpal-ui' -ErrorAction SilentlyContinue |
+        Where-Object SessionId -eq $interactiveSessionId)
+    if ($remainingUiProcesses.Count -ne 1 -or $remainingUiProcesses[0].Id -ne $uiProcess.Id) {
+        throw 'The settings single-instance boundary did not preserve the first-run window.'
+    }
     if ($setupUiLaunchedAfterUpgrade) {
         Write-Host "Upgrade preserved the first-run marker; explicit setup process $($uiProcess.Id) opened correctly."
     } else {

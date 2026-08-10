@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::mem::size_of;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -57,6 +58,7 @@ const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../../assets/resticpal.ico");
 const PREFERRED_TRAY_ICON_SIZE: u16 = 32;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static ONBOARDING_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static UI_LAUNCH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
@@ -70,6 +72,24 @@ enum UiDestination {
 struct TrayIcon {
     handle: HICON,
     owned: bool,
+}
+
+struct LaunchGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> LaunchGuard<'a> {
+    fn try_acquire(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self { flag })
+    }
+}
+
+impl Drop for LaunchGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
 }
 
 impl TrayIcon {
@@ -297,6 +317,19 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Windows APIs such as the UAC consent flow can dispatch nested window
+    // messages. Never allow a Rust panic to cross this FFI callback boundary.
+    catch_unwind(AssertUnwindSafe(|| {
+        window_proc_inner(window, message, wparam, lparam)
+    }))
+    .unwrap_or_else(|_| {
+        // SAFETY: after a failed handler, let Windows provide the normal
+        // fallback behavior for the original message.
+        unsafe { DefWindowProcW(window, message, wparam, lparam) }
+    })
+}
+
+fn window_proc_inner(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
         TRAY_CALLBACK => {
             match u32::try_from(lparam.0).unwrap_or_default() {
@@ -422,6 +455,13 @@ fn show_context_menu(window: HWND) -> Result<()> {
 }
 
 fn launch_ui(window: HWND, destination: UiDestination) -> bool {
+    // ShellExecuteW pumps window messages while Windows displays UAC consent.
+    // A timer or click delivered during that nested loop must not start another
+    // elevation request on the same call stack.
+    let Some(_launch_guard) = LaunchGuard::try_acquire(&UI_LAUNCH_IN_PROGRESS) else {
+        return true;
+    };
+
     let Ok(mut executable) = std::env::current_exe() else {
         show_error(
             window,
@@ -472,6 +512,10 @@ fn maybe_launch_onboarding(window: HWND) -> bool {
     };
     if let ResponsePayload::Status { status } = response.payload {
         if should_launch_onboarding(marker_exists, &status.state) {
+            // Stop retry delivery before ShellExecuteW enters the nested UAC
+            // message loop. A rejected prompt remains user-recoverable from
+            // the tray without generating another prompt automatically.
+            let _ = unsafe { KillTimer(Some(window), ONBOARDING_TIMER_ID) };
             let _ = launch_ui(window, UiDestination::Setup);
             return true;
         }
@@ -830,6 +874,16 @@ fn wide_null(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn launch_guard_rejects_reentrant_launches_and_resets_on_drop() {
+        let flag = AtomicBool::new(false);
+        let guard = LaunchGuard::try_acquire(&flag).expect("first launch should acquire the guard");
+
+        assert!(LaunchGuard::try_acquire(&flag).is_none());
+        drop(guard);
+        assert!(LaunchGuard::try_acquire(&flag).is_some());
+    }
 
     #[test]
     fn embedded_tray_icon_contains_the_preferred_png_image() {
