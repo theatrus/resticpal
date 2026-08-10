@@ -588,12 +588,17 @@ fn finish_outcome(
     let Ok(parsed) = output_result else {
         return BackupOutcome::failed("restic_output_invalid");
     };
-    if parsed.invalid_message {
-        return BackupOutcome::failed("restic_output_invalid");
-    }
 
+    // A single oversized or non-JSON stdout line (e.g. a huge status update)
+    // must not poison an otherwise-successful run. When restic exits cleanly and
+    // produced a valid summary, honor it regardless of intermediate parse
+    // failures; the invalid-message flag only refines the diagnostic when the
+    // summary is genuinely missing.
     let Some(summary) = parsed.summary else {
         return match status.code() {
+            Some(0) if parsed.invalid_message => {
+                BackupOutcome::failed("restic_output_invalid")
+            }
             Some(0) => BackupOutcome::failed("restic_summary_missing"),
             Some(code) => BackupOutcome::failed(
                 classify_stderr(stderr)
@@ -1012,6 +1017,35 @@ mod tests {
         assert_eq!(
             parsed.summary.expect("summary").snapshot_id.as_deref(),
             Some("bounded")
+        );
+    }
+
+    #[test]
+    fn an_oversized_progress_line_does_not_fail_a_successful_backup() {
+        use std::os::windows::process::ExitStatusExt;
+
+        // A status line larger than MAX_JSON_LINE_BYTES is dropped as oversized,
+        // followed by a valid summary from a clean restic exit.
+        let mut output =
+            br#"{"message_type":"status","files_done":1,"note":""#.to_vec();
+        output.resize(output.len() + MAX_JSON_LINE_BYTES + 16, b'x');
+        output.extend_from_slice(br#""}"#);
+        output.push(b'\n');
+        output.extend_from_slice(
+            br#"{"message_type":"summary","total_files_processed":3,"total_bytes_processed":4,"data_added":5,"snapshot_id":"ok"}"#,
+        );
+        output.push(b'\n');
+        let (progress_tx, _progress_rx) = mpsc::sync_channel(1);
+
+        let parsed = read_json_output(output.as_slice(), &progress_tx).expect("read output");
+        assert!(parsed.invalid_message, "oversized line marks invalid_message");
+        assert!(parsed.summary.is_some(), "summary still parses");
+
+        let outcome = finish_outcome(ExitStatus::from_raw(0), Ok(parsed), b"");
+        assert_eq!(outcome.kind, BackupOutcomeKind::Succeeded);
+        assert_eq!(
+            outcome.summary.expect("summary").snapshot_id.as_deref(),
+            Some("ok")
         );
     }
 
