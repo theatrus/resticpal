@@ -58,6 +58,15 @@ pub fn completion_deadline(
     interval_hours: u32,
 ) -> DateTime<Utc> {
     last_success
+        .map(|completed| {
+            // A backup cannot legitimately complete in the future. A persisted
+            // `last_success` ahead of `now` means the clock was wrong when it was
+            // recorded (dead CMOS battery, wrong timezone, restored VM snapshot);
+            // trusting it would push the next deadline arbitrarily far out and
+            // leave the machine silently unprotected. Clamp to `now` so the next
+            // deadline is one interval away instead.
+            completed.min(now)
+        })
         .and_then(|completed| {
             completed.checked_add_signed(Duration::hours(i64::from(interval_hours)))
         })
@@ -282,14 +291,38 @@ mod tests {
 
     #[test]
     fn malformed_extreme_timestamps_cannot_panic_the_scheduler() {
-        let mut state = snapshot(timestamp(9, 0));
+        let now = timestamp(9, 0);
+        let mut state = snapshot(now);
         state.last_success = Some(DateTime::<Utc>::MAX_UTC);
+
+        // An extreme future timestamp is clamped to `now` rather than overflowing
+        // or postponing the deadline out to the maximum representable time.
+        assert_eq!(
+            decide(&ScheduleConfig::default(), &state),
+            ScheduleDecision::Idle {
+                next_deadline: now + Duration::hours(24)
+            }
+        );
+    }
+
+    #[test]
+    fn a_future_last_success_does_not_postpone_the_next_backup() {
+        // A wrong clock recorded a completion a year ahead; after the clock is
+        // corrected the machine must still become due one interval from now
+        // rather than waiting until the bogus future timestamp.
+        let now = timestamp(9, 0);
+        let mut state = snapshot(now);
+        state.last_success = Some(now + Duration::days(365));
 
         assert_eq!(
             decide(&ScheduleConfig::default(), &state),
-            ScheduleDecision::Start {
-                trigger: BackupTrigger::Scheduled
+            ScheduleDecision::Idle {
+                next_deadline: now + Duration::hours(24)
             }
+        );
+        assert_eq!(
+            completion_deadline(Some(now + Duration::days(365)), now, 24),
+            now + Duration::hours(24)
         );
     }
 }
