@@ -18,7 +18,7 @@ f581c60bf88a31433837d7d8c329eaf3a31c523c44cc38b30c90e7f1cf5866b4
 Use the version helper so the Cargo workspace, Cargo lockfile, WinUI assembly/file metadata, and application manifest move together:
 
 ```powershell
-.\scripts\Set-Version.ps1 -Version 1.0.0
+.\scripts\Set-Version.ps1 -Version 1.0.1
 ```
 
 The MSI and generated appcast both derive their version from this synchronized product version. CI runs `Test-VersionConsistency.ps1` and rejects drift.

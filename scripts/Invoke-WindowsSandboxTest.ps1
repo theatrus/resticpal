@@ -6,6 +6,8 @@ param(
     [Parameter(Mandatory)]
     [string] $ResultRoot,
 
+    [string] $UpgradeFromMsiPath,
+
     [switch] $KeepOpen
 )
 
@@ -16,6 +18,7 @@ $temporaryResultPath = Join-Path $ResultRoot 'result.json.tmp'
 $transcriptPath = Join-Path $ResultRoot 'guest.log'
 $localTestRoot = 'C:\ResticPalTest'
 $localMsiPath = Join-Path $localTestRoot 'resticpal.msi'
+$localUpgradeFromMsiPath = Join-Path $localTestRoot 'resticpal-upgrade-from.msi'
 $localTestArtifactRoot = Join-Path $localTestRoot 'artifacts'
 $exportedTestArtifactRoot = Join-Path $ResultRoot 'test-artifacts'
 $status = 'failed'
@@ -195,6 +198,9 @@ try {
     New-Item -ItemType Directory -Path $ResultRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $localTestRoot -Force | Out-Null
     Copy-Item -LiteralPath $MsiPath -Destination $localMsiPath
+    if (-not [string]::IsNullOrWhiteSpace($UpgradeFromMsiPath)) {
+        Copy-Item -LiteralPath $UpgradeFromMsiPath -Destination $localUpgradeFromMsiPath
+    }
     Start-Transcript -LiteralPath $transcriptPath -Force | Out-Null
     $transcriptStarted = $true
 
@@ -205,7 +211,14 @@ try {
     }
 
     $testScript = 'C:\ResticPalSource\scripts\Test-InstalledResticPal.ps1'
-    & $testScript -MsiPath $localMsiPath -ArtifactRoot $localTestArtifactRoot
+    $testArguments = @{
+        MsiPath = $localMsiPath
+        ArtifactRoot = $localTestArtifactRoot
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UpgradeFromMsiPath)) {
+        $testArguments.UpgradeFromMsiPath = $localUpgradeFromMsiPath
+    }
+    & $testScript @testArguments
     $status = 'passed'
     $exitCode = 0
 } catch {

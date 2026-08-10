@@ -6,6 +6,7 @@
     Title="resticpal">
 
     <NavigationView
+        x:Name="NavigationRoot"
         IsBackButtonVisible="Collapsed"
         IsSettingsVisible="True"
         Loaded="NavigationView_Loaded"
@@ -688,7 +689,20 @@
                         </Grid.RowDefinitions>
 
                         <StackPanel Spacing="6">
-                            <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Managed backup" />
+                            <InfoBar
+                                x:Name="FirstRunInfoBar"
+                                IsClosable="False"
+                                IsOpen="False"
+                                Message="Paste a one-time bootstrap URL below to enroll this PC, or configure backup sources and a repository locally."
+                                Severity="Informational"
+                                Title="Set up this PC">
+                                <InfoBar.ActionButton>
+                                    <Button
+                                        Click="ConfigureLocallyButton_Click"
+                                        Content="Configure locally" />
+                                </InfoBar.ActionButton>
+                            </InfoBar>
+                            <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Setup and management" />
                             <TextBlock
                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                 Text="Enroll this PC with a one-time signed URL to receive policy, repository credentials, and status reporting settings."

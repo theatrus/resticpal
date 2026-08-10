@@ -10,9 +10,23 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of resticpal is already installed."
                   Schedule="afterInstallInitialize" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
-    <Icon Id="ResticPalIcon" SourceFile="$(BrandIcon)" />
-    <Property Id="ARPPRODUCTICON" Value="ResticPalIcon" />
+    <Icon Id="ResticPalIcon.ico" SourceFile="$(BrandIcon)" />
+    <Property Id="ARPPRODUCTICON" Value="ResticPalIcon.ico" />
     <Property Id="RESTICPAL_BOOTSTRAP_URL" Hidden="yes" Secure="yes" />
+    <util:CloseApplication Id="CloseResticPalTray"
+                           Target="resticpal-tray.exe"
+                           CloseMessage="yes"
+                           ElevatedCloseMessage="yes"
+                           Timeout="5"
+                           TerminateProcess="0"
+                           RebootPrompt="no" />
+    <util:CloseApplication Id="CloseResticPalUi"
+                           Target="resticpal-ui.exe"
+                           CloseMessage="yes"
+                           ElevatedCloseMessage="yes"
+                           Timeout="5"
+                           TerminateProcess="0"
+                           RebootPrompt="no" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="resticpal" />
@@ -20,9 +34,12 @@
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="PROGRAMDATADIR" Name="ResticPal" />
     </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
     <Feature Id="Complete" Title="resticpal" Level="1" AllowAdvertise="no">
       <Files Directory="INSTALLFOLDER" Include="$(StageDir)\**">
         <Exclude Files="$(StageDir)\resticpal-service.exe" />
+        <Exclude Files="$(StageDir)\resticpal-tray.exe" />
+        <Exclude Files="$(StageDir)\resticpal-ui.exe" />
         <!-- These multilingual Windows App SDK binaries list enough LCIDs to
              overflow MSI's File.Language column. Author them explicitly as
              language-neutral; their embedded resources remain unchanged. -->
@@ -90,12 +107,30 @@
       <Component Id="TrayStartup"
                  Guid="17E07A3D-C868-4D1F-9701-0CE3F77B2164"
                  Directory="INSTALLFOLDER">
+        <File Id="TrayExecutable"
+              Source="$(StageDir)\resticpal-tray.exe" />
         <RegistryValue Root="HKLM"
                        Key="Software\Microsoft\Windows\CurrentVersion\Run"
                        Name="ResticPal"
                        Type="string"
                        Value="&quot;[INSTALLFOLDER]resticpal-tray.exe&quot;"
                        KeyPath="yes" />
+      </Component>
+
+      <Component Id="UiExecutableComponent"
+                 Guid="D8CE5E44-21ED-476E-AEBD-43AB6D353B87"
+                 Directory="INSTALLFOLDER">
+        <File Id="UiExecutable"
+              Source="$(StageDir)\resticpal-ui.exe"
+              KeyPath="yes">
+          <Shortcut Id="ResticPalSettingsShortcut"
+                    Directory="ProgramMenuFolder"
+                    Name="resticpal"
+                    Description="Configure and monitor resticpal backups"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Advertise="yes"
+                    Icon="ResticPalIcon.ico" />
+        </File>
       </Component>
 
       <Component Id="BootstrapEnrollment"
@@ -115,5 +150,20 @@
       </Component>
 
     </Feature>
+
+    <!-- Launch in the installing user's normal desktop token after install,
+         upgrade, or repair. The tray itself prevents duplicate instances and
+         opens first-run setup when needed. -->
+    <Property Id="WixUnelevatedShellExecTarget" Value="[#TrayExecutable]" />
+    <CustomAction Id="LaunchTrayAfterInstall"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixUnelevatedShellExec"
+                  Execute="immediate"
+                  Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="LaunchTrayAfterInstall"
+              After="InstallFinalize"
+              Condition="NOT (REMOVE ~= &quot;ALL&quot;)" />
+    </InstallExecuteSequence>
   </Package>
 </Wix>

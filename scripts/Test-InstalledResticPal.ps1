@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string] $MsiPath,
+    [string] $UpgradeFromMsiPath,
     [switch] $KeepInstalled,
     [string] $ArtifactRoot
 )
@@ -22,8 +23,16 @@ if ([string]::IsNullOrWhiteSpace($MsiPath)) {
     $MsiPath = $candidates[0].FullName
 }
 $resolvedMsiPath = (Resolve-Path -LiteralPath $MsiPath).Path
+$resolvedUpgradeFromMsiPath = if ([string]::IsNullOrWhiteSpace($UpgradeFromMsiPath)) {
+    $null
+} else {
+    (Resolve-Path -LiteralPath $UpgradeFromMsiPath).Path
+}
 $installRoot = Join-Path $env:ProgramFiles 'resticpal'
 $dataRoot = Join-Path $env:ProgramData 'ResticPal'
+$startMenuShortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\resticpal.lnk'
+$onboardingMarker = Join-Path $env:LOCALAPPDATA 'resticpal\onboarding-shown-v1'
+$interactiveSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
 $e2eRoot = Join-Path $dataRoot 'E2E'
 $sourceRoot = Join-Path $e2eRoot 'Source'
 $backupRoot = Join-Path $e2eRoot 'Repository'
@@ -33,10 +42,13 @@ if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
 $artifactRoot = [IO.Path]::GetFullPath($ArtifactRoot)
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $installLog = Join-Path $artifactRoot "install-$timestamp.log"
+$baselineInstallLog = Join-Path $artifactRoot "baseline-install-$timestamp.log"
 $uninstallLog = Join-Path $artifactRoot "uninstall-$timestamp.log"
 $script:requestId = 0L
 $protocolVersion = 3
 $installedByTest = $false
+$installedPackagePath = $null
+$onboardingMarkerCreatedByTest = $false
 $testReachedPersistenceCheck = $false
 
 function Invoke-Installer([string] $Arguments, [string] $Action) {
@@ -48,6 +60,31 @@ function Invoke-Installer([string] $Arguments, [string] $Action) {
     if ($process.ExitCode -ne 0) {
         throw "$Action failed with Windows Installer exit code $($process.ExitCode)."
     }
+}
+
+function Wait-InteractiveProcess([string] $Name, [TimeSpan] $Timeout) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    do {
+        $process = Get-Process -Name $Name -ErrorAction SilentlyContinue |
+            Where-Object SessionId -eq $interactiveSessionId |
+            Select-Object -First 1
+        if ($null -ne $process) {
+            return $process
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for $Name in interactive session $interactiveSessionId."
+}
+
+function Wait-Path([string] $Path, [TimeSpan] $Timeout) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    do {
+        if (Test-Path -LiteralPath $Path) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for $Path."
 }
 
 function Read-Exact([IO.Stream] $Stream, [int] $Count) {
@@ -190,12 +227,33 @@ if (Test-Path -LiteralPath $installRoot) {
 if (Test-Path -LiteralPath $dataRoot) {
     throw "The data directory already exists: $dataRoot"
 }
+if (Test-Path -LiteralPath $onboardingMarker -PathType Leaf) {
+    throw "The current user already has a first-run marker; use Windows Sandbox for a clean onboarding test: $onboardingMarker"
+}
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 
 try {
+    if ($null -ne $resolvedUpgradeFromMsiPath) {
+        Write-Host "Installing upgrade baseline $resolvedUpgradeFromMsiPath"
+        Invoke-Installer "/i `"$resolvedUpgradeFromMsiPath`" /qn /norestart /l*v `"$baselineInstallLog`"" 'Baseline installation'
+        $installedByTest = $true
+        $installedPackagePath = $resolvedUpgradeFromMsiPath
+        $baselineService = Get-Service -Name ResticPal
+        $baselineService.WaitForStatus(
+            [ServiceProcess.ServiceControllerStatus]::Running,
+            [TimeSpan]::FromSeconds(30)
+        )
+        $upgradeSentinel = Join-Path $dataRoot 'upgrade-sentinel.txt'
+        Set-Content -LiteralPath $upgradeSentinel -Value 'preserve across major upgrade' -NoNewline
+        Write-Host "Upgrading the baseline installation to $resolvedMsiPath"
+    }
     Write-Host "Installing $resolvedMsiPath"
     Invoke-Installer "/i `"$resolvedMsiPath`" /qn /norestart /l*v `"$installLog`"" 'Installation'
     $installedByTest = $true
+    $installedPackagePath = $resolvedMsiPath
+    if ($null -ne $resolvedUpgradeFromMsiPath -and -not (Test-Path -LiteralPath $upgradeSentinel -PathType Leaf)) {
+        throw 'The major upgrade did not preserve existing machine data.'
+    }
 
     $service = Get-Service -Name ResticPal
     $service.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(30))
@@ -215,11 +273,24 @@ try {
     if ($runValue -notlike '*resticpal-tray.exe*') {
         throw 'The tray logon registration is missing or invalid.'
     }
+    $trayProcess = Wait-InteractiveProcess 'resticpal-tray' ([TimeSpan]::FromSeconds(30))
+    Write-Host "Tray process $($trayProcess.Id) started in the installing user's session."
+
+    Wait-Path $startMenuShortcut ([TimeSpan]::FromSeconds(10))
 
     $status = Invoke-ResticPalRequest @{ type = 'get_status' }
     if ($status.type -ne 'status' -or $status.status.state.state -ne 'unconfigured') {
         throw 'A fresh installed service did not report the expected unconfigured state.'
     }
+    $uiProcess = Wait-InteractiveProcess 'resticpal-ui' ([TimeSpan]::FromSeconds(30))
+    Wait-Path $onboardingMarker ([TimeSpan]::FromSeconds(30))
+    $onboardingMarkerCreatedByTest = $true
+    Write-Host "First-run setup process $($uiProcess.Id) opened for bootstrap or local configuration."
+    Stop-Process -Id $uiProcess.Id -Force
+    $uiProcess.WaitForExit(10000) | Out-Null
+    Start-Process -FilePath $startMenuShortcut
+    $startMenuUiProcess = Wait-InteractiveProcess 'resticpal-ui' ([TimeSpan]::FromSeconds(30))
+    Write-Host "The all-users Start Menu shortcut opened settings as process $($startMenuUiProcess.Id)."
 
     New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $sourceRoot 'document.txt') -Value 'resticpal installed-service end-to-end data' -NoNewline
@@ -324,18 +395,38 @@ try {
 } finally {
     if ($installedByTest -and -not $KeepInstalled) {
         Write-Host 'Uninstalling the end-to-end package...'
-        Invoke-Installer "/x `"$resolvedMsiPath`" /qn /norestart /l*v `"$uninstallLog`"" 'Uninstallation'
+        Invoke-Installer "/x `"$installedPackagePath`" /qn /norestart /l*v `"$uninstallLog`"" 'Uninstallation'
         if ($null -ne (Get-Service -Name ResticPal -ErrorAction SilentlyContinue)) {
             throw 'The ResticPal service still exists after uninstall.'
         }
         if (Test-Path -LiteralPath $installRoot) {
             throw 'The resticpal install directory still exists after uninstall.'
         }
+        if (Test-Path -LiteralPath $startMenuShortcut) {
+            throw 'The all-users Start Menu shortcut still exists after uninstall.'
+        }
+        $remainingRunKey = Get-ItemProperty `
+            -LiteralPath 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' `
+            -ErrorAction SilentlyContinue
+        $remainingRunValue = $remainingRunKey.ResticPal
+        if ($null -ne $remainingRunValue) {
+            throw 'The all-users tray logon registration still exists after uninstall.'
+        }
+        foreach ($processName in @('resticpal-tray', 'resticpal-ui')) {
+            $remainingProcess = Get-Process -Name $processName -ErrorAction SilentlyContinue |
+                Where-Object SessionId -eq $interactiveSessionId
+            if ($null -ne $remainingProcess) {
+                throw "$processName is still running in the interactive session after uninstall."
+            }
+        }
         if (-not (Test-Path -LiteralPath $dataRoot)) {
             throw 'Uninstall removed machine backup data instead of preserving it.'
         }
         if ($testReachedPersistenceCheck) {
             Write-Host 'Install, backup, restart, persistence, and uninstall checks passed.'
+        }
+        if ($onboardingMarkerCreatedByTest) {
+            Remove-Item -LiteralPath $onboardingMarker -Force
         }
         Remove-Item -LiteralPath $dataRoot -Recurse -Force
     }

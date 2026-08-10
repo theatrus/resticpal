@@ -21,7 +21,7 @@ Build the MSI on the host, then start the VM from a normal PowerShell session:
 .\scripts\Start-WindowsSandboxTest.ps1
 ```
 
-The launcher blocks until the guest reports a result, making it suitable for agentic shell work. On Windows 11 24H2 and newer it prefers the Windows Sandbox CLI, sharing the test payload and starting the guest harness directly in the signed-in Sandbox administrator session. This avoids depending on `.wsb` logon-command startup while preserving the normal Windows Installer execution context. Older hosts fall back to launching the generated `.wsb` file. Each run gets a directory under `artifacts\windows-sandbox`. That directory contains the generated `.wsb` configuration, a copy of the tested MSI, `result.json`, a guest transcript, and the MSI lifecycle logs. Failed installer runs also export relevant Windows events and service-startup probes.
+The launcher blocks until the guest reports a result, making it suitable for agentic shell work. On Windows 11 24H2 and newer it prefers the Windows Sandbox CLI, sharing the test payload and starting the guest harness directly in the signed-in Sandbox administrator session. This avoids depending on `.wsb` logon-command startup while preserving the normal Windows Installer execution context. Older hosts fall back to launching the generated `.wsb` file. The lifecycle verifies the current-session tray process, all-users logon registration, first-run bootstrap/local setup, all-users Start Menu launch, real local restic backups in append-only and standard modes, restart persistence, process/registration cleanup, and data-preserving uninstall. Each run gets a directory under `artifacts\windows-sandbox`. That directory contains the generated `.wsb` configuration, a copy of the tested MSI, `result.json`, a guest transcript, and the MSI lifecycle logs. Failed installer runs also export relevant Windows events and service-startup probes.
 
 The source tree is mounted read-only. The guest can write only to its run-specific artifact directory. Networking, clipboard sharing, device input, printers, and vGPU are disabled by default. Pass `-EnableNetworking` only for a test that needs network access, or `-KeepOpen` to leave the VM open for interactive inspection after the test completes.
 
@@ -29,6 +29,7 @@ Useful options:
 
 ```powershell
 .\scripts\Start-WindowsSandboxTest.ps1 -MsiPath C:\path\to\resticpal.msi
+.\scripts\Start-WindowsSandboxTest.ps1 -MsiPath C:\path\to\new.msi -UpgradeFromMsiPath C:\path\to\old.msi
 .\scripts\Start-WindowsSandboxTest.ps1 -MemoryInMB 4096 -TimeoutMinutes 20
 .\scripts\Start-WindowsSandboxTest.ps1 -GenerateOnly
 .\scripts\Start-WindowsSandboxTest.ps1 -UseLegacyLauncher

@@ -48,7 +48,16 @@ try {
         'Secure="yes" Hidden="yes"',
         'Name="BootstrapUrl"',
         'Value="[RESTICPAL_BOOTSTRAP_URL]"',
-        'Property Id="ARPPRODUCTICON" Value="ResticPalIcon"',
+        'Property Id="ARPPRODUCTICON" Value="ResticPalIcon.ico"',
+        'Shortcut Id="ResticPalSettingsShortcut"',
+        'Directory="ProgramMenuFolder"',
+        'File Id="TrayExecutable"',
+        'CustomAction Id="LaunchTrayAfterInstall"',
+        'DllEntry="WixUnelevatedShellExec"',
+        'Condition="NOT (REMOVE ~= &quot;ALL&quot;)"',
+        '<CustomTable Id="Wix4CloseApplication">',
+        '<Data Column="CloseApplication" Value="CloseResticPalTray" />',
+        '<Data Column="CloseApplication" Value="CloseResticPalUi" />',
         '<CustomTable Id="Wix4SecureObject">'
     )) {
         if (-not $decompiledPackage.Contains($requiredAuthoring)) {

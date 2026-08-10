@@ -2,6 +2,8 @@
 param(
     [string] $MsiPath,
 
+    [string] $UpgradeFromMsiPath,
+
     [ValidateRange(2048, 32768)]
     [int] $MemoryInMB = 8192,
 
@@ -35,12 +37,23 @@ if ([string]::IsNullOrWhiteSpace($MsiPath)) {
     $MsiPath = $candidates[0].FullName
 }
 $resolvedMsiPath = (Resolve-Path -LiteralPath $MsiPath).Path
+$resolvedUpgradeFromMsiPath = if ([string]::IsNullOrWhiteSpace($UpgradeFromMsiPath)) {
+    $null
+} else {
+    (Resolve-Path -LiteralPath $UpgradeFromMsiPath).Path
+}
 
 $runId = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), ([Guid]::NewGuid().ToString('N').Substring(0, 8))
 $runRoot = Join-Path $repositoryRoot "artifacts\windows-sandbox\$runId"
 New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
 $sandboxMsiPath = Join-Path $runRoot 'resticpal.msi'
 Copy-Item -LiteralPath $resolvedMsiPath -Destination $sandboxMsiPath
+$upgradeArgument = ''
+if ($null -ne $resolvedUpgradeFromMsiPath) {
+    $sandboxUpgradeMsiPath = Join-Path $runRoot 'resticpal-upgrade-from.msi'
+    Copy-Item -LiteralPath $resolvedUpgradeFromMsiPath -Destination $sandboxUpgradeMsiPath
+    $upgradeArgument = ' -UpgradeFromMsiPath C:\ResticPalRun\resticpal-upgrade-from.msi'
+}
 $stagedServicePath = Join-Path $repositoryRoot 'artifacts\installer\stage\resticpal-service.exe'
 if (Test-Path -LiteralPath $stagedServicePath -PathType Leaf) {
     Copy-Item -LiteralPath $stagedServicePath -Destination (Join-Path $runRoot 'resticpal-service.exe')
@@ -83,7 +96,7 @@ $configuration = @"
     </MappedFolder>
   </MappedFolders>
   <LogonCommand>
-    <Command>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ResticPalSource\scripts\Invoke-WindowsSandboxTest.ps1 -MsiPath C:\ResticPalRun\resticpal.msi -ResultRoot C:\ResticPalRun$keepOpenArgument</Command>
+    <Command>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ResticPalSource\scripts\Invoke-WindowsSandboxTest.ps1 -MsiPath C:\ResticPalRun\resticpal.msi -ResultRoot C:\ResticPalRun$upgradeArgument$keepOpenArgument</Command>
   </LogonCommand>
 </Configuration>
 "@
@@ -184,7 +197,7 @@ if ($useSandboxCli) {
             throw "Windows Sandbox did not establish its interactive administrator session: $($loginOutput | Out-String)"
         }
 
-        $guestCommand = 'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ResticPalSource\scripts\Invoke-WindowsSandboxTest.ps1 -MsiPath C:\ResticPalRun\resticpal.msi -ResultRoot C:\ResticPalRun -KeepOpen'
+        $guestCommand = "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\ResticPalSource\scripts\Invoke-WindowsSandboxTest.ps1 -MsiPath C:\ResticPalRun\resticpal.msi -ResultRoot C:\ResticPalRun$upgradeArgument -KeepOpen"
         $guestExecutionJob = Start-Job -ScriptBlock {
             param($Executable, $SandboxId, $Command)
             $output = & $Executable exec `

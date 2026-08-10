@@ -84,7 +84,7 @@ internal sealed class ResticPalServiceClient
             _ => ("Unknown service state", stateName, false, false),
         };
 
-        return new ServiceSnapshot(headline, description, canRun, canCancel);
+        return new ServiceSnapshot(stateName, headline, description, canRun, canCancel);
     }
 
     public async Task<ManagementConfiguration> GetManagementAsync(
@@ -578,6 +578,7 @@ internal sealed class ResticPalServiceClient
 }
 
 internal sealed record ServiceSnapshot(
+    string State,
     string Headline,
     string Description,
     bool CanRunBackup,

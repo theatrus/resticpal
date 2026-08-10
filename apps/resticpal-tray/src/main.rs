@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::mem::size_of;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use resticpal_core::status::BackupState;
@@ -14,12 +15,12 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
-    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, LR_DEFAULTCOLOR, LoadCursorW, LoadIconW,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MENU_ITEM_FLAGS, MSG, MessageBoxW, PostQuitMessage,
-    RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
+    GetCursorPos, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, KillTimer, LR_DEFAULTCOLOR,
+    LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MENU_ITEM_FLAGS, MSG,
+    MessageBoxW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, SetTimer,
+    TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
+    WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{Error, Result, w};
 
@@ -29,10 +30,14 @@ const TRAY_ICON_ID: u32 = 1;
 const MENU_OPEN: usize = 1;
 const MENU_RUN_BACKUP: usize = 2;
 const MENU_EXIT: usize = 3;
+const ONBOARDING_TIMER_ID: usize = 2;
+const ONBOARDING_RETRY_INTERVAL_MS: u32 = 1_000;
+const ONBOARDING_MAX_ATTEMPTS: u64 = 120;
 const MF_STRING: MENU_ITEM_FLAGS = MENU_ITEM_FLAGS(0);
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../../assets/resticpal.ico");
 const PREFERRED_TRAY_ICON_SIZE: u16 = 32;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static ONBOARDING_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 
 struct TrayIcon {
     handle: HICON,
@@ -91,6 +96,12 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // A machine-wide Run entry and the post-install launch can overlap during
+    // upgrades. Keep one notification icon per interactive session.
+    if unsafe { FindWindowW(WINDOW_CLASS, None) }.is_ok() {
+        return Ok(());
+    }
+
     // SAFETY: None asks Windows for the module containing this executable.
     let module = unsafe { GetModuleHandleW(None) }?;
     let instance = HINSTANCE(module.0);
@@ -130,6 +141,19 @@ fn run() -> Result<()> {
     }?;
 
     add_tray_icon(window, tray_icon.handle)?;
+    if !maybe_launch_onboarding(window) {
+        // The service can briefly report validation/waiting state while a fresh
+        // install settles. Retry from the normal Windows message loop so the
+        // notification icon remains responsive during that grace period.
+        unsafe {
+            SetTimer(
+                Some(window),
+                ONBOARDING_TIMER_ID,
+                ONBOARDING_RETRY_INTERVAL_MS,
+                None,
+            );
+        }
+    }
     run_message_loop()
 }
 
@@ -238,7 +262,9 @@ unsafe extern "system" fn window_proc(
     match message {
         TRAY_CALLBACK => {
             match u32::try_from(lparam.0).unwrap_or_default() {
-                WM_LBUTTONDBLCLK => launch_ui(window),
+                WM_LBUTTONDBLCLK => {
+                    let _ = launch_ui(window, false);
+                }
                 WM_RBUTTONUP => {
                     if let Err(error) = show_context_menu(window) {
                         show_error(window, &error.to_string());
@@ -253,7 +279,17 @@ unsafe extern "system" fn window_proc(
             let _ = unsafe { DestroyWindow(window) };
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == ONBOARDING_TIMER_ID => {
+            let attempts = ONBOARDING_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
+            if maybe_launch_onboarding(window) || attempts >= ONBOARDING_MAX_ATTEMPTS {
+                // SAFETY: this removes only the timer created for this window.
+                let _ = unsafe { KillTimer(Some(window), ONBOARDING_TIMER_ID) };
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            // SAFETY: harmless if the onboarding timer has already been removed.
+            let _ = unsafe { KillTimer(Some(window), ONBOARDING_TIMER_ID) };
             remove_tray_icon(window);
             // SAFETY: called from the UI thread's window procedure.
             unsafe { PostQuitMessage(0) };
@@ -303,7 +339,9 @@ fn show_context_menu(window: HWND) -> Result<()> {
         };
 
         match usize::try_from(command.0).unwrap_or_default() {
-            MENU_OPEN => launch_ui(window),
+            MENU_OPEN => {
+                let _ = launch_ui(window, false);
+            }
             MENU_RUN_BACKUP => {
                 if backup_running {
                     send_backup_action(window, RequestCommand::CancelBackup);
@@ -325,16 +363,21 @@ fn show_context_menu(window: HWND) -> Result<()> {
     result.and(destroy_result)
 }
 
-fn launch_ui(window: HWND) {
+fn launch_ui(window: HWND, show_onboarding: bool) -> bool {
     let Ok(mut executable) = std::env::current_exe() else {
         show_error(
             window,
             "The resticpal installation path could not be found.",
         );
-        return;
+        return false;
     };
     executable.set_file_name("resticpal-ui.exe");
     let executable = wide_null(&executable.to_string_lossy());
+    let arguments = if show_onboarding {
+        w!("--setup")
+    } else {
+        w!("")
+    };
     // SAFETY: the executable path is live and null terminated. ShellExecute
     // handles the UAC consent flow required by the settings application.
     let result = unsafe {
@@ -342,7 +385,7 @@ fn launch_ui(window: HWND) {
             Some(window),
             w!("runas"),
             windows::core::PCWSTR(executable.as_ptr()),
-            w!(""),
+            arguments,
             w!(""),
             SW_SHOWNORMAL,
         )
@@ -355,7 +398,40 @@ fn launch_ui(window: HWND) {
                 result.0 as isize
             ),
         );
+        false
+    } else {
+        true
     }
+}
+
+fn maybe_launch_onboarding(window: HWND) -> bool {
+    let marker_exists = onboarding_marker_path().is_some_and(|path| path.is_file());
+    if marker_exists {
+        return true;
+    }
+    let Ok(response) = send_request(RequestCommand::GetStatus) else {
+        return false;
+    };
+    if let ResponsePayload::Status { status } = response.payload {
+        if should_launch_onboarding(marker_exists, &status.state) {
+            let _ = launch_ui(window, true);
+            return true;
+        }
+        return !matches!(status.state, BackupState::Waiting { .. });
+    }
+    false
+}
+
+fn onboarding_marker_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|root| {
+        PathBuf::from(root)
+            .join("resticpal")
+            .join("onboarding-shown-v1")
+    })
+}
+
+fn should_launch_onboarding(marker_exists: bool, state: &BackupState) -> bool {
+    !marker_exists && matches!(state, BackupState::Unconfigured)
 }
 
 fn send_backup_action(window: HWND, command: RequestCommand) {
@@ -540,5 +616,12 @@ mod tests {
         let truncated = [0, 0, 1, 0, 1, 0, 32, 32];
 
         assert!(select_icon_image(&truncated, 32).is_none());
+    }
+
+    #[test]
+    fn onboarding_is_offered_once_for_an_unconfigured_user() {
+        assert!(should_launch_onboarding(false, &BackupState::Unconfigured));
+        assert!(!should_launch_onboarding(true, &BackupState::Unconfigured));
+        assert!(!should_launch_onboarding(false, &BackupState::Idle));
     }
 }

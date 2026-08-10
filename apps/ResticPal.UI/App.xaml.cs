@@ -13,8 +13,10 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
-        _window = new MainWindow();
+        bool showOnboarding = args.Arguments
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Contains("--setup", StringComparer.OrdinalIgnoreCase);
+        _window = new MainWindow(showOnboarding);
         _window.Activate();
     }
 }
-

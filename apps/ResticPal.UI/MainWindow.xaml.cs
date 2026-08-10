@@ -11,6 +11,7 @@ public sealed partial class MainWindow : Window
 {
     private readonly ResticPalServiceClient _service = new();
     private readonly ResticPalUpdateService _updates = new();
+    private readonly bool _showOnboarding;
     private bool _sourcesLoaded;
     private bool _pathsLocked;
     private bool _exclusionsLocked;
@@ -49,8 +50,9 @@ public sealed partial class MainWindow : Window
     public ObservableCollection<BackupRunListItem> BackupHistory { get; } = new();
     public ObservableCollection<DiagnosticListItem> Diagnostics { get; } = new();
 
-    public MainWindow()
+    public MainWindow(bool showOnboarding = false)
     {
+        _showOnboarding = showOnboarding;
         InitializeComponent();
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "resticpal.ico"));
         Closed += (_, _) => _updates.Dispose();
@@ -60,7 +62,11 @@ public sealed partial class MainWindow : Window
 
     private async void NavigationView_Loaded(object sender, RoutedEventArgs e)
     {
-        await RefreshStatusAsync();
+        ServiceSnapshot? status = await RefreshStatusAsync();
+        if (_showOnboarding || status?.State == "unconfigured")
+        {
+            ShowOnboarding();
+        }
         await CheckForUpdatesAsync(userInitiated: false);
     }
 
@@ -154,6 +160,7 @@ public sealed partial class MainWindow : Window
                 result.Message);
             if (result.Accepted)
             {
+                FirstRunInfoBar.IsOpen = false;
                 _managementLoaded = false;
                 await LoadManagementAsync();
                 await RefreshStatusAsync();
@@ -215,6 +222,35 @@ public sealed partial class MainWindow : Window
         BootstrapUrlBox.IsEnabled = !busy;
         EnrollButton.IsEnabled = !busy;
         UnenrollButton.IsEnabled = !busy && _managedDevice;
+    }
+
+    private void ConfigureLocallyButton_Click(object sender, RoutedEventArgs e)
+    {
+        FirstRunInfoBar.IsOpen = false;
+        NavigationRoot.SelectedItem = SourcesItem;
+    }
+
+    private void ShowOnboarding()
+    {
+        FirstRunInfoBar.IsOpen = true;
+        NavigationRoot.SelectedItem = NavigationRoot.SettingsItem;
+        MarkOnboardingShown();
+    }
+
+    private static void MarkOnboardingShown()
+    {
+        try
+        {
+            string directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "resticpal");
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, "onboarding-shown-v1"), "1");
+        }
+        catch
+        {
+            // A missing marker only means setup may be offered again next login.
+        }
     }
 
     private async Task CheckForUpdatesAsync(bool userInitiated)
@@ -1357,7 +1393,7 @@ public sealed partial class MainWindow : Window
         return true;
     }
 
-    private async Task RefreshStatusAsync()
+    private async Task<ServiceSnapshot?> RefreshStatusAsync()
     {
         try
         {
@@ -1368,6 +1404,7 @@ public sealed partial class MainWindow : Window
             StatusCardDescription.Text = status.Description;
             RunBackupButton.IsEnabled = status.CanRunBackup;
             CancelBackupButton.IsEnabled = status.CanCancelBackup;
+            return status;
         }
         catch (Exception exception)
         {
@@ -1378,6 +1415,7 @@ public sealed partial class MainWindow : Window
             RunBackupButton.IsEnabled = false;
             CancelBackupButton.IsEnabled = false;
             ShowConnectionError(exception);
+            return null;
         }
     }
 

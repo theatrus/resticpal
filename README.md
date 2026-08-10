@@ -17,7 +17,7 @@ It is built for personal PCs, small fleets, and managed deployments that want mo
 
 - **Made for sleeping laptops.** Backups catch up after wake, observe a grace period, and hold a bounded Windows wake lock while work is in progress.
 - **Protection without an open app.** The machine-wide service continues working when the settings window is closed or no user is signed in.
-- **A calm Windows experience.** Native WinUI setup, a low-resource Win32 tray process, useful status, cancellation, and bounded backup history.
+- **A calm Windows experience.** First-run WinUI setup with bootstrap enrollment or local configuration, a low-resource Win32 tray process, useful status, cancellation, and bounded backup history.
 - **Your repository, your choice.** Local disks, network shares, S3-compatible storage, REST servers, and the other repositories supported by restic.
 - **Ransomware-conscious operation.** Append-only clients can back up but cannot run retention, prune, rewrite, migration, destructive repair, or key removal.
 - **Ready to grow from one PC to a fleet.** Local configuration, plain manifest distribution, and signed server enrollment are distinct operating modes rather than an all-or-nothing cloud dependency.
@@ -56,8 +56,8 @@ All three policy transport paths now have an end-to-end implementation. A one-ti
 
 - Machine-wide Rust service with startup, resume, power, time-change, and shutdown handling
 - Daily/deadline scheduling, wake grace, battery/network gates, retries, and a two-hour wake-lock safety default
-- Native Rust/Win32 tray status with run-now and cancellation actions
-- On-demand WinUI 3 setup for sources, repository, schedule, retention, status, backup history, and redacted diagnostics
+- Native Rust/Win32 tray status with run-now and cancellation actions, launched immediately after install and at logon for every user
+- First-run and Start Menu WinUI 3 setup for bootstrap enrollment, sources, repository, schedule, retention, status, backup history, and redacted diagnostics
 - Typed, per-field managed policy resolution and UI lock enforcement
 - Plain HTTP/HTTPS manifests, signed Ed25519 manifests, rollback/freshness checks, and offline last-known-good policy
 - Authenticated, bounded device status reporting that cannot make a backup fail
@@ -67,7 +67,7 @@ All three policy transport paths now have an end-to-end implementation. A one-ti
 - DPAPI-encrypted, service-owned credential storage with protected ACLs and opaque references
 - Direct restic execution inside a kill-on-close Windows Job Object, bounded JSON progress, and sanitized outcomes
 - Durable repository validation, scheduler state, and privacy-bounded SQLite run history
-- Per-machine x64 MSI with a LocalSystem backup service, recovery policy, tray startup, bundled restic, and data-preserving uninstall
+- Per-machine x64 MSI with a LocalSystem backup service, recovery policy, all-users tray and Start Menu integration, bundled restic, and data-preserving uninstall
 - StackFoundry LLC Authenticode signing for the MSI and executable payload on trusted `main` builds
 - Strictly signed NetSparkle appcast checks, user-selected download/install, and backup-safe update handoff
 - Optional companion server for signed manifests, latest-device status, and server-only retention/prune jobs
@@ -109,7 +109,7 @@ Use `-UseVss` from an elevated shell to test the exact production snapshot path.
 .\scripts\Test-InstallerPackage.ps1
 ```
 
-The elevated `.\scripts\Test-InstalledResticPal.ps1` harness installs the MSI only when it can prove there is no pre-existing resticpal installation or data directory, exercises the production service and local repository lifecycle, verifies data-preserving uninstall, and removes only its own synthetic state.
+The elevated `.\scripts\Test-InstalledResticPal.ps1` harness installs the MSI only when it can prove there is no pre-existing resticpal installation or data directory. It verifies current-session tray startup, the all-users logon registration and Start Menu shortcut, first-run bootstrap/local setup, the production service and local repository lifecycle, and data-preserving uninstall before removing only its own synthetic state.
 
 For safer clean-machine testing, run that lifecycle in a disposable local Windows VM:
 
@@ -126,7 +126,7 @@ The Sandbox launcher waits for a machine-readable result and returns the guest t
 
 GitHub Actions runs the same Rust and WinUI validation, then builds, validates, administratively extracts, and smoke-tests an x64 MSI. Pushes to `main` and manual runs use Azure Trusted Signing for the executable payload and MSI; pull requests and forks build without signing access. The neutral `resticpal-windows-x64` artifact includes SHA-256 checksums. The installed-service Windows Sandbox lifecycle remains a local test because GitHub-hosted runners do not expose the nested Sandbox environment used by the harness.
 
-Product releases start at `1.0.0`. `Set-Version.ps1` moves the Rust, WinUI, manifest, MSI input, and appcast version together. NetSparkle release metadata is signed locally with the private key backed up outside GitHub, then published beside the signed MSI. See [the signed release guide](docs/releasing.md) for the key boundary and exact commands.
+Product releases start at `1.0.0`; the current source version is `1.0.1`. `Set-Version.ps1` moves the Rust, WinUI, manifest, MSI input, and appcast version together. NetSparkle release metadata is signed locally with the private key backed up outside GitHub, then published beside the signed MSI. See [the signed release guide](docs/releasing.md) for the key boundary and exact commands.
 
 ## For contributors
 
