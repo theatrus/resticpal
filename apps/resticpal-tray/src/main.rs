@@ -15,6 +15,7 @@ use resticpal_windows::named_pipe::{NamedPipeClient, NamedPipeError};
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
@@ -22,12 +23,12 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
-    GetCursorPos, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, KillTimer, LR_DEFAULTCOLOR,
-    LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MENU_ITEM_FLAGS, MSG,
-    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow,
-    SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-    WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-    WS_OVERLAPPED,
+    GetCursorPos, GetMessageTime, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, KillTimer,
+    LR_DEFAULTCOLOR, LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK,
+    MENU_ITEM_FLAGS, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SW_SHOWNORMAL, SetForegroundWindow, SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu,
+    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{Error, Result, w};
 
@@ -64,6 +65,7 @@ const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../../assets/resticpal.ico");
 const PREFERRED_TRAY_ICON_SIZE: u16 = 32;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static ONBOARDING_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static LAST_LEFT_CLICK_MESSAGE_TIME: AtomicU64 = AtomicU64::new(u64::MAX);
 static UI_LAUNCH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
@@ -73,6 +75,13 @@ enum UiDestination {
     Default,
     Setup,
     Updates,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayIconAction {
+    OpenSettings,
+    OpenUpdates,
+    ShowContextMenu,
 }
 
 #[derive(Clone, Copy)]
@@ -344,19 +353,28 @@ unsafe extern "system" fn window_proc(
 fn window_proc_inner(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
         TRAY_CALLBACK => {
-            match u32::try_from(lparam.0).unwrap_or_default() {
-                WM_LBUTTONDBLCLK => {
-                    let _ = launch_ui(window, UiDestination::Default);
+            match tray_icon_action(u32::try_from(lparam.0).unwrap_or_default()) {
+                Some(TrayIconAction::OpenSettings) => {
+                    // SAFETY: these functions only read system input timing state.
+                    let message_time = unsafe { GetMessageTime() } as u32;
+                    let double_click_time = unsafe { GetDoubleClickTime() };
+                    let previous = LAST_LEFT_CLICK_MESSAGE_TIME.load(Ordering::Relaxed);
+                    let previous = (previous != u64::MAX).then_some(previous as u32);
+                    if tray_left_click_is_distinct(previous, message_time, double_click_time) {
+                        LAST_LEFT_CLICK_MESSAGE_TIME
+                            .store(u64::from(message_time), Ordering::Relaxed);
+                        let _ = launch_ui(window, UiDestination::Default);
+                    }
                 }
-                NIN_BALLOONUSERCLICK => {
+                Some(TrayIconAction::OpenUpdates) => {
                     let _ = launch_ui(window, UiDestination::Updates);
                 }
-                WM_RBUTTONUP => {
+                Some(TrayIconAction::ShowContextMenu) => {
                     if let Err(error) = show_context_menu(window) {
                         show_error(window, &error.to_string());
                     }
                 }
-                _ => {}
+                None => {}
             }
             LRESULT(0)
         }
@@ -464,6 +482,24 @@ fn show_context_menu(window: HWND) -> Result<()> {
     // SAFETY: menu was created in this function and is no longer displayed.
     let destroy_result = unsafe { DestroyMenu(menu) };
     result.and(destroy_result)
+}
+
+fn tray_left_click_is_distinct(
+    previous_message_time: Option<u32>,
+    message_time: u32,
+    double_click_time: u32,
+) -> bool {
+    previous_message_time
+        .is_none_or(|previous| message_time.wrapping_sub(previous) > double_click_time)
+}
+
+fn tray_icon_action(event: u32) -> Option<TrayIconAction> {
+    match event {
+        WM_LBUTTONUP | WM_LBUTTONDBLCLK => Some(TrayIconAction::OpenSettings),
+        NIN_BALLOONUSERCLICK => Some(TrayIconAction::OpenUpdates),
+        WM_RBUTTONUP => Some(TrayIconAction::ShowContextMenu),
+        _ => None,
+    }
 }
 
 fn launch_ui(window: HWND, destination: UiDestination) -> bool {
@@ -904,6 +940,30 @@ mod tests {
         assert!(LaunchGuard::try_acquire(&flag).is_none());
         drop(guard);
         assert!(LaunchGuard::try_acquire(&flag).is_some());
+    }
+
+    #[test]
+    fn tray_left_clicks_open_once_per_system_double_click_window() {
+        assert!(tray_left_click_is_distinct(None, 1_000, 500));
+        assert!(!tray_left_click_is_distinct(Some(1_000), 1_200, 500));
+        assert!(tray_left_click_is_distinct(Some(1_000), 1_501, 500));
+        assert!(!tray_left_click_is_distinct(Some(u32::MAX - 100), 100, 500));
+    }
+
+    #[test]
+    fn tray_mouse_events_map_to_open_and_context_actions() {
+        assert_eq!(
+            tray_icon_action(WM_LBUTTONUP),
+            Some(TrayIconAction::OpenSettings)
+        );
+        assert_eq!(
+            tray_icon_action(WM_LBUTTONDBLCLK),
+            Some(TrayIconAction::OpenSettings)
+        );
+        assert_eq!(
+            tray_icon_action(WM_RBUTTONUP),
+            Some(TrayIconAction::ShowContextMenu)
+        );
     }
 
     #[test]

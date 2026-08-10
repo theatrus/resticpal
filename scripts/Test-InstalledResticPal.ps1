@@ -9,6 +9,65 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class ResticPalNativeTest
+{
+    private delegate bool EnumThreadWindowsCallback(IntPtr window, IntPtr parameter);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumThreadWindows(
+        uint threadId,
+        EnumThreadWindowsCallback callback,
+        IntPtr parameter);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr window, StringBuilder className, int maxCount);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PostMessage(
+        IntPtr window,
+        uint message,
+        IntPtr wParam,
+        IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    public static IntPtr FindWindowForProcess(int processId, string expectedClassName)
+    {
+        using (Process process = Process.GetProcessById(processId))
+        {
+            foreach (ProcessThread thread in process.Threads)
+            {
+                IntPtr found = IntPtr.Zero;
+                EnumThreadWindows((uint)thread.Id, (window, parameter) =>
+                {
+                    var className = new StringBuilder(256);
+                    if (GetClassName(window, className, className.Capacity) > 0 &&
+                        string.Equals(className.ToString(), expectedClassName, StringComparison.Ordinal))
+                    {
+                        found = window;
+                        return false;
+                    }
+                    return true;
+                }, IntPtr.Zero);
+                if (found != IntPtr.Zero)
+                {
+                    return found;
+                }
+            }
+        }
+        return IntPtr.Zero;
+    }
+}
+'@
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
@@ -131,6 +190,26 @@ function Wait-AutomationElementOnscreen(
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for UI element $AutomationId to come on-screen."
+}
+
+function Wait-NativeWindowForProcess(
+    [Diagnostics.Process] $Process,
+    [string] $ClassName,
+    [TimeSpan] $Timeout
+) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    do {
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            throw "$($Process.ProcessName) exited while waiting for native window $ClassName."
+        }
+        $window = [ResticPalNativeTest]::FindWindowForProcess($Process.Id, $ClassName)
+        if ($window -ne [IntPtr]::Zero) {
+            return $window
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for $($Process.ProcessName) native window $ClassName."
 }
 
 function Read-Exact([IO.Stream] $Stream, [int] $Count) {
@@ -367,6 +446,60 @@ try {
     }
     Stop-Process -Id $uiProcess.Id -Force
     $uiProcess.WaitForExit(10000) | Out-Null
+
+    $trayProcess.Refresh()
+    if ($trayProcess.HasExited) {
+        throw "The installed tray exited before click testing with code $($trayProcess.ExitCode)."
+    }
+    $trayWindow = [ResticPalNativeTest]::FindWindowForProcess(
+        $trayProcess.Id,
+        'ResticPalTrayWindow'
+    )
+    if ($trayWindow -eq [IntPtr]::Zero) {
+        throw 'The installed tray hidden window was not found.'
+    }
+    [uint32] $trayWindowProcessId = 0
+    [void] [ResticPalNativeTest]::GetWindowThreadProcessId(
+        $trayWindow,
+        [ref] $trayWindowProcessId
+    )
+    if ($trayWindowProcessId -ne $trayProcess.Id) {
+        throw "The tray window belongs to unexpected process $trayWindowProcessId."
+    }
+
+    if (-not [ResticPalNativeTest]::PostMessage(
+        $trayWindow,
+        0x8001,
+        [IntPtr]::Zero,
+        [IntPtr] 0x0202
+    )) {
+        throw 'Posting the tray left-click callback failed.'
+    }
+    $leftClickUiProcess = Wait-InteractiveProcess 'resticpal-ui' ([TimeSpan]::FromSeconds(30))
+    Wait-AutomationElement $leftClickUiProcess 'SettingsItem' ([TimeSpan]::FromSeconds(30)) | Out-Null
+    Write-Host "A single tray left click opened settings as process $($leftClickUiProcess.Id)."
+    Stop-Process -Id $leftClickUiProcess.Id -Force
+    $leftClickUiProcess.WaitForExit(10000) | Out-Null
+
+    if (-not [ResticPalNativeTest]::PostMessage(
+        $trayWindow,
+        0x8001,
+        [IntPtr]::Zero,
+        [IntPtr] 0x0205
+    )) {
+        throw 'Posting the tray right-click callback failed.'
+    }
+    Wait-NativeWindowForProcess $trayProcess '#32768' ([TimeSpan]::FromSeconds(10)) | Out-Null
+    Write-Host 'A tray right click opened the native action menu.'
+    if (-not [ResticPalNativeTest]::PostMessage(
+        $trayWindow,
+        0x001F,
+        [IntPtr]::Zero,
+        [IntPtr]::Zero
+    )) {
+        throw 'Closing the tray action menu failed.'
+    }
+
     Start-Process -FilePath $startMenuShortcut
     $startMenuUiProcess = Wait-InteractiveProcess 'resticpal-ui' ([TimeSpan]::FromSeconds(30))
     Write-Host "The all-users Start Menu shortcut opened settings as process $($startMenuUiProcess.Id)."

@@ -56,7 +56,7 @@ All three policy transport paths now have an end-to-end implementation. A one-ti
 
 - Machine-wide Rust service with startup, resume, power, time-change, and shutdown handling
 - Daily/deadline scheduling, wake grace, battery/network gates, retries, and a two-hour wake-lock safety default
-- Native Rust/Win32 tray status with run-now and cancellation actions, launched immediately after install and at logon for every user
+- Native Rust/Win32 tray status with single-click settings, a right-click action menu, run-now and cancellation actions, launched immediately after install and at logon for every user
 - First-run and Start Menu WinUI 3 setup for bootstrap enrollment, sources, repository, schedule, retention, status, backup history, and redacted diagnostics
 - Typed, per-field managed policy resolution and UI lock enforcement
 - Plain HTTP/HTTPS manifests, signed Ed25519 manifests, rollback/freshness checks, and offline last-known-good policy
