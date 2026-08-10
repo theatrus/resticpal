@@ -57,6 +57,18 @@ jobs:
     # Classic federated credentials require an exact subject match, which is
     # why this binds to an environment rather than a ref.
     environment: release
+    env:
+      # Sign on pushes to main and on manual dispatch -- what gets published --
+      # but not on pull requests. Every merge lands on main, so nothing ships
+      # unsigned; a PR artifact is never installed by anyone, and signing each
+      # one would spend four signatures a run out of the Basic tier's 5,000 a
+      # month, most of it on dependency bumps.
+      #
+      # The variable check keeps forks building, unsigned, rather than failing:
+      # a fork has neither the variables nor access to the federated credential.
+      SIGN_WINDOWS: >-
+        ${{ (github.event_name != 'pull_request' && vars.AZURE_CLIENT_ID != '')
+        && 'true' || 'false' }}
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -96,7 +108,7 @@ jobs:
       # access to the federated credential, still builds an (unsigned) MSI
       # rather than failing outright.
       - name: Authenticate to Azure (for payload signing)
-        if: vars.AZURE_CLIENT_ID != ''
+        if: env.SIGN_WINDOWS == 'true'
         uses: azure/login@v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
@@ -104,7 +116,7 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Resolve payload binaries to sign
-        if: vars.AZURE_CLIENT_ID != ''
+        if: env.SIGN_WINDOWS == 'true'
         shell: pwsh
         run: |
           # Named one by one, never a folder-and-recurse sweep. The stage
@@ -139,7 +151,7 @@ jobs:
             @('SIGN_FILES<<SIGN_FILES_EOF') + $paths + @('SIGN_FILES_EOF'))
 
       - name: Sign payload binaries
-        if: vars.AZURE_CLIENT_ID != ''
+        if: env.SIGN_WINDOWS == 'true'
         uses: azure/trusted-signing-action@v0
         with:
           endpoint: ${{ vars.SIGNING_ENDPOINT }}
@@ -156,7 +168,7 @@ jobs:
 
       # Fresh assertion: packaging sits between this and the login above.
       - name: Authenticate to Azure (for MSI signing)
-        if: vars.AZURE_CLIENT_ID != ''
+        if: env.SIGN_WINDOWS == 'true'
         uses: azure/login@v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
@@ -164,7 +176,7 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Resolve the MSI
-        if: vars.AZURE_CLIENT_ID != ''
+        if: env.SIGN_WINDOWS == 'true'
         shell: pwsh
         run: |
           $msi = Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'artifacts\installer\output') -Filter *.msi
@@ -172,7 +184,7 @@ jobs:
           "SIGN_MSI=$($msi[0].FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8NoBOM
 
       - name: Sign the MSI
-        if: vars.AZURE_CLIENT_ID != ''
+        if: env.SIGN_WINDOWS == 'true'
         uses: azure/trusted-signing-action@v0
         with:
           endpoint: ${{ vars.SIGNING_ENDPOINT }}
@@ -196,7 +208,7 @@ jobs:
       # names, where 7z yields the MSI's internal mangled ones and nothing can
       # be found by name.
       - name: Verify signatures
-        if: vars.AZURE_CLIENT_ID != ''
+        if: env.SIGN_WINDOWS == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
