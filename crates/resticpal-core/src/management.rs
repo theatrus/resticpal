@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use url::Url;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::SecretEnvironmentVariable;
 use crate::policy::ManagedPolicy;
@@ -99,7 +99,10 @@ impl BootstrapDescriptor {
                 return Err(EnrollmentError::InvalidBootstrapUrl);
             }
         }
-        let token = token.filter(|value| !value.is_empty() && value.len() <= 4096);
+        // valid_text also rejects the control characters that percent-decoding
+        // can reintroduce into the fragment, keeping credential material free of
+        // CR/LF/NUL like every sibling field.
+        let token = token.filter(|value| valid_text(value, 4096));
         let public_key = public_key.filter(|value| decode_raw_array::<32>(value).is_ok());
         let key_id = key_id.filter(|value| valid_text(value, 256));
         let (token, public_key, key_id) = match (token, public_key, key_id) {
@@ -142,7 +145,10 @@ pub struct EnrollmentRequest {
     pub architecture: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Deliberately not Debug/Clone: the parsed plaintext holds repository passwords
+// and the status token, and neither a debug print nor a stray clone of those
+// should ever exist.
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnrollmentSecretBundle {
     schema_version: u32,
@@ -275,7 +281,8 @@ pub fn verify_and_decrypt_enrollment(
     }
     for value in [&payload.manifest_url, &payload.status_url] {
         let url = Url::parse(value).map_err(|_| EnrollmentError::InvalidPayload)?;
-        if url.host_str().is_none()
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
             || url.fragment().is_some()
@@ -329,7 +336,7 @@ pub fn verify_and_decrypt_enrollment(
             )
             .map_err(|_| EnrollmentError::DecryptionFailed)?,
     );
-    let secrets: EnrollmentSecretBundle = serde_json::from_slice(&plaintext)?;
+    let mut secrets: EnrollmentSecretBundle = serde_json::from_slice(&plaintext)?;
     if secrets.schema_version != MANAGEMENT_SCHEMA_VERSION
         || secrets.status_token.is_empty()
         || secrets.status_token.len() > 4096
@@ -339,6 +346,12 @@ pub fn verify_and_decrypt_enrollment(
             .values()
             .any(|secret| secret.is_empty() || secret.len() > 32 * 1024 || secret.contains('\0'))
     {
+        // serde parsed the plaintext into owned Strings; scrub them before they
+        // are dropped so rejected secrets do not linger in freed heap memory.
+        secrets.status_token.zeroize();
+        for secret in secrets.repository_secrets.values_mut() {
+            secret.zeroize();
+        }
         return Err(EnrollmentError::InvalidSecrets);
     }
     Ok(EnrollmentMaterial {
