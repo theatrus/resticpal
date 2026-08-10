@@ -1,8 +1,22 @@
 [CmdletBinding()]
 param(
     [string] $Version,
-    [string] $ResticPath
+    [string] $ResticPath,
+
+    # Stop after staging the payload, before WiX packages it. Authenticode
+    # signing has to happen in that gap: signing the MSI alone would seal
+    # unsigned executables inside a signed installer, and the programs a user
+    # actually runs -- the service, the tray, the UI, and restic itself --
+    # would carry no publisher identity.
+    [switch] $StageOnly,
+
+    # Package an already-staged (and by then signed) payload. Skips the build
+    # and staging so the signatures applied in between are not overwritten.
+    [switch] $PackageOnly
 )
+if ($StageOnly -and $PackageOnly) {
+    throw 'Specify at most one of -StageOnly and -PackageOnly.'
+}
 
 $ErrorActionPreference = 'Stop'
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -45,12 +59,15 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     throw 'The installer build currently supports only Windows x64.'
 }
 
-Reset-GeneratedDirectory $stageRoot
+if (-not $PackageOnly) {
+    Reset-GeneratedDirectory $stageRoot
+}
 Reset-GeneratedDirectory $intermediateRoot
 Reset-GeneratedDirectory $outputRoot
 
 Push-Location $repositoryRoot
 try {
+  if (-not $PackageOnly) {
     & cargo build --release -p resticpal-service -p resticpal-tray
     if ($LASTEXITCODE -ne 0) {
         throw "Rust release build failed with exit code $LASTEXITCODE"
@@ -111,6 +128,16 @@ try {
         throw "Cargo metadata failed with exit code $LASTEXITCODE"
     }
     $cargoMetadata | Set-Content -LiteralPath (Join-Path $licenseRoot 'rust-package-metadata.json') -Encoding utf8
+  }
+
+  if ($StageOnly) {
+    Write-Host "Staged payload at $stageRoot (packaging skipped)"
+    return
+  }
+
+  if ($PackageOnly -and -not (Test-Path -LiteralPath $stageRoot -PathType Container)) {
+    throw "-PackageOnly was given but nothing is staged at $stageRoot"
+  }
 
     & wix build installer/Product.wxs `
         -arch x64 `

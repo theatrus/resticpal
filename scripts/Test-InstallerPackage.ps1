@@ -81,9 +81,34 @@ try {
     }
 
     $resticPath = Join-Path $installImage 'restic.exe'
+    # restic ships unsigned from upstream, so the release build signs it along
+    # with everything else in the payload -- an unsigned executable doing the
+    # actual backups would be the one thing a user runs without a publisher
+    # identity. Signing rewrites the file, so the pinned upstream hash no
+    # longer matches, and asserting it unconditionally would fail every signed
+    # build.
+    #
+    # Both states are still checked, just differently. Unsigned: the bytes must
+    # be exactly what upstream published. Signed: it must carry a valid
+    # signature naming us. The supply-chain guarantee is not weakened -- the
+    # hash is verified against upstream at download time in Get-Restic.ps1,
+    # before anything touches the file.
     $resticHash = (Get-FileHash -LiteralPath $resticPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($resticHash -ne $resticExecutableSha256) {
-        throw "Administrative-image restic executable has unexpected SHA-256: $resticHash"
+    if ($resticHash -eq $resticExecutableSha256) {
+        Write-Host 'Packaged restic matches the pinned upstream hash (unsigned build).'
+    }
+    else {
+        $signature = Get-AuthenticodeSignature -LiteralPath $resticPath
+        if ($signature.Status -ne 'Valid') {
+            throw ("Packaged restic is neither the pinned upstream build " +
+                   "($resticExecutableSha256) nor validly signed; got hash " +
+                   "$resticHash and signature status $($signature.Status).")
+        }
+        if ($signature.SignerCertificate.Subject -notmatch 'StackFoundry LLC') {
+            throw ("Packaged restic is signed by an unexpected publisher: " +
+                   $signature.SignerCertificate.Subject)
+        }
+        Write-Host 'Packaged restic is signed by StackFoundry LLC (signed build).'
     }
     & $resticPath version
     if ($LASTEXITCODE -ne 0) {

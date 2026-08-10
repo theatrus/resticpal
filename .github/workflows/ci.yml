@@ -8,6 +8,9 @@ on:
 
 permissions:
   contents: read
+  # For the OIDC exchange with Entra that authenticates Authenticode signing.
+  # No Azure signing secret is stored in this repo.
+  id-token: write
 
 concurrency:
   group: windows-ci-${{ github.ref }}
@@ -44,10 +47,28 @@ jobs:
         run: dotnet build ResticPal.slnx --configuration Debug
 
   package:
-    name: Build unsigned MSI
+    name: Build signed MSI
     needs: validate
     runs-on: windows-latest
     timeout-minutes: 45
+    # The Entra federated credential is bound to
+    # `repo:theatrus/resticpal:environment:release`, so this job must run in
+    # that environment or the OIDC token will not match and azure/login fails.
+    # Classic federated credentials require an exact subject match, which is
+    # why this binds to an environment rather than a ref.
+    environment: release
+    env:
+      # Sign on pushes to main and on manual dispatch -- what gets published --
+      # but not on pull requests. Every merge lands on main, so nothing ships
+      # unsigned; a PR artifact is never installed by anyone, and signing each
+      # one would spend four signatures a run out of the Basic tier's 5,000 a
+      # month, most of it on dependency bumps.
+      #
+      # The variable check keeps forks building, unsigned, rather than failing:
+      # a fork has neither the variables nor access to the federated credential.
+      SIGN_WINDOWS: >-
+        ${{ (github.event_name != 'pull_request' && vars.AZURE_CLIENT_ID != '')
+        && 'true' || 'false' }}
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -67,13 +88,168 @@ jobs:
           dotnet tool install --global wix --version 6.0.1
           wix extension add -g WixToolset.Util.wixext/6.0.1
 
-      - name: Build and validate MSI
+      # Stage the payload, sign it, then package. Signing only the MSI would
+      # seal unsigned executables inside a signed installer: the service, the
+      # tray, the UI and restic are what a user actually runs, and they would
+      # carry no publisher identity at all.
+      - name: Stage installer payload
         shell: pwsh
-        run: ./scripts/Build-Installer.ps1
+        run: ./scripts/Build-Installer.ps1 -StageOnly
+
+      # Immediately before signing rather than earlier in the job. The GitHub
+      # OIDC token azure/login exchanges is a client assertion valid for only
+      # five minutes, and the Rust and .NET builds above take far longer. A
+      # login placed before them leaves the az CLI holding a dead assertion and
+      # signing fails with AADSTS700024, "Client assertion is not within its
+      # valid time range" -- which reads like a misconfiguration but is purely
+      # about elapsed time.
+      #
+      # Gated on the variable so a fork, which has neither the variables nor
+      # access to the federated credential, still builds an (unsigned) MSI
+      # rather than failing outright.
+      - name: Authenticate to Azure (for payload signing)
+        if: env.SIGN_WINDOWS == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve payload binaries to sign
+        if: env.SIGN_WINDOWS == 'true'
+        shell: pwsh
+        run: |
+          # Named one by one, never a folder-and-recurse sweep. The stage
+          # directory is a self-contained .NET publish: a couple of hundred
+          # files, nearly all of them Microsoft's runtime and Windows App SDK,
+          # which Microsoft has already signed. Signing those would replace
+          # their publisher identity with ours and spend the Basic tier's
+          # 5,000 signatures a month on code we did not write.
+          #
+          # restic.exe IS in the list. Upstream ships it unsigned -- verified,
+          # not assumed -- so there is no publisher identity to preserve, and
+          # leaving it out would mean the program that actually performs the
+          # backups is the one unsigned executable on disk. Its bytes are
+          # pinned by SHA-256 at download time in Get-Restic.ps1, so what we
+          # are vouching for is exactly what upstream published.
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'artifacts\installer\stage'
+          $names = @(
+            'resticpal-service.exe',
+            'resticpal-tray.exe',
+            'resticpal-ui.exe',
+            'restic.exe'
+          )
+          $paths = foreach ($name in $names) {
+            $path = Join-Path $stage $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Expected to sign $path but staging did not produce it"
+            }
+            (Resolve-Path -LiteralPath $path).Path
+          }
+          $paths | ForEach-Object { Write-Output "will sign: $_" }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8NoBOM -Value (
+            @('SIGN_FILES<<SIGN_FILES_EOF') + $paths + @('SIGN_FILES_EOF'))
+
+      - name: Sign payload binaries
+        if: env.SIGN_WINDOWS == 'true'
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files: ${{ env.SIGN_FILES }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Package the signed payload into the MSI
+        shell: pwsh
+        run: ./scripts/Build-Installer.ps1 -PackageOnly
+
+      # Fresh assertion: packaging sits between this and the login above.
+      - name: Authenticate to Azure (for MSI signing)
+        if: env.SIGN_WINDOWS == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve the MSI
+        if: env.SIGN_WINDOWS == 'true'
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'artifacts\installer\output') -Filter *.msi
+          if ($msi.Count -ne 1) { throw "Expected exactly one MSI, found $($msi.Count)" }
+          "SIGN_MSI=$($msi[0].FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8NoBOM
+
+      - name: Sign the MSI
+        if: env.SIGN_WINDOWS == 'true'
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files: ${{ env.SIGN_MSI }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Inspect packaged payload
         shell: pwsh
         run: ./scripts/Test-InstallerPackage.ps1
+
+      # Opens the MSI and checks the binaries inside it, not just the installer
+      # around them. Verifying the MSI alone would pass while shipping unsigned
+      # executables within it -- which is exactly the defect this arrangement
+      # exists to prevent, and the one that is invisible from the outside.
+      #
+      # msiexec /a rather than 7z: an administrative install restores real file
+      # names, where 7z yields the MSI's internal mangled ones and nothing can
+      # be found by name.
+      - name: Verify signatures
+        if: env.SIGN_WINDOWS == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -like '*\x64\*' } |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $signtool) { throw 'signtool.exe was not found' }
+
+          function Assert-Signed([string] $path, [string] $label) {
+            $report = & $signtool.FullName verify /pa /v $path 2>&1 | Out-String
+            Write-Output "--- $label"
+            Write-Output $report
+            if ($LASTEXITCODE -ne 0) { throw "$label is not validly signed" }
+            if ($report -notmatch 'StackFoundry LLC') {
+              throw "$label is signed by someone other than StackFoundry LLC"
+            }
+          }
+
+          Assert-Signed $env:SIGN_MSI 'the MSI'
+
+          $extract = Join-Path $env:RUNNER_TEMP 'msi-payload-check'
+          Remove-Item -Recurse -Force $extract -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $extract | Out-Null
+          $proc = Start-Process msiexec -Wait -PassThru -ArgumentList @(
+            '/a', "`"$env:SIGN_MSI`"", '/qn', "TARGETDIR=`"$extract`""
+          )
+          if ($proc.ExitCode -ne 0) {
+            throw "msiexec administrative extract failed with $($proc.ExitCode)"
+          }
+
+          $checked = 0
+          foreach ($name in @('resticpal-service.exe','resticpal-tray.exe','resticpal-ui.exe','restic.exe')) {
+            $inner = Get-ChildItem -Path $extract -Recurse -Filter $name | Select-Object -First 1
+            if (-not $inner) { throw "$name is missing from the MSI payload" }
+            Assert-Signed $inner.FullName "$name (inside the MSI)"
+            $checked++
+          }
+          if ($checked -ne 4) {
+            throw "Expected to verify 4 payload binaries, verified $checked"
+          }
+          Write-Output "OK: the MSI and all $checked payload binaries are signed as StackFoundry LLC"
 
       - name: Generate SHA-256 checksums
         shell: pwsh
@@ -87,10 +263,12 @@ jobs:
             }
           $lines | Set-Content -LiteralPath (Join-Path $outputRoot 'SHA256SUMS.txt') -Encoding ascii
 
-      - name: Upload unsigned Windows package
+      - name: Upload Windows package
         uses: actions/upload-artifact@v7
         with:
-          name: resticpal-windows-x64-unsigned
+          # Signed when the signing variables are present; a fork build is
+          # still unsigned, hence the neutral name.
+          name: resticpal-windows-x64
           path: |
             artifacts/installer/output/*.msi
             artifacts/installer/output/*.wixpdb
