@@ -939,6 +939,17 @@ mod tests {
         }
     }
 
+    fn cmd_invocation(script: &str) -> ResticInvocation {
+        let system_root = std::env::var_os("SystemRoot").expect("Windows has SystemRoot");
+        ResticInvocation {
+            operation: ResticOperation::Backup,
+            executable: PathBuf::from(system_root).join(r"System32\cmd.exe"),
+            arguments: vec!["/d".into(), "/s".into(), "/c".into(), script.into()],
+            environment: BTreeMap::new(),
+            secret_environment: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn parses_documented_status_and_summary_messages() {
         let status = br#"{"message_type":"status","percent_done":0.426,"total_files":12,"files_done":5,"total_bytes":1000,"bytes_done":426,"error_count":1}"#;
@@ -1065,9 +1076,7 @@ mod tests {
 
     #[test]
     fn repository_probe_reports_success_and_not_found_without_parsing_console_text() {
-        let mut successful = powershell_invocation(
-            "[Console]::Out.WriteLine('untrusted repository metadata'); exit 0",
-        );
+        let mut successful = cmd_invocation("echo untrusted repository metadata & exit /b 0");
         successful.operation = ResticOperation::Probe;
         let runner = executor(BTreeMap::new());
         assert_eq!(
@@ -1081,7 +1090,7 @@ mod tests {
             RepositoryOutcomeKind::Succeeded
         );
 
-        let mut absent = powershell_invocation("exit 10");
+        let mut absent = cmd_invocation("exit /b 10");
         absent.operation = ResticOperation::Probe;
         assert_eq!(
             runner
