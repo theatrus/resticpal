@@ -74,13 +74,20 @@ public sealed partial class MainWindow : Window
             ShowUpdates();
         }
         await CheckForUpdatesAsync(userInitiated: false);
+        if (_showUpdates)
+        {
+            await Task.Delay(100);
+            ScrollUpdatesIntoView();
+        }
     }
 
     private async void NavigationView_SelectionChanged(
         NavigationView sender,
         NavigationViewSelectionChangedEventArgs args)
     {
-        string tag = (args.SelectedItemContainer?.Tag as string) ?? "settings";
+        string tag = args.IsSettingsSelected
+            ? "settings"
+            : (args.SelectedItemContainer?.Tag as string) ?? "overview";
         OverviewPanel.Visibility = tag == "overview" ? Visibility.Visible : Visibility.Collapsed;
         SourcesPanel.Visibility = tag == "sources" ? Visibility.Visible : Visibility.Collapsed;
         RepositoryPanel.Visibility = tag == "repository" ? Visibility.Visible : Visibility.Collapsed;
@@ -246,7 +253,16 @@ public sealed partial class MainWindow : Window
     private void ShowUpdates()
     {
         NavigationRoot.SelectedItem = NavigationRoot.SettingsItem;
-        DispatcherQueue.TryEnqueue(() => UpdateCard.StartBringIntoView());
+    }
+
+    private void ScrollUpdatesIntoView()
+    {
+        ManagementPanel.UpdateLayout();
+        ManagementPanel.ChangeView(
+            horizontalOffset: null,
+            verticalOffset: ManagementPanel.ScrollableHeight,
+            zoomFactor: null,
+            disableAnimation: true);
     }
 
     private static void MarkOnboardingShown()

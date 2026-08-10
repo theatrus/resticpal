@@ -7,6 +7,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
@@ -85,6 +87,50 @@ function Wait-Path([string] $Path, [TimeSpan] $Timeout) {
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for $Path."
+}
+
+function Wait-AutomationElement(
+    [Diagnostics.Process] $Process,
+    [string] $AutomationId,
+    [TimeSpan] $Timeout
+) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    do {
+        $Process.Refresh()
+        if ($Process.MainWindowHandle -ne [IntPtr]::Zero) {
+            $root = [Windows.Automation.AutomationElement]::FromHandle($Process.MainWindowHandle)
+            $condition = [Windows.Automation.PropertyCondition]::new(
+                [Windows.Automation.AutomationElement]::AutomationIdProperty,
+                $AutomationId
+            )
+            $element = $root.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
+            if ($null -ne $element) {
+                return $element
+            }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for UI element $AutomationId."
+}
+
+function Wait-AutomationElementOnscreen(
+    [Diagnostics.Process] $Process,
+    [string] $AutomationId,
+    [TimeSpan] $Timeout
+) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    do {
+        try {
+            $element = Wait-AutomationElement $Process $AutomationId ([TimeSpan]::FromSeconds(2))
+            if (-not $element.Current.IsOffscreen) {
+                return $element
+            }
+        } catch {
+            # Retry when a WinUI layout pass replaces the automation element.
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for UI element $AutomationId to come on-screen."
 }
 
 function Read-Exact([IO.Stream] $Stream, [int] $Count) {
@@ -291,6 +337,20 @@ try {
     Start-Process -FilePath $startMenuShortcut
     $startMenuUiProcess = Wait-InteractiveProcess 'resticpal-ui' ([TimeSpan]::FromSeconds(30))
     Write-Host "The all-users Start Menu shortcut opened settings as process $($startMenuUiProcess.Id)."
+    $settingsItem = Wait-AutomationElement $startMenuUiProcess 'SettingsItem' ([TimeSpan]::FromSeconds(30))
+    $settingsSelection = $settingsItem.GetCurrentPattern(
+        [Windows.Automation.SelectionItemPattern]::Pattern
+    )
+    $settingsSelection.Select()
+    Wait-AutomationElement $startMenuUiProcess 'ManagementStatusTitle' ([TimeSpan]::FromSeconds(10)) | Out-Null
+    Wait-AutomationElement $startMenuUiProcess 'CheckForUpdatesButton' ([TimeSpan]::FromSeconds(10)) | Out-Null
+    Write-Host 'The WinUI Settings page exposes enrollment and signed-update controls.'
+    Stop-Process -Id $startMenuUiProcess.Id -Force
+    $startMenuUiProcess.WaitForExit(10000) | Out-Null
+    Start-Process -FilePath (Join-Path $installRoot 'resticpal-ui.exe') -ArgumentList '--updates'
+    $updatesUiProcess = Wait-InteractiveProcess 'resticpal-ui' ([TimeSpan]::FromSeconds(30))
+    Wait-AutomationElementOnscreen $updatesUiProcess 'CheckForUpdatesButton' ([TimeSpan]::FromSeconds(30)) | Out-Null
+    Write-Host 'The --updates launch opens the signed-update controls in the visible viewport.'
 
     New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $sourceRoot 'document.txt') -Value 'resticpal installed-service end-to-end data' -NoNewline

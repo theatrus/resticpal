@@ -13,9 +13,7 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
-        string[] arguments = args.Arguments
-            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
-            .ToArray();
+        string[] arguments = Environment.GetCommandLineArgs().Skip(1).ToArray();
         bool showOnboarding = arguments.Contains("--setup", StringComparer.OrdinalIgnoreCase);
         bool showUpdates = arguments.Contains("--updates", StringComparer.OrdinalIgnoreCase);
         _window = new MainWindow(showOnboarding, showUpdates);
