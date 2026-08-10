@@ -298,7 +298,7 @@ The target credential/device-key model is:
 
 ## Enrollment and remote policy
 
-The transport is now split into two explicit modes. `plain_manifest` fetches a direct v1 payload from any bounded HTTP or HTTPS URL, supports offline last-known-good startup, and cannot configure signing or status reporting. `signed_manifest` fetches a v1 Ed25519 envelope, pins the public key locally, requires HTTPS except on loopback, rejects expiry/tampering/rollback/schema mismatch, and may use a DPAPI-backed bearer token for manifest and status requests. Both modes apply only typed `ManagedPolicy` fields through the existing resolver.
+The transport is now split into two explicit modes. `plain_manifest` fetches a direct v1 payload from a bounded HTTPS URL (loopback HTTP is allowed for local testing), supports offline last-known-good startup, and cannot configure signing or status reporting. Because a plain manifest is unsigned, HTTPS is required so its transport provides the only integrity guarantee against an on-path attacker rewriting policy. `signed_manifest` fetches a v1 Ed25519 envelope, pins the public key locally, requires HTTPS except on loopback, rejects expiry/tampering/rollback/schema mismatch, and may use a DPAPI-backed bearer token for manifest and status requests. Both modes apply only typed `ManagedPolicy` fields through the existing resolver.
 
 The enrollment protocol below is implemented end to end by the service, first-run WinUI Settings page, MSI bootstrap staging, and companion server. The application opens first-run setup when a fresh service reports `Unconfigured`; unattended installs may instead set the hidden `RESTICPAL_BOOTSTRAP_URL` property.
 

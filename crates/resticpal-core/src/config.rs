@@ -143,7 +143,12 @@ impl LocalManagementConfig {
                 }
             }
             ManagementMode::PlainManifest => {
-                validate_management_url(self.manifest_url.as_deref())?;
+                // A plain manifest is unsigned, so its only integrity guarantee
+                // is the transport. Require HTTPS (loopback HTTP stays allowed
+                // for local testing) so an on-path attacker cannot substitute
+                // policy that clears backup paths or redirects the repository.
+                let manifest_url = validate_management_url(self.manifest_url.as_deref())?;
+                validate_signed_transport(&manifest_url)?;
                 if self.signing_public_key.is_some()
                     || self.status_url.is_some()
                     || self.device_id.is_some()
@@ -248,7 +253,7 @@ fn validate_signed_transport(value: &Url) -> Result<(), ManagementConfigError> {
     if value.scheme() == "https" || loopback {
         Ok(())
     } else {
-        Err(ManagementConfigError::InsecureSignedTransport)
+        Err(ManagementConfigError::InsecureTransport)
     }
 }
 
@@ -536,10 +541,8 @@ pub enum ManagementConfigError {
     MissingSigningKey,
     #[error("the pinned signing key is malformed")]
     InvalidSigningKey,
-    #[error(
-        "signed management and status URLs require HTTPS (loopback HTTP is allowed for testing)"
-    )]
-    InsecureSignedTransport,
+    #[error("management and status URLs require HTTPS (loopback HTTP is allowed for testing)")]
+    InsecureTransport,
     #[error("status URL, device ID, and token reference must be configured together")]
     IncompleteStatusConfiguration,
     #[error("the managed device ID is malformed")]
@@ -638,13 +641,33 @@ mod tests {
     fn management_modes_keep_plain_files_separate_from_reporting() {
         let plain = LocalManagementConfig {
             mode: ManagementMode::PlainManifest,
-            manifest_url: Some("http://files.example.test/resticpal.json".to_owned()),
+            manifest_url: Some("https://files.example.test/resticpal.json".to_owned()),
             ..LocalManagementConfig::default()
         };
         assert!(plain.validate().is_ok());
 
+        // Loopback HTTP stays allowed so a local file server can be used in tests.
+        let plain_loopback = LocalManagementConfig {
+            mode: ManagementMode::PlainManifest,
+            manifest_url: Some("http://127.0.0.1:8080/resticpal.json".to_owned()),
+            ..LocalManagementConfig::default()
+        };
+        assert!(plain_loopback.validate().is_ok());
+
+        // An unsigned manifest over cleartext HTTP would let an on-path attacker
+        // rewrite policy, so it is rejected like the signed mode.
+        let plain_insecure = LocalManagementConfig {
+            mode: ManagementMode::PlainManifest,
+            manifest_url: Some("http://files.example.test/resticpal.json".to_owned()),
+            ..LocalManagementConfig::default()
+        };
+        assert_eq!(
+            plain_insecure.validate(),
+            Err(ManagementConfigError::InsecureTransport)
+        );
+
         let plain_with_reporting = LocalManagementConfig {
-            status_url: Some("http://files.example.test/status".to_owned()),
+            status_url: Some("https://files.example.test/status".to_owned()),
             ..plain
         };
         assert_eq!(
@@ -660,7 +683,7 @@ mod tests {
         };
         assert_eq!(
             insecure_signed.validate(),
-            Err(ManagementConfigError::InsecureSignedTransport)
+            Err(ManagementConfigError::InsecureTransport)
         );
 
         let lookalike_loopback = LocalManagementConfig {
@@ -671,7 +694,7 @@ mod tests {
         };
         assert_eq!(
             lookalike_loopback.validate(),
-            Err(ManagementConfigError::InsecureSignedTransport)
+            Err(ManagementConfigError::InsecureTransport)
         );
 
         let credentialed_url = LocalManagementConfig {
