@@ -18,7 +18,7 @@ f581c60bf88a31433837d7d8c329eaf3a31c523c44cc38b30c90e7f1cf5866b4
 Use the version helper so the Cargo workspace, Cargo lockfile, WinUI assembly/file metadata, and application manifest move together:
 
 ```powershell
-.\scripts\Set-Version.ps1 -Version 1.0.3
+.\scripts\Set-Version.ps1 -Version 1.0.4
 ```
 
 The MSI and generated appcast both derive their version from this synchronized product version. CI runs `Test-VersionConsistency.ps1` and rejects drift.
@@ -49,7 +49,7 @@ Review those files. Then publish the GitHub release with reviewed Markdown notes
     -Publish
 ```
 
-Publishing creates `v<version>` from the current `origin/main` commit and uploads the signed MSI, signed appcast, checksums, license, and third-party notices. Installed clients check the stable HTTPS URL `https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml`.
+Publishing creates `v<version>` from the current `origin/main` commit and uploads the signed MSI, signed appcast, checksums, license, and third-party notices. Installed clients first check `https://updates.resticpal.com/appcast.xml`, then fall back to `https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml`. The updates host must serve the exact GitHub-published `appcast.xml` and `appcast.xml.signature` bytes as a pair; clients reject a mismatched or independently modified mirror.
 
 ## Safety properties
 

@@ -4,8 +4,11 @@ namespace ResticPal.UI.Services;
 
 internal static class UpdateTrust
 {
-    internal const string AppCastUrl =
-        "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml";
+    internal static IReadOnlyList<string> AppCastUrls { get; } =
+    [
+        "https://updates.resticpal.com/appcast.xml",
+        "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml",
+    ];
 
     internal static string PublicKey { get; } = LoadPublicKey();
 

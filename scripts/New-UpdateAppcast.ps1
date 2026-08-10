@@ -78,7 +78,7 @@ try {
 
     $tag = "v$Version"
     $releaseBaseUrl = "https://github.com/theatrus/resticpal/releases/download/$tag"
-    $appCastUrl = 'https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml'
+    $appCastUrl = 'https://updates.resticpal.com/appcast.xml'
     $arguments = @(
         '--single-file', $resolvedMsiPath,
         '--file-version', $Version,
@@ -125,6 +125,11 @@ try {
 
 [xml] $appCast = Get-Content -LiteralPath $appCastPath -Raw
 $namespace = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
+$expectedAppCastLink = $appCastUrl
+$appCastLink = $appCast.SelectSingleNode('/rss/channel/link')
+if ($null -eq $appCastLink -or $appCastLink.InnerText -cne $expectedAppCastLink) {
+    throw 'The generated appcast does not identify the primary update feed.'
+}
 $enclosure = $appCast.SelectSingleNode('/rss/channel/item/enclosure')
 if ($null -eq $enclosure) {
     throw 'The generated appcast does not contain an update enclosure.'

@@ -8,13 +8,18 @@ namespace ResticPal.UI.Services;
 
 internal sealed class ResticPalUpdateService : IDisposable
 {
-    private readonly SparkleUpdater _updater;
+    private readonly IReadOnlyList<SparkleUpdater> _updaters;
     private bool _disposed;
 
     internal ResticPalUpdateService()
     {
-        _updater = new SparkleUpdater(
-            UpdateTrust.AppCastUrl,
+        _updaters = UpdateTrust.AppCastUrls.Select(CreateUpdater).ToArray();
+    }
+
+    private static SparkleUpdater CreateUpdater(string appCastUrl)
+    {
+        return new SparkleUpdater(
+            appCastUrl,
             new Ed25519Checker(SecurityMode.Strict, UpdateTrust.PublicKey))
         {
             UIFactory = null,
@@ -38,17 +43,30 @@ internal sealed class ResticPalUpdateService : IDisposable
     {
         ThrowIfDisposed();
         cancellationToken.ThrowIfCancellationRequested();
-        UpdateInfo result = await _updater.CheckForUpdatesQuietly(ignoreSkippedVersions: true);
-        cancellationToken.ThrowIfCancellationRequested();
-
-        return result.Status switch
+        foreach (SparkleUpdater updater in _updaters)
         {
-            UpdateStatus.UpdateAvailable when result.Updates.Count > 0 =>
-                UpdateCheckResult.Available(new AvailableUpdate(result.Updates[0])),
-            UpdateStatus.UpdateNotAvailable => UpdateCheckResult.Current,
-            UpdateStatus.UserSkipped => UpdateCheckResult.Current,
-            _ => UpdateCheckResult.Unavailable,
-        };
+            UpdateInfo result;
+            try
+            {
+                result = await updater.CheckForUpdatesQuietly(ignoreSkippedVersions: true);
+            }
+            catch when (!cancellationToken.IsCancellationRequested)
+            {
+                continue;
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+
+            switch (result.Status)
+            {
+                case UpdateStatus.UpdateAvailable when result.Updates.Count > 0:
+                    return UpdateCheckResult.Available(
+                        new AvailableUpdate(updater, result.Updates[0]));
+                case UpdateStatus.UpdateNotAvailable:
+                case UpdateStatus.UserSkipped:
+                    return UpdateCheckResult.Current;
+            }
+        }
+        return UpdateCheckResult.Unavailable;
     }
 
     internal async Task<DownloadedUpdate> DownloadAsync(
@@ -86,26 +104,27 @@ internal sealed class ResticPalUpdateService : IDisposable
             }
         }
 
-        _updater.DownloadFinished += DownloadFinished;
-        _updater.DownloadHadError += DownloadFailed;
-        _updater.DownloadMadeProgress += DownloadProgress;
+        SparkleUpdater updater = update.Updater;
+        updater.DownloadFinished += DownloadFinished;
+        updater.DownloadHadError += DownloadFailed;
+        updater.DownloadMadeProgress += DownloadProgress;
         using CancellationTokenRegistration registration = cancellationToken.Register(() =>
         {
-            _updater.CancelFileDownload();
+            updater.CancelFileDownload();
             completion.TrySetCanceled(cancellationToken);
         });
 
         try
         {
-            await _updater.InitAndBeginDownload(update.Item);
+            await updater.InitAndBeginDownload(update.Item);
             string path = await completion.Task;
             return new DownloadedUpdate(update, path);
         }
         finally
         {
-            _updater.DownloadFinished -= DownloadFinished;
-            _updater.DownloadHadError -= DownloadFailed;
-            _updater.DownloadMadeProgress -= DownloadProgress;
+            updater.DownloadFinished -= DownloadFinished;
+            updater.DownloadHadError -= DownloadFailed;
+            updater.DownloadMadeProgress -= DownloadProgress;
         }
     }
 
@@ -131,11 +150,12 @@ internal sealed class ResticPalUpdateService : IDisposable
         }
         void CloseApplication() => closeApplication();
 
-        _updater.InstallUpdateFailed += InstallFailed;
-        _updater.CloseApplication += CloseApplication;
+        SparkleUpdater updater = update.Update.Updater;
+        updater.InstallUpdateFailed += InstallFailed;
+        updater.CloseApplication += CloseApplication;
         try
         {
-            await _updater.InstallUpdate(update.Update.Item, update.Path);
+            await updater.InstallUpdate(update.Update.Item, update.Path);
             if (failure is not null)
             {
                 throw new InvalidOperationException(failure);
@@ -143,8 +163,8 @@ internal sealed class ResticPalUpdateService : IDisposable
         }
         finally
         {
-            _updater.InstallUpdateFailed -= InstallFailed;
-            _updater.CloseApplication -= CloseApplication;
+            updater.InstallUpdateFailed -= InstallFailed;
+            updater.CloseApplication -= CloseApplication;
         }
     }
 
@@ -155,7 +175,10 @@ internal sealed class ResticPalUpdateService : IDisposable
             return;
         }
 
-        _updater.Dispose();
+        foreach (SparkleUpdater updater in _updaters)
+        {
+            updater.Dispose();
+        }
         _disposed = true;
     }
 
@@ -167,11 +190,13 @@ internal sealed class ResticPalUpdateService : IDisposable
 
 internal sealed class AvailableUpdate
 {
-    internal AvailableUpdate(AppCastItem item)
+    internal AvailableUpdate(SparkleUpdater updater, AppCastItem item)
     {
+        Updater = updater;
         Item = item;
     }
 
+    internal SparkleUpdater Updater { get; }
     internal AppCastItem Item { get; }
     internal string Version => Item.Version ?? "unknown";
     internal ulong? Size => Item.UpdateSize > 0 ? checked((ulong)Item.UpdateSize) : null;

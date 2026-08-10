@@ -48,10 +48,16 @@ const UPDATE_PROMPT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const UPDATE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_UPDATE_APPCAST_BYTES: usize = 256 * 1024;
 const MAX_UPDATE_SIGNATURE_BYTES: usize = 1024;
-const UPDATE_APPCAST_URL: &str =
-    "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml";
-const UPDATE_APPCAST_SIGNATURE_URL: &str =
-    "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml.signature";
+const UPDATE_APPCAST_SOURCES: &[UpdateSource] = &[
+    UpdateSource {
+        appcast_url: "https://updates.resticpal.com/appcast.xml",
+        signature_url: "https://updates.resticpal.com/appcast.xml.signature",
+    },
+    UpdateSource {
+        appcast_url: "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml",
+        signature_url: "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml.signature",
+    },
+];
 const UPDATE_PUBLIC_KEY: &str = include_str!("../../../config/update-public-key.txt");
 const MF_STRING: MENU_ITEM_FLAGS = MENU_ITEM_FLAGS(0);
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../../assets/resticpal.ico");
@@ -67,6 +73,12 @@ enum UiDestination {
     Default,
     Setup,
     Updates,
+}
+
+#[derive(Clone, Copy)]
+struct UpdateSource {
+    appcast_url: &'static str,
+    signature_url: &'static str,
 }
 
 struct TrayIcon {
@@ -571,12 +583,21 @@ fn start_update_check(window: HWND) {
 
 fn check_for_update() -> Option<bool> {
     let agent = update_http_agent();
-    let appcast = fetch_bounded(&agent, UPDATE_APPCAST_URL, MAX_UPDATE_APPCAST_BYTES)?;
-    let signature = fetch_bounded(
-        &agent,
-        UPDATE_APPCAST_SIGNATURE_URL,
-        MAX_UPDATE_SIGNATURE_BYTES,
-    )?;
+    check_update_sources(UPDATE_APPCAST_SOURCES, |source| {
+        check_update_source(&agent, source)
+    })
+}
+
+fn check_update_sources(
+    sources: &[UpdateSource],
+    mut check: impl FnMut(UpdateSource) -> Option<bool>,
+) -> Option<bool> {
+    sources.iter().copied().find_map(&mut check)
+}
+
+fn check_update_source(agent: &ureq::Agent, source: UpdateSource) -> Option<bool> {
+    let appcast = fetch_bounded(agent, source.appcast_url, MAX_UPDATE_APPCAST_BYTES)?;
+    let signature = fetch_bounded(agent, source.signature_url, MAX_UPDATE_SIGNATURE_BYTES)?;
     let signature = std::str::from_utf8(&signature).ok()?;
     if !verify_signed_document(&appcast, signature, UPDATE_PUBLIC_KEY) {
         return None;
@@ -952,6 +973,32 @@ mod tests {
     }
 
     #[test]
+    fn update_sources_try_the_primary_before_the_github_fallback() {
+        let mut checked = Vec::new();
+        let available = check_update_sources(UPDATE_APPCAST_SOURCES, |source| {
+            checked.push(source.appcast_url);
+            (checked.len() == 2).then_some(true)
+        });
+
+        assert_eq!(available, Some(true));
+        assert_eq!(
+            checked,
+            vec![
+                "https://updates.resticpal.com/appcast.xml",
+                "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml",
+            ]
+        );
+
+        checked.clear();
+        let current = check_update_sources(UPDATE_APPCAST_SOURCES, |source| {
+            checked.push(source.appcast_url);
+            Some(false)
+        });
+        assert_eq!(current, Some(false));
+        assert_eq!(checked, vec!["https://updates.resticpal.com/appcast.xml"]);
+    }
+
+    #[test]
     fn update_client_uses_windows_native_tls_and_platform_roots() {
         let agent = update_http_agent();
         let tls = agent.config().tls_config();
@@ -978,8 +1025,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "contacts the live signed release feed"]
-    fn live_signed_update_feed_is_valid() {
-        assert!(check_for_update().is_some());
+    #[ignore = "contacts both live signed release feeds"]
+    fn live_signed_update_feeds_are_valid() {
+        let agent = update_http_agent();
+        for source in UPDATE_APPCAST_SOURCES {
+            assert!(
+                check_update_source(&agent, *source).is_some(),
+                "{} should serve a valid signed appcast",
+                source.appcast_url
+            );
+        }
     }
 }
