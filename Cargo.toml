@@ -6,6 +6,9 @@ members = [
     "crates/resticpal-protocol",
     "crates/resticpal-windows",
 ]
+# The e2e CI job checks resticpal-server out inside this workspace; without the
+# exclusion cargo would claim the nested package as a workspace member.
+exclude = ["resticpal-server"]
 resolver = "3"
 
 [workspace.package]
