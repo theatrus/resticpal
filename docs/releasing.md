@@ -55,13 +55,24 @@ Publishing creates `v<version>` from the current `origin/main` commit and upload
 
 Those releases let NetSparkle derive its temporary filename after following redirects. A GitHub release asset redirects to an opaque object path, so a valid MSI can be downloaded under an extensionless GUID and never reach `msiexec`. Version 1.0.5 explicitly assigns a `.msi` staging name, but clients on an older release need a one-time delivery bridge.
 
-Before publishing that bridge release, mirror the exact signed CI MSI without redirects at `https://updates.resticpal.com/releases/v<version>/resticpal-<version>-x64.msi`. Confirm that both `HEAD` and `GET` return the MSI at that filename path, then generate the signed feed with the direct enclosure URL:
+The release hook mirrors and verifies the MSI before it advances the signed appcast. A bridge release therefore uses two safe phases:
+
+1. Create the stable GitHub release with only the signed MSI, an MSI-only `SHA256SUMS.txt`, license, notices, and release notes. Do not attach a new appcast yet; clients continue using the previous signed feed.
+2. Wait for the release hook to expose `https://updates.resticpal.com/releases/v<version>/resticpal-<version>-x64.msi`. Confirm `HEAD` is a direct HTTP 200 and use a full `GET` to match its length and SHA-256 to the signed CI artifact.
+3. Generate the feed only after that verification. `New-UpdateAppcast.ps1` repeats the full remote comparison before reading the private key or signing:
 
 ```powershell
-.\scripts\Publish-Release.ps1 -Version 1.0.5 -RunId <signed-run-id> -PackageHost UpdatesHost
+.\scripts\New-UpdateAppcast.ps1 `
+    -MsiPath C:\path\to\resticpal-1.0.5-x64.msi `
+    -Version 1.0.5 `
+    -OutputDirectory artifacts\release\v1.0.5\feed `
+    -PackageHost UpdatesHost
 ```
 
-Review the generated enclosure and signature before using `-Publish`. The same MSI should remain a GitHub release asset; only its signed enclosure URL differs. New clients accept only the exact versioned GitHub or official updates-host paths and still require the pinned Ed25519 package signature. After the bridge population has moved beyond 1.0.4, normal GitHub-hosted enclosures can resume.
+4. Review the enclosure, signature, and final checksums; upload the appcast pair and replace `SHA256SUMS.txt` on the existing release. Explicitly edit the release after all assets exist so the release webhook reruns and atomically advances the mirrored pair.
+5. Require byte-identical primary and GitHub fallback feeds, strict signature validation, a previous-client staged path ending in `.msi`, and a signed previous-version-to-new-version Sandbox lifecycle before declaring the release complete.
+
+New clients accept only the exact versioned GitHub or official updates-host paths and still require the pinned Ed25519 package signature. After the bridge population has moved beyond 1.0.4, normal GitHub-hosted enclosures can resume.
 
 ## Safety properties
 
