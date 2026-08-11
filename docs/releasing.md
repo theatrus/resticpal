@@ -18,7 +18,7 @@ f581c60bf88a31433837d7d8c329eaf3a31c523c44cc38b30c90e7f1cf5866b4
 Use the version helper so the Cargo workspace, Cargo lockfile, WinUI assembly/file metadata, and application manifest move together:
 
 ```powershell
-.\scripts\Set-Version.ps1 -Version 1.0.4
+.\scripts\Set-Version.ps1 -Version 1.0.5
 ```
 
 The MSI and generated appcast both derive their version from this synchronized product version. CI runs `Test-VersionConsistency.ps1` and rejects drift.
@@ -51,12 +51,26 @@ Review those files. Then publish the GitHub release with reviewed Markdown notes
 
 Publishing creates `v<version>` from the current `origin/main` commit and uploads the signed MSI, signed appcast, checksums, license, and third-party notices. Installed clients first check `https://updates.resticpal.com/appcast.xml`, then fall back to `https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml`. The updates host must serve the exact GitHub-published `appcast.xml` and `appcast.xml.signature` bytes as a pair; clients reject a mismatched or independently modified mirror.
 
+### Direct-download bridge for 1.0.3 and 1.0.4
+
+Those releases let NetSparkle derive its temporary filename after following redirects. A GitHub release asset redirects to an opaque object path, so a valid MSI can be downloaded under an extensionless GUID and never reach `msiexec`. Version 1.0.5 explicitly assigns a `.msi` staging name, but clients on an older release need a one-time delivery bridge.
+
+Before publishing that bridge release, mirror the exact signed CI MSI without redirects at `https://updates.resticpal.com/releases/v<version>/resticpal-<version>-x64.msi`. Confirm that both `HEAD` and `GET` return the MSI at that filename path, then generate the signed feed with the direct enclosure URL:
+
+```powershell
+.\scripts\Publish-Release.ps1 -Version 1.0.5 -RunId <signed-run-id> -PackageHost UpdatesHost
+```
+
+Review the generated enclosure and signature before using `-Publish`. The same MSI should remain a GitHub release asset; only its signed enclosure URL differs. New clients accept only the exact versioned GitHub or official updates-host paths and still require the pinned Ed25519 package signature. After the bridge population has moved beyond 1.0.4, normal GitHub-hosted enclosures can resume.
+
 ## Safety properties
 
 - The private update key is read only by the local release process and never printed or uploaded.
 - Appcast generation refuses an unsigned MSI, an unexpected Authenticode publisher, a mismatched product version, or a Dropbox public key that differs from the compiled public key.
 - NetSparkle runs in strict Ed25519 mode and verifies the appcast and downloaded MSI.
-- Before installation, the elevated WinUI application asks the service for a bounded update hold. The service refuses while a backup or repository operation is active and prevents new backup work while the MSI starts.
+- NetSparkle is given an explicit unique `.msi` download filename because redirected release assets may otherwise be staged without an extension; Windows Installer selection depends on that suffix.
+- Prompted installs use the elevated WinUI application and quiet MSI arguments. When an administrator enables automatic installation, the tray sends the signed enclosure metadata to the LocalSystem service, which independently restricts the release URL, bounds and verifies the MSI, and installs without UAC or installer prompts.
+- The service refuses installation while a backup, repository operation, or management operation is active and prevents new backup work while the MSI starts.
 - MSI major-upgrade behavior stops and restarts the service. The update hold expires after at most 30 minutes if installation is cancelled before the service is replaced.
 
-Rollback, interrupted-upgrade recovery, and the full Windows 10/11 repair/upgrade matrix still require release qualification before unattended updates are considered.
+Rollback, interrupted-upgrade recovery, and the full Windows 10/11 repair/upgrade matrix still require release qualification before unattended updates are considered broadly production-qualified.

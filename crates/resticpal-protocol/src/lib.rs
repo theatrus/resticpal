@@ -92,6 +92,13 @@ pub enum RequestCommand {
     PrepareForUpdate {
         hold_seconds: u32,
     },
+    GetUpdateSettings,
+    UpdateUpdateSettings {
+        automatic_install: bool,
+    },
+    InstallUpdate {
+        package: UpdatePackage,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +159,9 @@ pub enum ResponsePayload {
     },
     Retention {
         configuration: RetentionView,
+    },
+    UpdateSettings {
+        configuration: UpdateSettingsView,
     },
     Diagnostics {
         entries: Vec<DiagnosticEntry>,
@@ -275,6 +285,21 @@ pub struct RetentionView {
     pub last_retention: Option<DateTime<Utc>>,
     pub last_prune: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSettingsView {
+    pub automatic_install: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePackage {
+    pub version: String,
+    pub url: String,
+    pub signature: String,
+    pub length: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,6 +462,27 @@ mod tests {
     #[test]
     fn bounded_update_preparation_round_trips() {
         let request = Request::new(45, RequestCommand::PrepareForUpdate { hold_seconds: 900 });
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &request).expect("request should serialize");
+        let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn automatic_update_request_round_trips_with_typed_metadata() {
+        let request = Request::new(
+            46,
+            RequestCommand::InstallUpdate {
+                package: UpdatePackage {
+                    version: "1.2.3".to_owned(),
+                    url: "https://github.com/theatrus/resticpal/releases/download/v1.2.3/resticpal-1.2.3-x64.msi".to_owned(),
+                    signature: "signed-package".to_owned(),
+                    length: 83_329_024,
+                },
+            },
+        );
         let mut bytes = Vec::new();
 
         write_frame(&mut bytes, &request).expect("request should serialize");

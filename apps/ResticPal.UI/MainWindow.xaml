@@ -772,6 +772,12 @@
                                         Text="Updates are checked against a strictly signed resticpal release feed."
                                         TextWrapping="Wrap" />
                                 </StackPanel>
+                                <ToggleSwitch
+                                    x:Name="AutomaticUpdatesToggle"
+                                    Header="Install signed updates automatically"
+                                    OffContent="Ask before installing"
+                                    OnContent="Install silently in the background"
+                                    Toggled="AutomaticUpdatesToggle_Toggled" />
                                 <ProgressBar
                                     x:Name="UpdateDownloadProgress"
                                     Maximum="100"
@@ -798,7 +804,7 @@
                                 </StackPanel>
                                 <TextBlock
                                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                    Text="Installing requires administrator approval. A backup already in progress is never interrupted; installation waits until resticpal is idle."
+                                    Text="Automatic installation runs through the protected Windows service without UAC or installer prompts. Every MSI must pass the pinned Ed25519 signature check, and a running backup is never interrupted."
                                     TextWrapping="Wrap" />
                             </StackPanel>
                         </Border>

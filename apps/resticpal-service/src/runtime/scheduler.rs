@@ -4,7 +4,7 @@ use super::state::ServiceRuntime;
 
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use resticpal_core::schedule::{ScheduleBlocker, ScheduleDecision, SchedulerSnapshot, decide};
 use resticpal_core::status::{BackupPhase, BackupState, WaitingReason};
 
@@ -24,6 +24,18 @@ impl ServiceRuntime {
     ) -> ScheduleAction {
         let config = self.config();
         let mut state = self.state_guard();
+        if state.update_install_active {
+            transition_state(
+                &mut state.status,
+                BackupState::Waiting {
+                    reason: WaitingReason::Update,
+                },
+                now,
+            );
+            state.status.next_deadline =
+                Some(now + Duration::seconds(CONDITION_RETRY_SECONDS as i64));
+            return ScheduleAction::None;
+        }
         if state
             .update_hold_until
             .is_some_and(|deadline| deadline > now)

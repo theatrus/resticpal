@@ -2,9 +2,10 @@
 //! scheduler loop, plus the small data types the loop hands back to `main`.
 
 use resticpal_core::schedule::BackupTrigger;
-use resticpal_protocol::RepositoryOperationKind;
+use resticpal_protocol::{RepositoryOperationKind, UpdatePackage};
 
 use crate::executor::{BackupOutcome, RepositoryOutcome};
+use crate::updater::UpdateInstallOutcome;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
@@ -21,6 +22,8 @@ pub enum RuntimeEvent {
         operation: RepositoryOperationKind,
         outcome: RepositoryOutcome,
     },
+    UpdateInstallRequested(UpdatePackage),
+    UpdateInstallFinished(UpdateInstallOutcome),
     BackupFinished(BackupOutcome),
 }
 

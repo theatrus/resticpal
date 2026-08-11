@@ -161,6 +161,31 @@ internal sealed class ResticPalServiceClient
             cancellationToken);
     }
 
+    public async Task<UpdateSettingsConfiguration> GetUpdateSettingsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(
+            new { type = "get_update_settings" },
+            cancellationToken);
+        RequirePayloadType(payload, "update_settings");
+        JsonElement configuration = payload.GetProperty("configuration");
+        return new UpdateSettingsConfiguration(
+            configuration.GetProperty("automatic_install").GetBoolean());
+    }
+
+    public async Task<CommandResult> UpdateUpdateSettingsAsync(
+        bool automaticInstall,
+        CancellationToken cancellationToken = default)
+    {
+        return await SendCommandAsync(
+            new
+            {
+                type = "update_update_settings",
+                automatic_install = automaticInstall,
+            },
+            cancellationToken);
+    }
+
     public async Task<BackupSourcesConfiguration> GetBackupSourcesAsync(
         CancellationToken cancellationToken = default)
     {
@@ -585,6 +610,8 @@ internal sealed record ServiceSnapshot(
     bool CanCancelBackup);
 
 internal sealed record CommandResult(bool Accepted, string Message);
+
+internal sealed record UpdateSettingsConfiguration(bool AutomaticInstall);
 
 internal sealed record ManagementConfiguration(
     string Mode,

@@ -12,11 +12,50 @@ use crate::executor::{
     RetentionOutcomeKind,
 };
 use crate::history::CompletedBackupRun;
+use crate::updater::UpdateInstallOutcome;
 
 const INITIAL_FAILURE_RETRY_MINUTES: i64 = 5;
 const MAX_FAILURE_BACKOFF_EXPONENT: u32 = 6;
 
 impl ServiceRuntime {
+    pub fn finish_update_install(&self, outcome: &UpdateInstallOutcome) {
+        let now = Utc::now();
+        let mut state = self.state_guard();
+        state.update_install_active = false;
+        match outcome {
+            UpdateInstallOutcome::Completed { .. } => {
+                // A successful MSI stops this service as part of the upgrade.
+                // Keep the update hold until that happens so no backup starts
+                // during Windows Installer finalization.
+            }
+            UpdateInstallOutcome::Failed { .. } => {
+                state.update_hold_until = None;
+                if let Some((previous, previous_deadline)) =
+                    state.update_hold_previous_status.take()
+                {
+                    state.status.state = previous;
+                    state.status.state_since = now;
+                    state.status.next_deadline = previous_deadline;
+                }
+            }
+        }
+        drop(state);
+
+        match outcome {
+            UpdateInstallOutcome::Completed { .. } => self.record_diagnostic(
+                DiagnosticLevel::Information,
+                "update.installer_completed",
+                "The signed resticpal update installer completed.",
+                None,
+            ),
+            UpdateInstallOutcome::Failed { code } => self.record_diagnostic(
+                DiagnosticLevel::Error,
+                "update.failed",
+                "The signed resticpal update could not be installed.",
+                Some(code),
+            ),
+        }
+    }
     pub fn update_progress(&self, progress: BackupProgress) {
         let mut state = self.state_guard();
         let status = &mut state.status;

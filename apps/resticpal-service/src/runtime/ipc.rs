@@ -12,7 +12,7 @@ use resticpal_core::status::{BackupState, WaitingReason};
 use resticpal_protocol::{
     BackupSourcesView, RepositoryOperationKind, RepositoryOperationStatus, RepositorySecretUpdate,
     RepositoryView, Request, RequestCommand, Response, ResponsePayload, RetentionView,
-    ScheduleView,
+    ScheduleView, UpdatePackage, UpdateSettingsView,
 };
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::ClientIdentity;
@@ -20,6 +20,7 @@ use resticpal_windows::user_profiles::discover_backup_sources;
 
 use crate::diagnostics::MAX_DIAGNOSTIC_RESULTS;
 use crate::history::MAX_HISTORY_RESULTS;
+use crate::updater;
 
 const MAX_SECRET_UPDATES: usize = 16;
 const MIN_UPDATE_HOLD_SECONDS: u32 = 60;
@@ -276,6 +277,15 @@ impl ServiceRuntime {
             RequestCommand::PrepareForUpdate { hold_seconds } => {
                 self.prepare_for_update(hold_seconds, identity)
             }
+            RequestCommand::GetUpdateSettings => ResponsePayload::UpdateSettings {
+                configuration: self.update_settings_view(),
+            },
+            RequestCommand::UpdateUpdateSettings { automatic_install } => {
+                self.update_update_settings(automatic_install, identity)
+            }
+            RequestCommand::InstallUpdate { package } => {
+                self.begin_update_install(package, identity)
+            }
         };
 
         Response::new(request_id, payload)
@@ -475,6 +485,132 @@ impl ServiceRuntime {
 
         ResponsePayload::Accepted {
             message: "Backups are held briefly while the update starts.".to_owned(),
+        }
+    }
+
+    fn update_settings_view(&self) -> UpdateSettingsView {
+        UpdateSettingsView {
+            automatic_install: self.local_config_guard().updates.automatic_install,
+        }
+    }
+
+    fn update_update_settings(
+        &self,
+        automatic_install: bool,
+        identity: ClientIdentity,
+    ) -> ResponsePayload {
+        if !identity.is_elevated_administrator {
+            return administrator_required();
+        }
+        let mut candidate = self.local_config_guard().clone();
+        candidate.updates.automatic_install = automatic_install;
+        if let Some(store) = &self.config_store
+            && let Err(error) = store.save(&candidate)
+        {
+            eprintln!(
+                "could not save local configuration to {}: {error}",
+                store.path().display()
+            );
+            return rejected(
+                "configuration_save_failed",
+                "The automatic-update setting could not be saved.",
+            );
+        }
+        *self.local_config_guard() = candidate;
+        ResponsePayload::Accepted {
+            message: if automatic_install {
+                "Signed resticpal updates will install automatically in the background.".to_owned()
+            } else {
+                "resticpal will ask before installing updates.".to_owned()
+            },
+        }
+    }
+
+    fn begin_update_install(
+        &self,
+        package: UpdatePackage,
+        identity: ClientIdentity,
+    ) -> ResponsePayload {
+        let automatic_install = self.local_config_guard().updates.automatic_install;
+        if !identity.is_elevated_administrator && !automatic_install {
+            return administrator_required();
+        }
+        if let Err(error) = updater::validate_package(&package) {
+            eprintln!("rejected update metadata for {}: {error}", package.version);
+            return rejected(
+                "update_metadata_invalid",
+                "The signed update metadata is invalid or does not describe a newer resticpal MSI.",
+            );
+        }
+
+        let now = Utc::now();
+        let mut state = self.state_guard();
+        if state.update_install_active {
+            return rejected(
+                "update_already_running",
+                "An update is already being installed.",
+            );
+        }
+        if matches!(state.status.state, BackupState::Running { .. }) {
+            return rejected(
+                "backup_running",
+                "The update will be retried after the active backup finishes.",
+            );
+        }
+        if matches!(
+            state.repository_operation,
+            RepositoryOperationStatus::Running { .. }
+        ) || state.management_operation_active
+        {
+            return rejected(
+                "operation_running",
+                "The update will be retried after the current service operation finishes.",
+            );
+        }
+
+        let deadline = now
+            .checked_add_signed(Duration::seconds(i64::from(MAX_UPDATE_HOLD_SECONDS)))
+            .unwrap_or(now);
+        if state.update_hold_previous_status.is_none() {
+            state.update_hold_previous_status =
+                Some((state.status.state.clone(), state.status.next_deadline));
+        }
+        state.update_install_active = true;
+        state.update_hold_until = Some(deadline);
+        state.manual_requested = false;
+        state.resumed_at = None;
+        transition_state(
+            &mut state.status,
+            BackupState::Waiting {
+                reason: WaitingReason::Update,
+            },
+            now,
+        );
+        state.status.next_deadline = Some(deadline);
+
+        let version = package.version.clone();
+        if self
+            .events
+            .send(RuntimeEvent::UpdateInstallRequested(package))
+            .is_err()
+        {
+            state.update_install_active = false;
+            state.update_hold_until = None;
+            if let Some((previous, previous_deadline)) = state.update_hold_previous_status.take() {
+                state.status.state = previous;
+                state.status.state_since = now;
+                state.status.next_deadline = previous_deadline;
+            }
+            return rejected(
+                "service_stopping",
+                "The backup service is stopping. Try again shortly.",
+            );
+        }
+        ResponsePayload::Accepted {
+            message: format!(
+                "resticpal {} will download and install silently after signature verification.",
+                version
+            ),
         }
     }
 

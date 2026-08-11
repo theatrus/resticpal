@@ -39,6 +39,7 @@ public sealed partial class MainWindow : Window
         {
             ShowUpdates();
         }
+        await LoadUpdateSettingsAsync();
         await CheckForUpdatesAsync(userInitiated: false);
         if (_showUpdates)
         {

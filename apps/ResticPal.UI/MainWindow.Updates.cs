@@ -12,6 +12,7 @@ namespace ResticPal.UI;
 public sealed partial class MainWindow
 {
     private bool _updateCheckAttempted;
+    private bool _updateSettingsLoaded;
     private AvailableUpdate? _availableUpdate;
     private DownloadedUpdate? _downloadedUpdate;
 
@@ -81,6 +82,35 @@ public sealed partial class MainWindow
         {
             SetUpdateBusy(false);
         }
+    }
+
+    private Task LoadUpdateSettingsAsync() =>
+        RunGuardedAsync("update-settings-load", async () =>
+        {
+            UpdateSettingsConfiguration configuration = await _service.GetUpdateSettingsAsync();
+            AutomaticUpdatesToggle.IsOn = configuration.AutomaticInstall;
+            _updateSettingsLoaded = true;
+        }, busy => AutomaticUpdatesToggle.IsEnabled = !busy);
+
+    private async void AutomaticUpdatesToggle_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (!_updateSettingsLoaded)
+        {
+            return;
+        }
+        await RunGuardedAsync("update-settings-save", async () =>
+        {
+            CommandResult result = await _service.UpdateUpdateSettingsAsync(
+                AutomaticUpdatesToggle.IsOn);
+            ShowMessage(
+                result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning,
+                result.Message);
+            if (!result.Accepted)
+            {
+                _updateSettingsLoaded = false;
+                await LoadUpdateSettingsAsync();
+            }
+        }, busy => AutomaticUpdatesToggle.IsEnabled = !busy);
     }
 
     private async void CheckForUpdatesButton_Click(object sender, RoutedEventArgs e)

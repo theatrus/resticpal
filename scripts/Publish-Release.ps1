@@ -4,6 +4,8 @@ param(
     [uint64] $RunId,
     [string] $ReleaseNotesPath,
     [switch] $Publish,
+    [ValidateSet('GitHub', 'UpdatesHost')]
+    [string] $PackageHost = 'GitHub',
     [string] $KeyPath = (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Dropbox\resticpal\keys\updates')
 )
 
@@ -80,6 +82,7 @@ $feedRoot = Join-Path $releaseRoot 'feed'
     -MsiPath $msi.FullName `
     -Version $Version `
     -OutputDirectory $feedRoot `
+    -PackageHost $PackageHost `
     -KeyPath $KeyPath
 if ($LASTEXITCODE -ne 0) {
     throw 'Signed appcast preparation failed.'

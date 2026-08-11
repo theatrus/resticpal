@@ -510,6 +510,7 @@ try {
     $settingsSelection.Select()
     Wait-AutomationElement $startMenuUiProcess 'ManagementStatusTitle' ([TimeSpan]::FromSeconds(10)) | Out-Null
     Wait-AutomationElement $startMenuUiProcess 'CheckForUpdatesButton' ([TimeSpan]::FromSeconds(10)) | Out-Null
+    Wait-AutomationElement $startMenuUiProcess 'AutomaticUpdatesToggle' ([TimeSpan]::FromSeconds(10)) | Out-Null
     Write-Host 'The WinUI Settings page exposes enrollment and signed-update controls.'
     Stop-Process -Id $startMenuUiProcess.Id -Force
     $startMenuUiProcess.WaitForExit(10000) | Out-Null
@@ -517,6 +518,28 @@ try {
     $updatesUiProcess = Wait-InteractiveProcess 'resticpal-ui' ([TimeSpan]::FromSeconds(30))
     Wait-AutomationElementOnscreen $updatesUiProcess 'CheckForUpdatesButton' ([TimeSpan]::FromSeconds(30)) | Out-Null
     Write-Host 'The --updates launch opens the signed-update controls in the visible viewport.'
+
+    $updateSettings = Invoke-ResticPalRequest @{ type = 'get_update_settings' }
+    if ($updateSettings.type -ne 'update_settings' -or $updateSettings.configuration.automatic_install) {
+        throw 'Automatic update installation was not disabled by default.'
+    }
+    $invalidUpdate = Invoke-ResticPalRequest @{
+        type = 'install_update'
+        package = @{
+            version = '99.0.0'
+            url = 'https://example.test/resticpal-99.0.0-x64.msi'
+            signature = ('A' * 88)
+            length = 1024
+        }
+    }
+    if ($invalidUpdate.type -ne 'rejected' -or $invalidUpdate.code -ne 'update_metadata_invalid') {
+        throw 'The service accepted update metadata outside the pinned GitHub release path.'
+    }
+    Assert-Accepted @{ type = 'update_update_settings'; automatic_install = $true }
+    $updateSettings = Invoke-ResticPalRequest @{ type = 'get_update_settings' }
+    if (-not $updateSettings.configuration.automatic_install) {
+        throw 'Automatic update installation was not enabled through IPC.'
+    }
 
     New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $sourceRoot 'document.txt') -Value 'resticpal installed-service end-to-end data' -NoNewline
@@ -616,6 +639,10 @@ try {
     if ($null -eq $retentionAfterRestart.configuration.last_retention `
         -or $null -eq $retentionAfterRestart.configuration.last_prune) {
         throw 'Retention state did not survive the installed service restart.'
+    }
+    $updatesAfterRestart = Invoke-ResticPalRequest @{ type = 'get_update_settings' }
+    if (-not $updatesAfterRestart.configuration.automatic_install) {
+        throw 'The automatic-update setting did not survive the installed service restart.'
     }
     $testReachedPersistenceCheck = $true
 } finally {

@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, VerifyingKey};
 use resticpal_core::status::BackupState;
-use resticpal_protocol::{Request, RequestCommand, Response, ResponsePayload};
+use resticpal_protocol::{Request, RequestCommand, Response, ResponsePayload, UpdatePackage};
 use resticpal_windows::named_pipe::{NamedPipeClient, NamedPipeError};
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -43,7 +43,9 @@ const ONBOARDING_TIMER_ID: usize = 2;
 const ONBOARDING_RETRY_INTERVAL_MS: u32 = 1_000;
 const ONBOARDING_MAX_ATTEMPTS: u64 = 120;
 const UPDATE_TIMER_ID: usize = 3;
+const UPDATE_RETRY_TIMER_ID: usize = 4;
 const UPDATE_CHECK_INTERVAL_MS: u32 = 6 * 60 * 60 * 1_000;
+const UPDATE_RETRY_INTERVAL_MS: u32 = 5 * 60 * 1_000;
 const UPDATE_AVAILABLE_MESSAGE: u32 = WM_APP + 2;
 const UPDATE_PROMPT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const UPDATE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,6 +90,12 @@ enum TrayIconAction {
 struct UpdateSource {
     appcast_url: &'static str,
     signature_url: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateCheck {
+    Current,
+    Available(UpdatePackage),
 }
 
 struct TrayIcon {
@@ -395,6 +403,12 @@ fn window_proc_inner(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM)
             start_update_check(window);
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == UPDATE_RETRY_TIMER_ID => {
+            // SAFETY: this removes only the one-shot retry timer below.
+            let _ = unsafe { KillTimer(Some(window), UPDATE_RETRY_TIMER_ID) };
+            start_update_check(window);
+            LRESULT(0)
+        }
         UPDATE_AVAILABLE_MESSAGE => {
             if wparam.0 != 0 {
                 let _ = show_update_notification(window);
@@ -405,6 +419,7 @@ fn window_proc_inner(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM)
             // SAFETY: harmless if the onboarding timer has already been removed.
             let _ = unsafe { KillTimer(Some(window), ONBOARDING_TIMER_ID) };
             let _ = unsafe { KillTimer(Some(window), UPDATE_TIMER_ID) };
+            let _ = unsafe { KillTimer(Some(window), UPDATE_RETRY_TIMER_ID) };
             remove_tray_icon(window);
             // SAFETY: called from the UI thread's window procedure.
             unsafe { PostQuitMessage(0) };
@@ -595,9 +610,28 @@ fn start_update_check(window: HWND) {
     let window_value = window.0 as isize;
     std::thread::spawn(move || {
         match check_for_update() {
-            Some(true) => {
+            Some(UpdateCheck::Available(package)) => {
                 UPDATE_AVAILABLE.store(true, Ordering::Relaxed);
-                let prompt = record_update_prompt_if_due(SystemTime::now());
+                let automatic = automatic_updates_enabled();
+                let install_started = automatic && request_automatic_update(package);
+                if install_started {
+                    UPDATE_AVAILABLE.store(false, Ordering::Relaxed);
+                } else if automatic {
+                    // A backup or another service operation may be finishing.
+                    // Retry promptly without asking the user to intervene.
+                    let window = HWND(window_value as *mut core::ffi::c_void);
+                    // SAFETY: the integer originated from the live HWND and
+                    // the timer is removed on delivery or window destruction.
+                    unsafe {
+                        SetTimer(
+                            Some(window),
+                            UPDATE_RETRY_TIMER_ID,
+                            UPDATE_RETRY_INTERVAL_MS,
+                            None,
+                        );
+                    }
+                }
+                let prompt = !automatic && record_update_prompt_if_due(SystemTime::now());
                 // SAFETY: the integer originated from the live HWND. A posted
                 // message safely fails if the tray exits before the check.
                 let window = HWND(window_value as *mut core::ffi::c_void);
@@ -610,14 +644,14 @@ fn start_update_check(window: HWND) {
                     )
                 };
             }
-            Some(false) => UPDATE_AVAILABLE.store(false, Ordering::Relaxed),
+            Some(UpdateCheck::Current) => UPDATE_AVAILABLE.store(false, Ordering::Relaxed),
             None => {}
         }
         UPDATE_CHECK_RUNNING.store(false, Ordering::Release);
     });
 }
 
-fn check_for_update() -> Option<bool> {
+fn check_for_update() -> Option<UpdateCheck> {
     let agent = update_http_agent();
     check_update_sources(UPDATE_APPCAST_SOURCES, |source| {
         check_update_source(&agent, source)
@@ -626,12 +660,12 @@ fn check_for_update() -> Option<bool> {
 
 fn check_update_sources(
     sources: &[UpdateSource],
-    mut check: impl FnMut(UpdateSource) -> Option<bool>,
-) -> Option<bool> {
+    mut check: impl FnMut(UpdateSource) -> Option<UpdateCheck>,
+) -> Option<UpdateCheck> {
     sources.iter().copied().find_map(&mut check)
 }
 
-fn check_update_source(agent: &ureq::Agent, source: UpdateSource) -> Option<bool> {
+fn check_update_source(agent: &ureq::Agent, source: UpdateSource) -> Option<UpdateCheck> {
     let appcast = fetch_bounded(agent, source.appcast_url, MAX_UPDATE_APPCAST_BYTES)?;
     let signature = fetch_bounded(agent, source.signature_url, MAX_UPDATE_SIGNATURE_BYTES)?;
     let signature = std::str::from_utf8(&signature).ok()?;
@@ -640,9 +674,38 @@ fn check_update_source(agent: &ureq::Agent, source: UpdateSource) -> Option<bool
     }
 
     let appcast = std::str::from_utf8(&appcast).ok()?;
-    let available = extract_appcast_version(appcast)?;
+    let package = extract_update_package(appcast)?;
+    let available = parse_product_version(&package.version)?;
     let current = parse_product_version(env!("CARGO_PKG_VERSION"))?;
-    Some(available > current)
+    Some(if available > current {
+        UpdateCheck::Available(package)
+    } else {
+        UpdateCheck::Current
+    })
+}
+
+fn automatic_updates_enabled() -> bool {
+    matches!(
+        send_request(RequestCommand::GetUpdateSettings),
+        Ok(Response {
+            payload: ResponsePayload::UpdateSettings {
+                configuration: resticpal_protocol::UpdateSettingsView {
+                    automatic_install: true
+                }
+            },
+            ..
+        })
+    )
+}
+
+fn request_automatic_update(package: UpdatePackage) -> bool {
+    matches!(
+        send_request(RequestCommand::InstallUpdate { package }),
+        Ok(Response {
+            payload: ResponsePayload::Accepted { .. },
+            ..
+        })
+    )
 }
 
 fn update_http_agent() -> ureq::Agent {
@@ -694,12 +757,43 @@ fn verify_signed_document(document: &[u8], signature: &str, public_key: &str) ->
         .is_ok()
 }
 
+#[cfg(test)]
 fn extract_appcast_version(document: &str) -> Option<[u64; 3]> {
     const OPEN: &str = "<sparkle:version>";
     const CLOSE: &str = "</sparkle:version>";
     let value_start = document.find(OPEN)?.checked_add(OPEN.len())?;
     let value_end = value_start.checked_add(document.get(value_start..)?.find(CLOSE)?)?;
     parse_product_version(document.get(value_start..value_end)?.trim())
+}
+
+fn extract_update_package(document: &str) -> Option<UpdatePackage> {
+    let version = extract_between(document, "<sparkle:version>", "</sparkle:version>")?
+        .trim()
+        .to_owned();
+    parse_product_version(&version)?;
+    let enclosure_start = document.find("<enclosure ")?;
+    let enclosure = document.get(enclosure_start..)?;
+    let enclosure_end = enclosure.find('>')?;
+    let enclosure = enclosure.get(..=enclosure_end)?;
+    Some(UpdatePackage {
+        version,
+        url: extract_xml_attribute(enclosure, "url")?.to_owned(),
+        signature: extract_xml_attribute(enclosure, "sparkle:signature")?.to_owned(),
+        length: extract_xml_attribute(enclosure, "length")?.parse().ok()?,
+    })
+}
+
+fn extract_between<'a>(document: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = document.find(open)?.checked_add(open.len())?;
+    let end = start.checked_add(document.get(start..)?.find(close)?)?;
+    document.get(start..end)
+}
+
+fn extract_xml_attribute<'a>(element: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!(" {name}=\"");
+    let start = element.find(&marker)?.checked_add(marker.len())?;
+    let end = start.checked_add(element.get(start..)?.find('"')?)?;
+    element.get(start..end).filter(|value| !value.is_empty())
 }
 
 fn parse_product_version(value: &str) -> Option<[u64; 3]> {
@@ -831,6 +925,7 @@ fn fetch_status_tooltip() -> std::result::Result<String, NamedPipeError> {
         | ResponsePayload::Repository { .. }
         | ResponsePayload::Schedule { .. }
         | ResponsePayload::Retention { .. }
+        | ResponsePayload::UpdateSettings { .. }
         | ResponsePayload::Diagnostics { .. } => {
             "resticpal: unexpected service response".to_owned()
         }
@@ -1033,14 +1128,37 @@ mod tests {
     }
 
     #[test]
+    fn signed_appcast_metadata_preserves_the_msi_identity() {
+        let appcast = r#"<rss xmlns:sparkle="http://example.test/sparkle">
+            <channel><item><sparkle:version>2.3.4</sparkle:version>
+            <enclosure url="https://github.com/theatrus/resticpal/releases/download/v2.3.4/resticpal-2.3.4-x64.msi"
+                length="83329024" sparkle:signature="c2lnbmF0dXJl" /></item></channel></rss>"#;
+
+        assert_eq!(
+            extract_update_package(appcast),
+            Some(UpdatePackage {
+                version: "2.3.4".to_owned(),
+                url: "https://github.com/theatrus/resticpal/releases/download/v2.3.4/resticpal-2.3.4-x64.msi".to_owned(),
+                signature: "c2lnbmF0dXJl".to_owned(),
+                length: 83_329_024,
+            })
+        );
+    }
+
+    #[test]
     fn update_sources_try_the_primary_before_the_github_fallback() {
         let mut checked = Vec::new();
         let available = check_update_sources(UPDATE_APPCAST_SOURCES, |source| {
             checked.push(source.appcast_url);
-            (checked.len() == 2).then_some(true)
+            (checked.len() == 2).then_some(UpdateCheck::Available(UpdatePackage {
+                version: "9.0.0".to_owned(),
+                url: "https://example.test/update.msi".to_owned(),
+                signature: "signature".to_owned(),
+                length: 1,
+            }))
         });
 
-        assert_eq!(available, Some(true));
+        assert!(matches!(available, Some(UpdateCheck::Available(_))));
         assert_eq!(
             checked,
             vec![
@@ -1052,9 +1170,9 @@ mod tests {
         checked.clear();
         let current = check_update_sources(UPDATE_APPCAST_SOURCES, |source| {
             checked.push(source.appcast_url);
-            Some(false)
+            Some(UpdateCheck::Current)
         });
-        assert_eq!(current, Some(false));
+        assert_eq!(current, Some(UpdateCheck::Current));
         assert_eq!(checked, vec!["https://updates.resticpal.com/appcast.xml"]);
     }
 

@@ -26,6 +26,7 @@ internal sealed class ResticPalUpdateService : IDisposable
             UIFactory = null,
             RelaunchAfterUpdate = false,
             UserInteractionMode = UserInteractionMode.NotSilent,
+            CustomInstallerArguments = "/qn /norestart",
         };
     }
 
@@ -117,8 +118,20 @@ internal sealed class ResticPalUpdateService : IDisposable
 
         try
         {
+            // NetSparkle follows GitHub's redirect before choosing a local
+            // name. GitHub's release-object response does not reliably expose
+            // the original Content-Disposition filename, so the default can
+            // become an extensionless GUID. NetSparkle selects msiexec from
+            // the downloaded path's extension; make the MSI identity explicit.
+            updater.TmpDownloadFileNameWithExtension =
+                $"resticpal-{NormalizeVersionForFileName(update.Version)}-x64-{Guid.NewGuid():N}.msi";
             await updater.InitAndBeginDownload(update.Item);
             string path = await completion.Task;
+            if (!string.Equals(Path.GetExtension(path), ".msi", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "The signed update was not staged as a Windows Installer package.");
+            }
             return new DownloadedUpdate(update, path);
         }
         finally
@@ -127,6 +140,14 @@ internal sealed class ResticPalUpdateService : IDisposable
             updater.DownloadHadError -= DownloadFailed;
             updater.DownloadMadeProgress -= DownloadProgress;
         }
+    }
+
+    private static string NormalizeVersionForFileName(string version)
+    {
+        return version.Length is > 0 and <= 32
+            && version.All(character => char.IsAsciiDigit(character) || character == '.')
+                ? version
+                : "update";
     }
 
     internal async Task InstallAsync(DownloadedUpdate update, Action closeApplication)

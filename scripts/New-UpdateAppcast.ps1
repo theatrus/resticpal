@@ -4,6 +4,8 @@ param(
     [string] $MsiPath,
     [string] $Version,
     [string] $OutputDirectory,
+    [ValidateSet('GitHub', 'UpdatesHost')]
+    [string] $PackageHost = 'GitHub',
     [string] $KeyPath = (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Dropbox\resticpal\keys\updates')
 )
 
@@ -30,6 +32,13 @@ $expectedMsiName = "resticpal-$Version-x64.msi"
 if ([IO.Path]::GetFileName($resolvedMsiPath) -cne $expectedMsiName) {
     throw "Expected MSI name $expectedMsiName, got $([IO.Path]::GetFileName($resolvedMsiPath))."
 }
+$tag = "v$Version"
+$releaseBaseUrl = if ($PackageHost -eq 'UpdatesHost') {
+    "https://updates.resticpal.com/releases/$tag"
+} else {
+    "https://github.com/theatrus/resticpal/releases/download/$tag"
+}
+$expectedDownload = "$releaseBaseUrl/$expectedMsiName"
 
 $authenticode = Get-AuthenticodeSignature -LiteralPath $resolvedMsiPath
 if ($authenticode.Status -ne 'Valid') {
@@ -69,6 +78,42 @@ if (Test-Path -LiteralPath $resolvedOutput) {
 }
 New-Item -ItemType Directory -Path $resolvedOutput | Out-Null
 
+if ($PackageHost -eq 'UpdatesHost') {
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $client = [Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromMinutes(20)
+    $response = $null
+    $stream = $null
+    $hasher = $null
+    try {
+        $response = $client.GetAsync(
+            $expectedDownload,
+            [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        if ($response.StatusCode -ne [Net.HttpStatusCode]::OK) {
+            throw "The updates-host MSI returned HTTP $([int]$response.StatusCode); expected 200 without a redirect."
+        }
+        $localLength = (Get-Item -LiteralPath $resolvedMsiPath).Length
+        if ($response.Content.Headers.ContentLength -ne $localLength) {
+            throw "The updates-host MSI length does not match the signed CI artifact."
+        }
+        $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        $remoteHash = [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '')
+        $localHash = (Get-FileHash -LiteralPath $resolvedMsiPath -Algorithm SHA256).Hash
+        if ($remoteHash -cne $localHash) {
+            throw "The updates-host MSI hash does not match the signed CI artifact."
+        }
+    } finally {
+        if ($null -ne $hasher) { $hasher.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
 Push-Location $repositoryRoot
 try {
     & dotnet tool restore
@@ -76,8 +121,6 @@ try {
         throw "Restoring the pinned NetSparkle tool failed with exit code $LASTEXITCODE."
     }
 
-    $tag = "v$Version"
-    $releaseBaseUrl = "https://github.com/theatrus/resticpal/releases/download/$tag"
     $appCastUrl = 'https://updates.resticpal.com/appcast.xml'
     $arguments = @(
         '--single-file', $resolvedMsiPath,
@@ -134,7 +177,6 @@ $enclosure = $appCast.SelectSingleNode('/rss/channel/item/enclosure')
 if ($null -eq $enclosure) {
     throw 'The generated appcast does not contain an update enclosure.'
 }
-$expectedDownload = "https://github.com/theatrus/resticpal/releases/download/v$Version/$expectedMsiName"
 $invalidEnclosure = (
     $enclosure.GetAttribute('url') -cne $expectedDownload -or
     $enclosure.GetAttribute('version', $namespace) -cne $Version -or

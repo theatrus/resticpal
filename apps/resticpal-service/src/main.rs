@@ -8,6 +8,7 @@ mod management;
 mod power_request;
 mod runtime;
 mod state;
+mod updater;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -32,10 +33,11 @@ use executor::{
 use resticpal_core::restic::ResticOperation;
 use resticpal_core::status::BackupState;
 use resticpal_protocol::DiagnosticLevel;
-use resticpal_protocol::RepositoryOperationKind;
+use resticpal_protocol::{RepositoryOperationKind, UpdatePackage};
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::{DEFAULT_PIPE_NAME, NamedPipeServer};
 use runtime::{RuntimeEvent, ScheduleAction, ServiceRuntime};
+use updater::UpdateInstallOutcome;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
@@ -500,6 +502,24 @@ fn run_event_loop(
                 active_repository_operation = None;
                 evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
             }
+            Ok(RuntimeEvent::UpdateInstallRequested(package)) => {
+                if active_backup.is_some() || active_repository_operation.is_some() {
+                    runtime.finish_update_install(&UpdateInstallOutcome::Failed {
+                        code: "update_operation_conflict",
+                    });
+                    continue;
+                }
+                if start_update_worker(Arc::clone(&runtime), package, event_sender.clone()).is_err()
+                {
+                    runtime.finish_update_install(&UpdateInstallOutcome::Failed {
+                        code: "update_worker_start_failed",
+                    });
+                }
+            }
+            Ok(RuntimeEvent::UpdateInstallFinished(outcome)) => {
+                runtime.finish_update_install(&outcome);
+                evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
+            }
             Ok(RuntimeEvent::Resume) => {
                 runtime.record_resume(Utc::now());
                 evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
@@ -637,6 +657,25 @@ fn start_repository_worker(
             };
             let outcome = executor.repository_operation(&config, restic_operation, &cancellation);
             let _ = events.send(RuntimeEvent::RepositoryOperationFinished { operation, outcome });
+        })
+}
+
+fn start_update_worker(
+    runtime: Arc<ServiceRuntime>,
+    package: UpdatePackage,
+    events: mpsc::Sender<RuntimeEvent>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("resticpal-update".to_owned())
+        .spawn(move || {
+            runtime.record_diagnostic(
+                DiagnosticLevel::Information,
+                "update.started",
+                "A signed resticpal update started downloading.",
+                None,
+            );
+            let outcome = updater::install(&package, &program_data_root());
+            let _ = events.send(RuntimeEvent::UpdateInstallFinished(outcome));
         })
 }
 

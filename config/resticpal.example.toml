@@ -41,6 +41,12 @@ monthly = 12
 yearly = 3
 prune_interval_days = 7
 
+# When enabled, the tray asks the LocalSystem service to download, verify, and
+# install newer resticpal MSIs silently. The pinned Ed25519 signature remains
+# mandatory and a running backup is never interrupted.
+[updates]
+automatic_install = false
+
 [management]
 mode = "disabled"
 

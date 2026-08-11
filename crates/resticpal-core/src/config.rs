@@ -35,6 +35,7 @@ pub struct LocalConfig {
     pub repository: LocalRepositoryConfig,
     pub schedule: LocalScheduleConfig,
     pub retention: LocalRetentionConfig,
+    pub updates: LocalUpdateConfig,
     pub management: LocalManagementConfig,
 }
 
@@ -46,6 +47,7 @@ impl Default for LocalConfig {
             repository: LocalRepositoryConfig::default(),
             schedule: LocalScheduleConfig::default(),
             retention: LocalRetentionConfig::default(),
+            updates: LocalUpdateConfig::default(),
             management: LocalManagementConfig::default(),
         }
     }
@@ -108,6 +110,14 @@ pub struct LocalRetentionConfig {
     pub monthly: Option<u32>,
     pub yearly: Option<u32>,
     pub prune_interval_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalUpdateConfig {
+    /// Install strictly signed product updates in the background through the
+    /// LocalSystem service. This remains opt-in for existing installations.
+    pub automatic_install: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

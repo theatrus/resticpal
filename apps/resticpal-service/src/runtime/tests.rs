@@ -12,7 +12,7 @@ use resticpal_core::status::{
 use resticpal_protocol::{
     DiagnosticLevel, ManagementView, RepositoryOperationKind, RepositoryOperationStatus,
     RepositorySecretUpdate, RepositoryView, Request, RequestCommand, ResponsePayload,
-    RetentionView, ScheduleView,
+    RetentionView, ScheduleView, UpdatePackage, UpdateSettingsView,
 };
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::ClientIdentity;
@@ -25,6 +25,7 @@ use crate::executor::{
 };
 use crate::management::PendingEnrollment;
 use crate::state::{ScheduleStateStore, ServiceStateSnapshot};
+use crate::updater::UpdateInstallOutcome;
 
 use super::events::RetentionPlan;
 use super::scheduler::repository_requires_network;
@@ -326,6 +327,95 @@ fn expired_update_preparation_restores_an_unconfigured_status() {
     let status = runtime.status();
     assert!(matches!(status.state, BackupState::Unconfigured));
     assert_eq!(status.next_deadline, None);
+}
+
+#[test]
+fn automatic_update_setting_is_admin_controlled_and_authorizes_the_tray() {
+    let (runtime, events) = runtime(false);
+    let version = "99.0.0";
+    let package = UpdatePackage {
+        version: version.to_owned(),
+        url: format!(
+            "https://github.com/theatrus/resticpal/releases/download/v{version}/resticpal-{version}-x64.msi"
+        ),
+        signature: base64::engine::general_purpose::STANDARD.encode([0_u8; 64]),
+        length: 83_329_024,
+    };
+
+    let disabled = runtime.handle_request(
+        Request::new(
+            52,
+            RequestCommand::InstallUpdate {
+                package: package.clone(),
+            },
+        ),
+        USER,
+    );
+    assert!(matches!(
+        disabled.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+    ));
+
+    let user_change = runtime.handle_request(
+        Request::new(
+            53,
+            RequestCommand::UpdateUpdateSettings {
+                automatic_install: true,
+            },
+        ),
+        USER,
+    );
+    assert!(matches!(
+        user_change.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+    ));
+
+    let enabled = runtime.handle_request(
+        Request::new(
+            54,
+            RequestCommand::UpdateUpdateSettings {
+                automatic_install: true,
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(enabled.payload, ResponsePayload::Accepted { .. }));
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(55, RequestCommand::GetUpdateSettings), USER)
+            .payload,
+        ResponsePayload::UpdateSettings {
+            configuration: UpdateSettingsView {
+                automatic_install: true
+            }
+        }
+    ));
+
+    let install = runtime.handle_request(
+        Request::new(
+            56,
+            RequestCommand::InstallUpdate {
+                package: package.clone(),
+            },
+        ),
+        USER,
+    );
+    assert!(matches!(install.payload, ResponsePayload::Accepted { .. }));
+    assert_eq!(
+        events.recv().expect("update event"),
+        RuntimeEvent::UpdateInstallRequested(package)
+    );
+    assert!(matches!(
+        runtime.status().state,
+        BackupState::Waiting {
+            reason: WaitingReason::Update
+        }
+    ));
+
+    runtime.finish_update_install(&UpdateInstallOutcome::Failed {
+        code: "test_update_failed",
+    });
+    assert!(matches!(runtime.status().state, BackupState::Unconfigured));
 }
 
 #[test]
