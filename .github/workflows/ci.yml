@@ -51,6 +51,47 @@ jobs:
       - name: Build WinUI application
         run: dotnet build ResticPal.slnx --configuration Debug
 
+  e2e:
+    name: End-to-end Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      # The enrollment flow runs against resticpal-server's current main on
+      # purpose: this is the living contract test between the two repos, so
+      # drift on either side fails here instead of in a real deployment.
+      - name: Check out resticpal-server
+        uses: actions/checkout@v6
+        with:
+          repository: theatrus/resticpal-server
+          path: resticpal-server
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.0 --profile minimal
+
+      # The same pinned, hash-verified restic the installer ships. This is the
+      # one place CI runs restic for real: init, backup, verify, and cancel
+      # against a disposable local repository.
+      - name: Download pinned restic
+        shell: pwsh
+        run: ./scripts/Get-Restic.ps1 -DestinationPath (Join-Path $env:RUNNER_TEMP 'restic/restic.exe')
+
+      - name: Run a real restic backup lifecycle
+        shell: pwsh
+        run: |
+          $env:RESTICPAL_TEST_RESTIC = Join-Path $env:RUNNER_TEMP 'restic/restic.exe'
+          cargo test -p resticpal-service --locked -- --ignored --exact executor::tests::real_restic_local_repository_lifecycle_without_vss
+
+      # Build the server, mint a one-time bootstrap URL, and drive the client's
+      # real enrollment: sealed-secret decryption, an authenticated manifest
+      # fetch, a status report, and a bootstrap-token replay rejection.
+      - name: Run the server enrollment flow
+        shell: pwsh
+        run: ./scripts/Test-ServerEnrollment.ps1 -ServerRepoPath (Join-Path $env:GITHUB_WORKSPACE 'resticpal-server')
+
   package:
     name: Build Windows MSI
     needs: validate

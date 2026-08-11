@@ -533,6 +533,93 @@ mod tests {
         assert_eq!(after_replay.policy.revision, "plain-12");
     }
 
+    /// Full enrollment lifecycle against a live resticpal-server: enroll with
+    /// a one-time bootstrap URL, verify and decrypt the sealed material, then
+    /// use the issued status token against the real manifest and status
+    /// endpoints. CI starts the server and provides the bootstrap URL; see
+    /// scripts/Test-ServerEnrollment.ps1.
+    #[test]
+    #[ignore = "requires RESTICPAL_TEST_BOOTSTRAP_URL pointing at a live resticpal-server"]
+    fn real_server_enrollment_manifest_and_status_lifecycle() {
+        use resticpal_core::config::SecretEnvironmentVariable;
+        use resticpal_core::status::{BackupState, ServiceStatus};
+        use resticpal_windows::credentials::DpapiSecretStore;
+
+        let bootstrap_url = std::env::var("RESTICPAL_TEST_BOOTSTRAP_URL")
+            .expect("set RESTICPAL_TEST_BOOTSTRAP_URL to a one-time bootstrap URL");
+        let client = ManagementClient::new();
+
+        let pending = client.enroll(&bootstrap_url).expect("enrollment succeeds");
+        let material = &pending.material;
+        assert!(
+            material.initial_manifest.signed,
+            "initial manifest arrives signed"
+        );
+        assert!(
+            !material.status_token.is_empty(),
+            "a status token is issued"
+        );
+        assert!(
+            material
+                .repository_secrets
+                .contains_key(&SecretEnvironmentVariable::ResticPassword),
+            "the sealed bundle delivers the repository password"
+        );
+
+        // Persist the issued token the way the runtime does, then exercise the
+        // authenticated manifest and status endpoints with it.
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let store =
+            DpapiSecretStore::open(temporary.path().join("credentials")).expect("credential store");
+        let token_ref = store
+            .put_new("management-status", material.status_token.as_bytes())
+            .expect("store status token");
+        let config = LocalManagementConfig {
+            mode: ManagementMode::SignedManifest,
+            manifest_url: Some(material.manifest_url.clone()),
+            signing_public_key: Some(pending.public_key.clone()),
+            refresh_interval_minutes: Some(material.refresh_interval_minutes),
+            status_url: Some(material.status_url.clone()),
+            device_id: Some(material.device_id.clone()),
+            status_token_ref: Some(token_ref),
+            enrollment_key_ref: None,
+        };
+
+        let initial_sequence = material.initial_manifest.payload.sequence;
+        let (loaded, _document) = client
+            .fetch_policy(&config, Some(initial_sequence), Some(&store))
+            .expect("manifest fetch with the issued token succeeds");
+        assert!(
+            loaded.sequence >= initial_sequence,
+            "the served manifest never rolls back past enrollment"
+        );
+
+        client
+            .report_status(
+                &config,
+                &store,
+                ServiceStatus {
+                    state: BackupState::Idle,
+                    state_since: Utc::now(),
+                    last_attempt: None,
+                    last_success: None,
+                    next_deadline: None,
+                    repository_display_name: None,
+                    repository_mode: Default::default(),
+                    managed_revision: Some(loaded.policy.revision.clone()),
+                    progress: None,
+                },
+            )
+            .expect("status report with the issued token succeeds");
+
+        // The bootstrap token is one-time: the server consumes it on success,
+        // so replaying the same bootstrap URL must be rejected.
+        assert!(
+            client.enroll(&bootstrap_url).is_err(),
+            "a consumed bootstrap token cannot be replayed"
+        );
+    }
+
     fn serve_once(body: Vec<u8>) -> (String, thread::JoinHandle<()>) {
         serve_documents([body])
     }
