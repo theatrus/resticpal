@@ -85,6 +85,39 @@ jobs:
           $env:RESTICPAL_TEST_RESTIC = Join-Path $env:RUNNER_TEMP 'restic/restic.exe'
           cargo test -p resticpal-service --locked -- --ignored --exact executor::tests::real_restic_local_repository_lifecycle_without_vss
 
+      # VSS on a shared runner is at the mercy of the image's shadow-copy
+      # stack, so probe it first: if a snapshot of the temp volume cannot be
+      # created at all, skip the VSS lifecycle visibly rather than failing the
+      # job for a broken runner. When the probe passes, the test must too --
+      # that run exercises the exact production invocation, --use-fs-snapshot
+      # included.
+      - name: Probe VSS availability
+        id: vss
+        shell: pwsh
+        run: |
+          $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          $available = $false
+          if ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            $volume = [IO.Path]::GetPathRoot([IO.Path]::GetTempPath())
+            vssadmin create shadow /for=$volume | Out-Host
+            if ($LASTEXITCODE -eq 0) {
+              $available = $true
+              vssadmin delete shadows /for=$volume /quiet | Out-Host
+            }
+          }
+          if (-not $available) {
+            Write-Host '::notice::VSS is unavailable on this runner; the VSS backup lifecycle was skipped.'
+          }
+          "available=$($available.ToString().ToLower())" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Run a real restic VSS backup lifecycle
+        if: steps.vss.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $env:RESTICPAL_TEST_RESTIC = Join-Path $env:RUNNER_TEMP 'restic/restic.exe'
+          cargo test -p resticpal-service --locked -- --ignored --exact executor::tests::real_restic_vss_local_repository_lifecycle
+
       # Build the server, mint a one-time bootstrap URL, and drive the client's
       # real enrollment: sealed-secret decryption, an authenticated manifest
       # fetch, a status report, and a bootstrap-token replay rejection.
