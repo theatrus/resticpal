@@ -99,10 +99,17 @@ jobs:
           $available = $false
           if ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
             $volume = [IO.Path]::GetPathRoot([IO.Path]::GetTempPath())
-            vssadmin create shadow /for=$volume | Out-Host
-            if ($LASTEXITCODE -eq 0) {
-              $available = $true
-              vssadmin delete shadows /for=$volume /quiet | Out-Host
+            $output = vssadmin create shadow /for=$volume 2>&1
+            $available = $LASTEXITCODE -eq 0
+            $output | Out-Host
+            # vssadmin shadows are persistent, unlike the auto-release
+            # VSS_CTX_BACKUP snapshots restic creates: delete exactly the one
+            # this probe made, whatever the exit code said, so nothing is
+            # stranded (and nothing pre-existing is touched) on a reused runner.
+            $id = $output | Select-String -Pattern 'Shadow Copy ID: (\{[0-9a-fA-F-]+\})' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
+            if ($id) {
+              vssadmin delete shadows /shadow=$id /quiet | Out-Host
             }
           }
           if (-not $available) {
