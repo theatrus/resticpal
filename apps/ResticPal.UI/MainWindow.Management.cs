@@ -49,6 +49,7 @@ public sealed partial class MainWindow
                     FirstRunInfoBar.IsOpen = false;
                     _managementLoaded = false;
                     await LoadManagementAsync();
+                    await SynchronizeConfigurationPagesAsync();
                     await RefreshStatusAsync();
                 }
             }
@@ -85,6 +86,7 @@ public sealed partial class MainWindow
             {
                 _managementLoaded = false;
                 await LoadManagementAsync();
+                await SynchronizeConfigurationPagesAsync();
                 await RefreshStatusAsync();
             }
         }, SetManagementBusy);

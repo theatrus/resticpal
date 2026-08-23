@@ -9,6 +9,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @'
 using System;
 using System.Diagnostics;
@@ -190,6 +191,86 @@ function Wait-AutomationElementOnscreen(
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for UI element $AutomationId to come on-screen."
+}
+
+function Wait-AutomationElementEnabled(
+    [Diagnostics.Process] $Process,
+    [string] $AutomationId,
+    [TimeSpan] $Timeout
+) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    do {
+        try {
+            $element = Wait-AutomationElement $Process $AutomationId ([TimeSpan]::FromSeconds(2))
+            if ($element.Current.IsEnabled) {
+                return $element
+            }
+        } catch {
+            # Retry when a WinUI layout pass replaces the automation element.
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for enabled UI element $AutomationId."
+}
+
+function Wait-AutomationElementByName([string] $Name, [TimeSpan] $Timeout) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    $condition = [Windows.Automation.PropertyCondition]::new(
+        [Windows.Automation.AutomationElement]::NameProperty,
+        $Name
+    )
+    do {
+        $window = [Windows.Automation.AutomationElement]::RootElement.FindFirst(
+            [Windows.Automation.TreeScope]::Descendants,
+            $condition
+        )
+        if ($null -ne $window) {
+            return $window
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $windowCondition = [Windows.Automation.PropertyCondition]::new(
+        [Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [Windows.Automation.ControlType]::Window
+    )
+    $visibleWindowNames = @(
+        [Windows.Automation.AutomationElement]::RootElement.FindAll(
+            [Windows.Automation.TreeScope]::Children,
+            $windowCondition
+        ) | ForEach-Object { $_.Current.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    throw "Timed out waiting for automation element '$Name'. Visible windows: $($visibleWindowNames -join '; ')"
+}
+
+function Wait-AutomationTextContains(
+    [Diagnostics.Process] $Process,
+    [string] $AutomationId,
+    [string] $ExpectedText,
+    [TimeSpan] $Timeout
+) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    $lastText = ''
+    do {
+        try {
+            $element = Wait-AutomationElement $Process $AutomationId ([TimeSpan]::FromSeconds(2))
+            $text = @(
+                $element.Current.Name
+                $element.FindAll(
+                    [Windows.Automation.TreeScope]::Descendants,
+                    [Windows.Automation.Condition]::TrueCondition
+                ) |
+                    ForEach-Object { $_.Current.Name }
+            ) -join ' '
+            $lastText = $text
+            if ($text.IndexOf($ExpectedText, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                return $text
+            }
+        } catch {
+            # Retry while the async command updates the WinUI InfoBar content.
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for '$ExpectedText' in UI element $AutomationId. Observed: $lastText"
 }
 
 function Wait-NativeWindowForProcess(
@@ -512,6 +593,38 @@ try {
     Wait-AutomationElement $startMenuUiProcess 'CheckForUpdatesButton' ([TimeSpan]::FromSeconds(10)) | Out-Null
     Wait-AutomationElement $startMenuUiProcess 'AutomaticUpdatesToggle' ([TimeSpan]::FromSeconds(10)) | Out-Null
     Write-Host 'The WinUI Settings page exposes enrollment and signed-update controls.'
+
+    $sourcesItem = Wait-AutomationElement $startMenuUiProcess 'SourcesItem' ([TimeSpan]::FromSeconds(10))
+    $sourcesSelection = $sourcesItem.GetCurrentPattern(
+        [Windows.Automation.SelectionItemPattern]::Pattern
+    )
+    $sourcesSelection.Select()
+    $addSource = Wait-AutomationElementEnabled $startMenuUiProcess 'AddSourceButton' ([TimeSpan]::FromSeconds(10))
+    $addSourceInvoke = $addSource.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)
+    $addSourceInvoke.Invoke()
+    try {
+        Wait-AutomationElementByName 'Choose a folder to back up' ([TimeSpan]::FromSeconds(5)) | Out-Null
+    } catch {
+        $pickerError = $_.Exception.Message
+        $messageText = try {
+            $messageBar = Wait-AutomationElement $startMenuUiProcess 'MessageBar' ([TimeSpan]::FromSeconds(2))
+            $messageTextCondition = [Windows.Automation.PropertyCondition]::new(
+                [Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [Windows.Automation.ControlType]::Text
+            )
+            @(
+                $messageBar.FindAll([Windows.Automation.TreeScope]::Descendants, $messageTextCondition) |
+                    ForEach-Object { $_.Current.Name } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            ) -join ' '
+        } catch {
+            '(no error message was shown)'
+        }
+        throw "$pickerError resticpal message: $messageText"
+    }
+    [Windows.Forms.SendKeys]::SendWait('{ESC}')
+    Wait-AutomationElementEnabled $startMenuUiProcess 'AddSourceButton' ([TimeSpan]::FromSeconds(10)) | Out-Null
+    Write-Host 'The backup-source Add folder action opened the native Windows App SDK picker.'
     Stop-Process -Id $startMenuUiProcess.Id -Force
     $startMenuUiProcess.WaitForExit(10000) | Out-Null
     Start-Process -FilePath (Join-Path $installRoot 'resticpal-ui.exe') -ArgumentList '--updates'
@@ -570,19 +683,36 @@ try {
     Assert-Accepted @{ type = 'validate_repository' }
     Wait-RepositoryOperation 'validate' ([TimeSpan]::FromMinutes(2))
 
+    $repositoryItem = Wait-AutomationElement $updatesUiProcess 'RepositoryItem' ([TimeSpan]::FromSeconds(10))
+    $repositorySelection = $repositoryItem.GetCurrentPattern(
+        [Windows.Automation.SelectionItemPattern]::Pattern
+    )
+    $repositorySelection.Select()
+    Wait-AutomationElementEnabled $updatesUiProcess 'ValidateRepositoryButton' ([TimeSpan]::FromSeconds(10)) | Out-Null
+    $saveRepository = Wait-AutomationElement $updatesUiProcess 'SaveRepositoryButton' ([TimeSpan]::FromSeconds(10))
+    if ($saveRepository.Current.IsEnabled) {
+        throw 'Loading the service-saved repository incorrectly marked it as an unsaved UI edit.'
+    }
+    Write-Host 'A service-loaded repository can be tested immediately without an unnecessary save.'
+
     Assert-Accepted @{
         type = 'update_backup_sources'
         paths = @($sourceRoot)
         exclusions = @()
     }
-    $runRequest = Invoke-ResticPalRequest @{ type = 'run_backup_now' }
-    if ($runRequest.type -ne 'accepted' -and -not (
-        $runRequest.type -eq 'rejected' -and $runRequest.code -eq 'already_running'
-    )) {
-        throw "The service rejected 'run_backup_now': $($runRequest.code) $($runRequest.message)"
-    }
-    $run = Wait-Backup ([TimeSpan]::FromMinutes(3))
-    Write-Host "Append-only backup snapshot $($run.snapshot_id) completed through the installed service."
+    $automaticRun = Wait-Backup ([TimeSpan]::FromMinutes(3))
+    Write-Host "Initial configuration automatically started append-only snapshot $($automaticRun.snapshot_id)."
+    $overviewItem = Wait-AutomationElement $updatesUiProcess 'OverviewItem' ([TimeSpan]::FromSeconds(10))
+    $overviewSelection = $overviewItem.GetCurrentPattern(
+        [Windows.Automation.SelectionItemPattern]::Pattern
+    )
+    $overviewSelection.Select()
+    $runBackupButton = Wait-AutomationElementEnabled $updatesUiProcess 'RunBackupButton' ([TimeSpan]::FromSeconds(10))
+    $runBackupInvoke = $runBackupButton.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)
+    $runBackupInvoke.Invoke()
+    Wait-AutomationTextContains $updatesUiProcess 'MessageBar' 'Backup requested' ([TimeSpan]::FromSeconds(10)) | Out-Null
+    $run = Wait-Backup ([TimeSpan]::FromMinutes(3)) $automaticRun.snapshot_id
+    Write-Host "The Run backup now button started append-only snapshot $($run.snapshot_id) and acknowledged the queued state."
 
     $appendOnlyRetention = Invoke-ResticPalRequest @{ type = 'get_retention' }
     if ($appendOnlyRetention.type -ne 'retention' -or $appendOnlyRetention.configuration.repository_mode -ne 'append_only') {

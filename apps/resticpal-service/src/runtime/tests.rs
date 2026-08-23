@@ -1819,6 +1819,38 @@ fn enrollment_commit_protects_credentials_activates_policy_and_unenrolls_cleanly
             .as_slice(),
         b"repository-password"
     );
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(60, RequestCommand::GetRepository), ADMIN)
+            .payload,
+        ResponsePayload::Repository {
+            configuration: RepositoryView {
+                ref configured_secrets,
+                secrets_locked: true,
+                ..
+            }
+        } if configured_secrets == &[SecretEnvironmentVariable::ResticPassword]
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(
+                    61,
+                    RequestCommand::UpdateRepository {
+                        display_name: None,
+                        url: None,
+                        mode: None,
+                        options: None,
+                        secret_updates: vec![RepositorySecretUpdate::Remove {
+                            variable: SecretEnvironmentVariable::ResticPassword,
+                        }],
+                    },
+                ),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "managed_field_locked"
+    ));
 
     assert!(matches!(
         runtime.unenroll(ADMIN),
@@ -1828,6 +1860,17 @@ fn enrollment_commit_protects_credentials_activates_policy_and_unenrolls_cleanly
         .load()
         .expect("unmanaged config");
     assert_eq!(local.management.mode, ManagementMode::Disabled);
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(62, RequestCommand::GetRepository), ADMIN)
+            .payload,
+        ResponsePayload::Repository {
+            configuration: RepositoryView {
+                secrets_locked: false,
+                ..
+            }
+        }
+    ));
     assert!(matches!(
         credentials.get(&status_ref),
         Err(CredentialStoreError::NotFound)

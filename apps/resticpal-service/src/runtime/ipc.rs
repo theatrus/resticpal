@@ -221,7 +221,8 @@ impl ServiceRuntime {
                         state.not_before = None;
                         match self.events.send(RuntimeEvent::RunNow) {
                             Ok(()) => ResponsePayload::Accepted {
-                                message: "Backup request accepted.".to_owned(),
+                                message: "Backup requested. Waiting for the service to start."
+                                    .to_owned(),
                             },
                             Err(_) => {
                                 state.manual_requested = false;
@@ -315,8 +316,12 @@ impl ServiceRuntime {
             url_locked: self.field_locked(PolicyField::RepositoryUrl),
             mode_locked: self.field_locked(PolicyField::RepositoryMode),
             options_locked: self.field_locked(PolicyField::RepositoryOptions),
-            secrets_locked: self.field_locked(PolicyField::RepositorySecretRefs),
+            secrets_locked: self.repository_secrets_locked(),
         }
+    }
+
+    fn repository_secrets_locked(&self) -> bool {
+        self.field_locked(PolicyField::RepositorySecretRefs) || self.management_view().enrolled
     }
 
     fn begin_repository_operation(
@@ -962,7 +967,7 @@ impl ServiceRuntime {
             || url.is_some() && self.field_locked(PolicyField::RepositoryUrl)
             || mode.is_some() && self.field_locked(PolicyField::RepositoryMode)
             || options.is_some() && self.field_locked(PolicyField::RepositoryOptions)
-            || !secret_updates.is_empty() && self.field_locked(PolicyField::RepositorySecretRefs)
+            || !secret_updates.is_empty() && self.repository_secrets_locked()
         {
             return rejected(
                 "managed_field_locked",

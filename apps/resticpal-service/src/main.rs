@@ -57,6 +57,30 @@ use zeroize::Zeroizing;
 const SERVICE_NAME: &str = "ResticPal";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const MANAGEMENT_BUSY_RETRY: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagementRefreshOutcome {
+    Synchronized,
+    RuntimeBusy,
+    Failed,
+}
+
+fn management_refresh_delay(
+    refresh_interval_minutes: u32,
+    outcome: ManagementRefreshOutcome,
+    consecutive_failures: u32,
+) -> Duration {
+    let configured = Duration::from_secs(u64::from(refresh_interval_minutes) * 60);
+    match outcome {
+        ManagementRefreshOutcome::Synchronized => configured,
+        ManagementRefreshOutcome::RuntimeBusy => MANAGEMENT_BUSY_RETRY,
+        ManagementRefreshOutcome::Failed => {
+            let exponent = consecutive_failures.saturating_sub(1).min(6);
+            Duration::from_secs(60_u64.saturating_mul(1_u64 << exponent)).min(configured)
+        }
+    }
+}
 
 fn main() -> ExitCode {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
@@ -269,6 +293,7 @@ fn start_management_worker(
             let mut sequence = 0;
             let mut source_identity = None;
             let mut next_refresh = Instant::now();
+            let mut refresh_failures = 0_u32;
             let mut next_report = Instant::now();
             let mut report_failures = 0_u32;
             let mut last_observed_state: Option<BackupState> = None;
@@ -285,6 +310,7 @@ fn start_management_worker(
                 if local.management.mode == resticpal_core::config::ManagementMode::Disabled {
                     source_identity = None;
                     sequence = 0;
+                    refresh_failures = 0;
                     last_observed_state = None;
                     thread::sleep(Duration::from_secs(30));
                     continue;
@@ -297,26 +323,42 @@ fn start_management_worker(
                 );
                 let now = Instant::now();
                 if source_identity.as_ref() != Some(&current_identity) {
-                    match management::load_best_policy(
+                    refresh_failures = 0;
+                    let outcome = match management::load_best_policy(
                         &config_path,
                         &local,
                         credential_store.as_ref(),
                     ) {
-                        Ok(Some(loaded)) => {
-                            if runtime
-                                .apply_managed_policy(&loaded.policy)
-                                .unwrap_or(false)
-                            {
+                        Ok(Some(loaded)) => match runtime.apply_managed_policy(&loaded.policy) {
+                            Ok(true) => {
                                 sequence = loaded.sequence;
+                                ManagementRefreshOutcome::Synchronized
                             }
+                            Ok(false) => ManagementRefreshOutcome::RuntimeBusy,
+                            Err(error) => {
+                                eprintln!("managed source activation failed: {error}");
+                                ManagementRefreshOutcome::Failed
+                            }
+                        },
+                        Ok(None) => {
+                            sequence = 0;
+                            ManagementRefreshOutcome::Synchronized
                         }
-                        Ok(None) => sequence = 0,
-                        Err(error) => eprintln!("managed source activation failed: {error}"),
-                    }
+                        Err(error) => {
+                            eprintln!("managed source activation failed: {error}");
+                            ManagementRefreshOutcome::Failed
+                        }
+                    };
+                    refresh_failures = match outcome {
+                        ManagementRefreshOutcome::Failed => refresh_failures.saturating_add(1),
+                        _ => 0,
+                    };
                     source_identity = Some(current_identity);
                     next_refresh = now
-                        + Duration::from_secs(
-                            u64::from(local.management.refresh_interval_minutes()) * 60,
+                        + management_refresh_delay(
+                            local.management.refresh_interval_minutes(),
+                            outcome,
+                            refresh_failures,
                         );
                     next_report = now;
                     report_failures = 0;
@@ -324,7 +366,7 @@ fn start_management_worker(
                 }
 
                 if now >= next_refresh {
-                    match management::refresh_policy(
+                    let outcome = match management::refresh_policy(
                         &client,
                         &config_path,
                         &local,
@@ -334,19 +376,34 @@ fn start_management_worker(
                         Ok(loaded) => {
                             if loaded.sequence > sequence {
                                 match runtime.apply_managed_policy(&loaded.policy) {
-                                    Ok(true) => sequence = loaded.sequence,
-                                    Ok(false) => {}
+                                    Ok(true) => {
+                                        sequence = loaded.sequence;
+                                        ManagementRefreshOutcome::Synchronized
+                                    }
+                                    Ok(false) => ManagementRefreshOutcome::RuntimeBusy,
                                     Err(error) => {
-                                        eprintln!("managed policy could not be applied: {error}")
+                                        eprintln!("managed policy could not be applied: {error}");
+                                        ManagementRefreshOutcome::Failed
                                     }
                                 }
+                            } else {
+                                ManagementRefreshOutcome::Synchronized
                             }
                         }
-                        Err(error) => eprintln!("managed policy refresh failed: {error}"),
-                    }
+                        Err(error) => {
+                            eprintln!("managed policy refresh failed: {error}");
+                            ManagementRefreshOutcome::Failed
+                        }
+                    };
+                    refresh_failures = match outcome {
+                        ManagementRefreshOutcome::Failed => refresh_failures.saturating_add(1),
+                        _ => 0,
+                    };
                     next_refresh = now
-                        + Duration::from_secs(
-                            u64::from(local.management.refresh_interval_minutes()) * 60,
+                        + management_refresh_delay(
+                            local.management.refresh_interval_minutes(),
+                            outcome,
+                            refresh_failures,
                         );
                 }
 
@@ -809,4 +866,33 @@ fn restic_path() -> PathBuf {
             executable
         })
         .unwrap_or_else(|_| PathBuf::from("restic.exe"))
+}
+
+#[cfg(test)]
+mod management_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn busy_runtime_retries_policy_without_waiting_for_the_full_interval() {
+        assert_eq!(
+            management_refresh_delay(15, ManagementRefreshOutcome::RuntimeBusy, 0),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn failed_policy_fetch_backs_off_without_exceeding_the_configured_interval() {
+        assert_eq!(
+            management_refresh_delay(15, ManagementRefreshOutcome::Failed, 1),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            management_refresh_delay(15, ManagementRefreshOutcome::Failed, 8),
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            management_refresh_delay(15, ManagementRefreshOutcome::Synchronized, 0),
+            Duration::from_secs(15 * 60)
+        );
+    }
 }

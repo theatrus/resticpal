@@ -4,12 +4,12 @@ use std::fs;
 use std::mem::size_of;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, VerifyingKey};
-use resticpal_core::status::BackupState;
+use resticpal_core::status::{BackupState, ServiceStatus, WaitingReason};
 use resticpal_protocol::{Request, RequestCommand, Response, ResponsePayload, UpdatePackage};
 use resticpal_windows::named_pipe::{NamedPipeClient, NamedPipeError};
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
@@ -24,11 +24,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
     GetCursorPos, GetMessageTime, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, KillTimer,
-    LR_DEFAULTCOLOR, LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK,
-    MENU_ITEM_FLAGS, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SW_SHOWNORMAL, SetForegroundWindow, SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu,
-    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    LR_DEFAULTCOLOR, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK, MENU_ITEM_FLAGS, MSG,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow,
+    SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER,
+    WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{Error, Result, w};
 
@@ -44,6 +44,9 @@ const ONBOARDING_RETRY_INTERVAL_MS: u32 = 1_000;
 const ONBOARDING_MAX_ATTEMPTS: u64 = 120;
 const UPDATE_TIMER_ID: usize = 3;
 const UPDATE_RETRY_TIMER_ID: usize = 4;
+const BACKUP_STATUS_TIMER_ID: usize = 5;
+const BACKUP_STATUS_INTERVAL_MS: u32 = 1_000;
+const BACKUP_WAITING_INTERVAL_MS: u32 = 30_000;
 const UPDATE_CHECK_INTERVAL_MS: u32 = 6 * 60 * 60 * 1_000;
 const UPDATE_RETRY_INTERVAL_MS: u32 = 5 * 60 * 1_000;
 const UPDATE_AVAILABLE_MESSAGE: u32 = WM_APP + 2;
@@ -71,6 +74,10 @@ static LAST_LEFT_CLICK_MESSAGE_TIME: AtomicU64 = AtomicU64::new(u64::MAX);
 static UI_LAUNCH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static BACKUP_MONITOR_BASELINE_ATTEMPT: AtomicI64 = AtomicI64::new(i64::MIN);
+static BACKUP_MONITOR_TICKS: AtomicU64 = AtomicU64::new(0);
+static BACKUP_MONITOR_OBSERVED_RUNNING: AtomicBool = AtomicBool::new(false);
+static BACKUP_STARTED_NOTIFICATION_SHOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 enum UiDestination {
@@ -409,6 +416,10 @@ fn window_proc_inner(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM)
             start_update_check(window);
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == BACKUP_STATUS_TIMER_ID => {
+            poll_backup_status(window);
+            LRESULT(0)
+        }
         UPDATE_AVAILABLE_MESSAGE => {
             if wparam.0 != 0 {
                 let _ = show_update_notification(window);
@@ -420,6 +431,7 @@ fn window_proc_inner(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM)
             let _ = unsafe { KillTimer(Some(window), ONBOARDING_TIMER_ID) };
             let _ = unsafe { KillTimer(Some(window), UPDATE_TIMER_ID) };
             let _ = unsafe { KillTimer(Some(window), UPDATE_RETRY_TIMER_ID) };
+            let _ = unsafe { KillTimer(Some(window), BACKUP_STATUS_TIMER_ID) };
             remove_tray_icon(window);
             // SAFETY: called from the UI thread's window procedure.
             unsafe { PostQuitMessage(0) };
@@ -845,6 +857,14 @@ fn update_prompt_is_due(now: SystemTime, last_prompt: Option<SystemTime>) -> boo
 }
 
 fn show_update_notification(window: HWND) -> Result<()> {
+    show_tray_notification(
+        window,
+        "resticpal update available",
+        "A signed resticpal update is ready. Click to review and install it.",
+    )
+}
+
+fn show_tray_notification(window: HWND, title: &str, message: &str) -> Result<()> {
     let mut data = NOTIFYICONDATAW {
         cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>())
             .expect("NOTIFYICONDATAW size fits in u32"),
@@ -854,11 +874,8 @@ fn show_update_notification(window: HWND) -> Result<()> {
         dwInfoFlags: NIIF_INFO,
         ..NOTIFYICONDATAW::default()
     };
-    copy_wide("resticpal update available", &mut data.szInfoTitle);
-    copy_wide(
-        "A signed resticpal update is ready. Click to review and install it.",
-        &mut data.szInfo,
-    );
+    copy_wide(title, &mut data.szInfoTitle);
+    copy_wide(message, &mut data.szInfo);
     data.Anonymous.uTimeout = 10_000;
 
     // SAFETY: data identifies the notification icon owned by the live window.
@@ -870,13 +887,32 @@ fn show_update_notification(window: HWND) -> Result<()> {
 }
 
 fn send_backup_action(window: HWND, command: RequestCommand) {
+    let run_backup = matches!(&command, RequestCommand::RunBackupNow);
+    let baseline_attempt = if run_backup {
+        fetch_service_status()
+            .ok()
+            .flatten()
+            .and_then(|status| status.last_attempt)
+            .map_or(i64::MIN, |attempt| attempt.timestamp_millis())
+    } else {
+        i64::MIN
+    };
     match send_request(command) {
         Ok(Response {
             payload: ResponsePayload::Accepted { message },
             ..
         }) => {
-            show_information(window, &message);
+            let _ = show_tray_notification(
+                window,
+                if run_backup {
+                    "Backup requested"
+                } else {
+                    "Cancellation requested"
+                },
+                &message,
+            );
             let _ = refresh_tray_status(window);
+            start_backup_status_monitor(window, baseline_attempt, !run_backup);
         }
         Ok(Response {
             payload: ResponsePayload::Rejected { message, .. },
@@ -894,59 +930,69 @@ fn send_backup_action(window: HWND, command: RequestCommand) {
 }
 
 fn fetch_status_tooltip() -> std::result::Result<String, NamedPipeError> {
-    let response = send_request(RequestCommand::GetStatus)?;
-    Ok(match response.payload {
-        ResponsePayload::Status { status } => match status.state {
-            BackupState::Unconfigured => "resticpal: setup required".to_owned(),
-            BackupState::Idle | BackupState::Succeeded => "resticpal: protected".to_owned(),
-            BackupState::Waiting { .. } => "resticpal: backup waiting".to_owned(),
-            BackupState::Running { .. } => status
-                .progress
-                .as_ref()
-                .and_then(|progress| {
-                    progress
-                        .percent_done
-                        .map(|percent| format!("resticpal: backup running ({percent}%)"))
-                })
-                .unwrap_or_else(|| "resticpal: backup running".to_owned()),
-            BackupState::SucceededWithWarnings => {
-                "resticpal: backup completed with warnings".to_owned()
-            }
-            BackupState::Failed { .. } => "resticpal: backup needs attention".to_owned(),
-            BackupState::Cancelled => "resticpal: last backup cancelled".to_owned(),
-            BackupState::Paused => "resticpal: backups paused".to_owned(),
-        },
-        ResponsePayload::Rejected { message, .. } => format!("resticpal: {message}"),
-        ResponsePayload::Accepted { .. } => "resticpal: connected".to_owned(),
-        ResponsePayload::RunHistory { .. }
-        | ResponsePayload::Management { .. }
-        | ResponsePayload::BackupSources { .. }
-        | ResponsePayload::DiscoveredBackupSources { .. }
-        | ResponsePayload::Repository { .. }
-        | ResponsePayload::Schedule { .. }
-        | ResponsePayload::Retention { .. }
-        | ResponsePayload::UpdateSettings { .. }
-        | ResponsePayload::Diagnostics { .. } => {
-            "resticpal: unexpected service response".to_owned()
-        }
+    fetch_service_status().map(|status| {
+        status.map_or_else(
+            || "resticpal: unexpected service response".to_owned(),
+            |status| status_tooltip(&status),
+        )
     })
 }
 
-fn backup_is_running() -> std::result::Result<bool, NamedPipeError> {
+fn fetch_service_status() -> std::result::Result<Option<ServiceStatus>, NamedPipeError> {
     let response = send_request(RequestCommand::GetStatus)?;
-    Ok(matches!(
-        response.payload,
-        ResponsePayload::Status {
-            status: resticpal_core::status::ServiceStatus {
-                state: BackupState::Running { .. },
-                ..
-            }
+    match response.payload {
+        ResponsePayload::Status { status } => Ok(Some(status)),
+        _ => Ok(None),
+    }
+}
+
+fn status_tooltip(status: &ServiceStatus) -> String {
+    match status.state {
+        BackupState::Unconfigured => "resticpal: setup required".to_owned(),
+        BackupState::Idle | BackupState::Succeeded => "resticpal: protected".to_owned(),
+        BackupState::Waiting {
+            reason: WaitingReason::Battery,
+        } => "resticpal: backup waiting for AC power".to_owned(),
+        BackupState::Waiting {
+            reason: WaitingReason::Network,
+        } => "resticpal: backup waiting for network".to_owned(),
+        BackupState::Waiting {
+            reason: WaitingReason::MeteredNetwork,
+        } => "resticpal: backup waiting for an unmetered network".to_owned(),
+        BackupState::Waiting { .. } => "resticpal: backup waiting".to_owned(),
+        BackupState::Running { .. } => status
+            .progress
+            .as_ref()
+            .and_then(|progress| {
+                progress
+                    .percent_done
+                    .map(|percent| format!("resticpal: backup running ({percent}%)"))
+            })
+            .unwrap_or_else(|| "resticpal: backup running".to_owned()),
+        BackupState::SucceededWithWarnings => {
+            "resticpal: backup completed with warnings".to_owned()
         }
+        BackupState::Failed { .. } => "resticpal: backup needs attention".to_owned(),
+        BackupState::Cancelled => "resticpal: last backup cancelled".to_owned(),
+        BackupState::Paused => "resticpal: backups paused".to_owned(),
+    }
+}
+
+fn backup_is_running() -> std::result::Result<bool, NamedPipeError> {
+    Ok(matches!(
+        fetch_service_status()?,
+        Some(ServiceStatus {
+            state: BackupState::Running { .. },
+            ..
+        })
     ))
 }
 
-fn refresh_tray_status(window: HWND) -> std::result::Result<(), NamedPipeError> {
-    let tooltip = fetch_status_tooltip()?;
+fn refresh_tray_status(window: HWND) -> std::result::Result<Option<ServiceStatus>, NamedPipeError> {
+    let Some(status) = fetch_service_status()? else {
+        return Ok(None);
+    };
+    let tooltip = status_tooltip(&status);
     let mut data = NOTIFYICONDATAW {
         cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>())
             .expect("NOTIFYICONDATAW size fits in u32"),
@@ -959,10 +1005,122 @@ fn refresh_tray_status(window: HWND) -> std::result::Result<(), NamedPipeError> 
 
     // SAFETY: data identifies our live notification icon and contains a valid tip.
     if unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const data) }.as_bool() {
-        Ok(())
+        Ok(Some(status))
     } else {
         Err(windows::core::Error::from_thread().into())
     }
+}
+
+fn start_backup_status_monitor(window: HWND, baseline_attempt: i64, observed_running: bool) {
+    BACKUP_MONITOR_BASELINE_ATTEMPT.store(baseline_attempt, Ordering::Relaxed);
+    BACKUP_MONITOR_TICKS.store(0, Ordering::Relaxed);
+    BACKUP_MONITOR_OBSERVED_RUNNING.store(observed_running, Ordering::Relaxed);
+    BACKUP_STARTED_NOTIFICATION_SHOWN.store(observed_running, Ordering::Relaxed);
+    // SAFETY: the timer belongs to the tray's live hidden window and is replaced
+    // when another tray backup action starts.
+    unsafe {
+        SetTimer(
+            Some(window),
+            BACKUP_STATUS_TIMER_ID,
+            BACKUP_STATUS_INTERVAL_MS,
+            None,
+        );
+    }
+}
+
+fn poll_backup_status(window: HWND) {
+    let status = match refresh_tray_status(window) {
+        Ok(Some(status)) => status,
+        _ => {
+            if BACKUP_MONITOR_TICKS.fetch_add(1, Ordering::Relaxed) + 1 == 15 {
+                // SAFETY: resetting the same live timer reduces polling while
+                // the service is temporarily unavailable.
+                unsafe {
+                    SetTimer(
+                        Some(window),
+                        BACKUP_STATUS_TIMER_ID,
+                        BACKUP_WAITING_INTERVAL_MS,
+                        None,
+                    );
+                }
+            }
+            return;
+        }
+    };
+    let ticks = BACKUP_MONITOR_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let observed_running = BACKUP_MONITOR_OBSERVED_RUNNING.load(Ordering::Relaxed);
+    let attempt_changed = status.last_attempt.is_some_and(|attempt| {
+        attempt.timestamp_millis() != BACKUP_MONITOR_BASELINE_ATTEMPT.load(Ordering::Relaxed)
+    });
+    if ticks == 15
+        && !observed_running
+        && !attempt_changed
+        && !matches!(status.state, BackupState::Running { .. })
+    {
+        let _ = show_tray_notification(
+            window,
+            "Backup waiting",
+            "The request is still queued. resticpal will keep watching its power, network, and service conditions.",
+        );
+        // SAFETY: resetting the same live timer reduces idle polling while a
+        // start condition remains unavailable.
+        unsafe {
+            SetTimer(
+                Some(window),
+                BACKUP_STATUS_TIMER_ID,
+                BACKUP_WAITING_INTERVAL_MS,
+                None,
+            );
+        }
+    }
+
+    match status.state {
+        BackupState::Running { .. } => {
+            BACKUP_MONITOR_OBSERVED_RUNNING.store(true, Ordering::Relaxed);
+            if !BACKUP_STARTED_NOTIFICATION_SHOWN.swap(true, Ordering::Relaxed) {
+                let _ = show_tray_notification(
+                    window,
+                    "Backup started",
+                    "resticpal is now protecting this PC.",
+                );
+            }
+        }
+        BackupState::Succeeded if observed_running || attempt_changed => {
+            finish_backup_status_monitor(
+                window,
+                "Backup complete",
+                "The latest backup finished successfully.",
+            );
+        }
+        BackupState::SucceededWithWarnings if observed_running || attempt_changed => {
+            finish_backup_status_monitor(
+                window,
+                "Backup completed with warnings",
+                "The backup finished, but some files need attention. Open resticpal for details.",
+            );
+        }
+        BackupState::Failed { .. } if observed_running || attempt_changed => {
+            finish_backup_status_monitor(
+                window,
+                "Backup needs attention",
+                "The backup did not complete. Open resticpal diagnostics for details.",
+            );
+        }
+        BackupState::Cancelled if observed_running || attempt_changed => {
+            finish_backup_status_monitor(
+                window,
+                "Backup cancelled",
+                "The active backup was cancelled.",
+            );
+        }
+        _ => {}
+    }
+}
+
+fn finish_backup_status_monitor(window: HWND, title: &str, message: &str) {
+    // SAFETY: this removes only the backup status timer owned by this window.
+    let _ = unsafe { KillTimer(Some(window), BACKUP_STATUS_TIMER_ID) };
+    let _ = show_tray_notification(window, title, message);
 }
 
 fn send_request(command: RequestCommand) -> std::result::Result<Response, NamedPipeError> {
@@ -982,10 +1140,6 @@ fn remove_tray_icon(window: HWND) {
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &raw const data);
     }
-}
-
-fn show_information(window: HWND, message: &str) {
-    show_message(window, message, MB_OK | MB_ICONINFORMATION);
 }
 
 fn show_error(window: HWND, message: &str) {

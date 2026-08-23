@@ -16,6 +16,12 @@ public sealed partial class MainWindow
     private bool _repositoryBusy;
     private bool _applyingRepositoryConfiguration;
     private bool _repositoryDirty;
+    private string _loadedRepositoryDisplayName = string.Empty;
+    private string _loadedRepositoryUrl = string.Empty;
+    private string _loadedRepositoryMode = "standard";
+    private string _loadedRepositoryOptions = string.Empty;
+    private RepositoryOperationStatus _loadedRepositoryOperation =
+        new("not_run", null, null, null);
     private IReadOnlySet<string> _configuredRepositorySecrets = new HashSet<string>();
 
     private async void SaveRepositoryButton_Click(object sender, RoutedEventArgs e)
@@ -52,14 +58,21 @@ public sealed partial class MainWindow
                 }
             }
 
-            string? mode = _repositoryModeLocked
-                ? null
-                : (RepositoryModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "standard";
+            string selectedMode = SelectedRepositoryMode();
             CommandResult result = await _service.UpdateRepositoryAsync(
-                _repositoryDisplayNameLocked ? null : RepositoryDisplayNameBox.Text,
-                _repositoryUrlLocked ? null : RepositoryUrlBox.Text,
-                mode,
-                _repositoryOptionsLocked ? null : options,
+                !_repositoryDisplayNameLocked
+                    && RepositoryDisplayNameBox.Text != _loadedRepositoryDisplayName
+                        ? RepositoryDisplayNameBox.Text
+                        : null,
+                !_repositoryUrlLocked && RepositoryUrlBox.Text != _loadedRepositoryUrl
+                    ? RepositoryUrlBox.Text
+                    : null,
+                !_repositoryModeLocked && selectedMode != _loadedRepositoryMode
+                    ? selectedMode
+                    : null,
+                !_repositoryOptionsLocked && RepositoryOptionsBox.Text != _loadedRepositoryOptions
+                    ? options
+                    : null,
                 secretUpdates);
             ShowMessage(
                 result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning,
@@ -94,43 +107,62 @@ public sealed partial class MainWindow
         object sender,
         SelectionChangedEventArgs e)
     {
-        MarkRepositoryDirty();
-        if (CreateRepositoryButton is not null)
-        {
-            CreateRepositoryButton.IsEnabled =
-                !_repositoryBusy && !_repositoryDirty && SelectedRepositoryMode() == "standard";
-        }
+        UpdateRepositoryDirtyState();
     }
 
     private void RepositoryField_Changed(object sender, RoutedEventArgs e)
     {
-        MarkRepositoryDirty();
+        UpdateRepositoryDirtyState();
     }
 
-    private void MarkRepositoryDirty()
+    private void UpdateRepositoryDirtyState()
     {
-        if (_applyingRepositoryConfiguration)
+        if (_applyingRepositoryConfiguration
+            || RepositoryDisplayNameBox is null
+            || RepositoryUrlBox is null
+            || RepositoryModeBox is null
+            || RepositoryOptionsBox is null
+            || RepositoryOperationMessage is null)
         {
             return;
         }
 
-        _repositoryDirty = true;
-        if (!_repositoryBusy && RepositoryOperationMessage is not null)
+        bool credentialsChanged = !_repositorySecretsLocked && (
+            !string.IsNullOrEmpty(ResticPasswordBox.Password)
+            || !string.IsNullOrEmpty(AwsAccessKeyBox.Password)
+            || !string.IsNullOrEmpty(AwsSecretKeyBox.Password)
+            || !string.IsNullOrEmpty(AwsSessionTokenBox.Password)
+            || !string.IsNullOrEmpty(AzureAccountKeyBox.Password)
+            || !string.IsNullOrEmpty(B2AccountKeyBox.Password)
+            || !string.IsNullOrEmpty(GoogleCredentialsBox.Text)
+            || !string.IsNullOrEmpty(RcloneConfigPasswordBox.Password)
+            || RemoveStoredCredentialsCheckBox.IsChecked == true);
+        _repositoryDirty =
+            !_repositoryDisplayNameLocked
+                && RepositoryDisplayNameBox.Text != _loadedRepositoryDisplayName
+            || !_repositoryUrlLocked && RepositoryUrlBox.Text != _loadedRepositoryUrl
+            || !_repositoryModeLocked && SelectedRepositoryMode() != _loadedRepositoryMode
+            || !_repositoryOptionsLocked && RepositoryOptionsBox.Text != _loadedRepositoryOptions
+            || credentialsChanged;
+
+        if (_repositoryBusy)
+        {
+            return;
+        }
+
+        if (_repositoryDirty)
         {
             RepositoryOperationMessage.Title = "Save changes first";
             RepositoryOperationMessage.Message =
                 "Connection tests and repository creation use the service's saved settings.";
             RepositoryOperationMessage.Severity = InfoBarSeverity.Warning;
             RepositoryOperationMessage.IsOpen = true;
-            if (ValidateRepositoryButton is not null)
-            {
-                ValidateRepositoryButton.IsEnabled = false;
-            }
-            if (CreateRepositoryButton is not null)
-            {
-                CreateRepositoryButton.IsEnabled = false;
-            }
         }
+        else
+        {
+            ShowRepositoryOperationStatus(_loadedRepositoryOperation);
+        }
+        SetRepositoryBusy(false);
     }
 
     private async void ValidateRepositoryButton_Click(object sender, RoutedEventArgs e)
@@ -205,11 +237,12 @@ public sealed partial class MainWindow
                 RepositoryUrlBox.Text = configuration.Url ?? string.Empty;
                 RepositoryKindBox.SelectedIndex = RepositoryKindIndex(configuration.Url);
                 RepositoryModeBox.SelectedIndex = configuration.Mode == "append_only" ? 1 : 0;
-                RepositoryOptionsBox.Text = string.Join(
+                string optionsText = string.Join(
                     Environment.NewLine,
                     configuration.Options
                         .OrderBy(option => option.Key, StringComparer.Ordinal)
                         .Select(option => $"{option.Key}={option.Value}"));
+                RepositoryOptionsBox.Text = optionsText;
                 _repositoryDisplayNameLocked = configuration.DisplayNameLocked;
                 _repositoryUrlLocked = configuration.UrlLocked;
                 _repositoryModeLocked = configuration.ModeLocked;
@@ -217,6 +250,11 @@ public sealed partial class MainWindow
                 _repositorySecretsLocked = configuration.SecretsLocked;
                 _configuredRepositorySecrets = configuration.ConfiguredSecrets;
                 ClearRepositoryCredentialInputs();
+                _loadedRepositoryDisplayName = RepositoryDisplayNameBox.Text;
+                _loadedRepositoryUrl = RepositoryUrlBox.Text;
+                _loadedRepositoryMode = SelectedRepositoryMode();
+                _loadedRepositoryOptions = optionsText;
+                _loadedRepositoryOperation = configuration.OperationStatus;
                 _applyingRepositoryConfiguration = false;
                 _repositoryDirty = false;
 
@@ -232,9 +270,16 @@ public sealed partial class MainWindow
                 RepositoryPolicyMessage.Message = lockedFields == 5
                     ? "Repository settings and credentials are managed by your organization."
                     : $"{lockedFields} repository field{(lockedFields == 1 ? " is" : "s are")} managed by your organization.";
-                RepositoryCredentialStatus.Text = configuration.ConfiguredSecrets.Count == 0
-                    ? "No stored credentials. Enter only the values this repository requires."
-                    : $"Stored securely: {string.Join(", ", configuration.ConfiguredSecrets.Order())}. Leave fields blank to keep them.";
+                RepositoryCredentialInputs.Visibility = _repositorySecretsLocked
+                    ? Visibility.Collapsed
+                    : Visibility.Visible;
+                RepositoryCredentialStatus.Text = _repositorySecretsLocked
+                    ? configuration.ConfiguredSecrets.Count == 0
+                        ? "Managed by your backup service. No repository credentials were supplied for this repository."
+                        : $"Managed and stored securely: {string.Join(", ", configuration.ConfiguredSecrets.Order())}. Secret values are never displayed."
+                    : configuration.ConfiguredSecrets.Count == 0
+                        ? "No stored credentials. Enter only the values this repository requires."
+                        : $"Stored securely: {string.Join(", ", configuration.ConfiguredSecrets.Order())}. Leave fields blank to keep them.";
                 ShowRepositoryOperationStatus(configuration.OperationStatus);
                 _repositoryLoaded = true;
             }
@@ -266,12 +311,7 @@ public sealed partial class MainWindow
         RcloneConfigPasswordBox.IsEnabled = credentialsEnabled;
         RemoveStoredCredentialsCheckBox.IsEnabled =
             credentialsEnabled && _configuredRepositorySecrets.Count > 0;
-        SaveRepositoryButton.IsEnabled = !busy && !(
-            _repositoryDisplayNameLocked
-            && _repositoryUrlLocked
-            && _repositoryModeLocked
-            && _repositoryOptionsLocked
-            && _repositorySecretsLocked);
+        SaveRepositoryButton.IsEnabled = !busy && _repositoryDirty;
         ValidateRepositoryButton.IsEnabled = !busy && !_repositoryDirty;
         CreateRepositoryButton.IsEnabled =
             !busy && !_repositoryDirty && SelectedRepositoryMode() == "standard";

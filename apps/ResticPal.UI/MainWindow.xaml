@@ -288,45 +288,47 @@
                                         Text="No stored credentials"
                                         TextWrapping="Wrap" />
                                 </StackPanel>
-                                <PasswordBox
-                                    x:Name="ResticPasswordBox"
-                                    Header="Repository password (RESTIC_PASSWORD)"
-                                    PasswordChanged="RepositoryField_Changed"
-                                    PasswordRevealMode="Peek" />
-                                <Grid ColumnSpacing="16">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
+                                <StackPanel x:Name="RepositoryCredentialInputs" Spacing="14">
                                     <PasswordBox
-                                        x:Name="AwsAccessKeyBox"
-                                        Header="AWS access key ID"
+                                        x:Name="ResticPasswordBox"
+                                        Header="Repository password (RESTIC_PASSWORD)"
                                         PasswordChanged="RepositoryField_Changed"
                                         PasswordRevealMode="Peek" />
+                                    <Grid ColumnSpacing="16">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <PasswordBox
+                                            x:Name="AwsAccessKeyBox"
+                                            Header="AWS access key ID"
+                                            PasswordChanged="RepositoryField_Changed"
+                                            PasswordRevealMode="Peek" />
+                                        <PasswordBox
+                                            x:Name="AwsSecretKeyBox"
+                                            Grid.Column="1"
+                                            Header="AWS secret access key"
+                                            PasswordChanged="RepositoryField_Changed"
+                                            PasswordRevealMode="Peek" />
+                                    </Grid>
                                     <PasswordBox
-                                        x:Name="AwsSecretKeyBox"
-                                        Grid.Column="1"
-                                        Header="AWS secret access key"
+                                        x:Name="AwsSessionTokenBox"
+                                        Header="AWS session token (optional)"
                                         PasswordChanged="RepositoryField_Changed"
                                         PasswordRevealMode="Peek" />
-                                </Grid>
-                                <PasswordBox
-                                    x:Name="AwsSessionTokenBox"
-                                    Header="AWS session token (optional)"
-                                    PasswordChanged="RepositoryField_Changed"
-                                    PasswordRevealMode="Peek" />
-                                <Expander Header="Other backend credentials">
-                                    <StackPanel Padding="0,12,0,0" Spacing="12">
-                                        <PasswordBox x:Name="AzureAccountKeyBox" Header="Azure account key" PasswordChanged="RepositoryField_Changed" PasswordRevealMode="Peek" />
-                                        <PasswordBox x:Name="B2AccountKeyBox" Header="Backblaze B2 account key" PasswordChanged="RepositoryField_Changed" PasswordRevealMode="Peek" />
-                                        <TextBox x:Name="GoogleCredentialsBox" Header="Google application credentials path" IsSpellCheckEnabled="False" TextChanged="RepositoryField_Changed" />
-                                        <PasswordBox x:Name="RcloneConfigPasswordBox" Header="rclone configuration password" PasswordChanged="RepositoryField_Changed" PasswordRevealMode="Peek" />
-                                    </StackPanel>
-                                </Expander>
-                                <CheckBox
-                                    x:Name="RemoveStoredCredentialsCheckBox"
-                                    Checked="RepositoryField_Changed"
-                                    Content="Remove all currently stored repository credentials when saving" />
+                                    <Expander Header="Other backend credentials">
+                                        <StackPanel Padding="0,12,0,0" Spacing="12">
+                                            <PasswordBox x:Name="AzureAccountKeyBox" Header="Azure account key" PasswordChanged="RepositoryField_Changed" PasswordRevealMode="Peek" />
+                                            <PasswordBox x:Name="B2AccountKeyBox" Header="Backblaze B2 account key" PasswordChanged="RepositoryField_Changed" PasswordRevealMode="Peek" />
+                                            <TextBox x:Name="GoogleCredentialsBox" Header="Google application credentials path" IsSpellCheckEnabled="False" TextChanged="RepositoryField_Changed" />
+                                            <PasswordBox x:Name="RcloneConfigPasswordBox" Header="rclone configuration password" PasswordChanged="RepositoryField_Changed" PasswordRevealMode="Peek" />
+                                        </StackPanel>
+                                    </Expander>
+                                    <CheckBox
+                                        x:Name="RemoveStoredCredentialsCheckBox"
+                                        Checked="RepositoryField_Changed"
+                                        Content="Remove all currently stored repository credentials when saving" />
+                                </StackPanel>
                             </StackPanel>
                         </Border>
 

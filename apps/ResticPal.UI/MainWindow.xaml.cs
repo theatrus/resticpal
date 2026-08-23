@@ -16,6 +16,12 @@ public sealed partial class MainWindow : Window
     private readonly bool _showOnboarding;
     private readonly bool _showUpdates;
     private readonly HashSet<string> _activeOperations = new(StringComparer.Ordinal);
+    private readonly DispatcherTimer _statusRefreshTimer = new();
+    private bool _statusRefreshInProgress;
+    private bool _manualBackupPending;
+    private DateTimeOffset? _manualBackupRequestedAt;
+    private DateTimeOffset? _manualBackupBaselineAttempt;
+    private ServiceSnapshot? _lastServiceSnapshot;
 
     public MainWindow(bool showOnboarding = false, bool showUpdates = false)
     {
@@ -23,7 +29,13 @@ public sealed partial class MainWindow : Window
         _showUpdates = showUpdates;
         InitializeComponent();
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "resticpal.ico"));
-        Closed += (_, _) => _updates.Dispose();
+        _statusRefreshTimer.Interval = TimeSpan.FromSeconds(15);
+        _statusRefreshTimer.Tick += StatusRefreshTimer_Tick;
+        Closed += (_, _) =>
+        {
+            _statusRefreshTimer.Stop();
+            _updates.Dispose();
+        };
         UpdateStatusDescription.Text =
             $"resticpal {ResticPalUpdateService.InstalledVersion} uses a strictly signed update feed.";
     }
@@ -31,6 +43,7 @@ public sealed partial class MainWindow : Window
     private async void NavigationView_Loaded(object sender, RoutedEventArgs e)
     {
         ServiceSnapshot? status = await RefreshStatusAsync();
+        _statusRefreshTimer.Start();
         if (_showOnboarding || status?.State == "unconfigured")
         {
             ShowOnboarding();
@@ -64,7 +77,11 @@ public sealed partial class MainWindow : Window
         DiagnosticsPanel.Visibility = tag == "diagnostics" ? Visibility.Visible : Visibility.Collapsed;
         ManagementPanel.Visibility = tag == "settings" ? Visibility.Visible : Visibility.Collapsed;
 
-        if (tag == "sources" && !_sourcesLoaded)
+        if (tag == "overview")
+        {
+            await RefreshStatusAsync();
+        }
+        else if (tag == "sources" && !_sourcesLoaded)
         {
             await LoadBackupSourcesAsync();
         }
@@ -99,10 +116,25 @@ public sealed partial class MainWindow : Window
         RunBackupButton.IsEnabled = false;
         try
         {
+            DateTimeOffset? baselineAttempt = _lastServiceSnapshot?.LastAttempt;
             CommandResult result = await _service.RunBackupNowAsync();
             MessageBar.Severity = result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning;
             MessageBar.Message = result.Message;
             MessageBar.IsOpen = true;
+            if (result.Accepted)
+            {
+                _manualBackupPending = true;
+                _manualBackupRequestedAt = DateTimeOffset.UtcNow;
+                _manualBackupBaselineAttempt = baselineAttempt;
+                ApplyStatus(
+                    "Backup requested",
+                    "The service accepted the request and is preparing to start the backup.",
+                    canRunBackup: false,
+                    canCancelBackup: false);
+                UpdateStatusRefreshCadence();
+                _statusRefreshTimer.Start();
+                await Task.Delay(TimeSpan.FromMilliseconds(250));
+            }
         }
         catch (Exception exception)
         {
@@ -162,6 +194,42 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// Invalidates every view backed by effective configuration and eagerly
+    /// reloads the ones the administrator has already visited. Enrollment and
+    /// unenrollment can replace several independently locked fields at once;
+    /// keeping the old page caches would expose stale values and edit controls.
+    /// </summary>
+    private async Task SynchronizeConfigurationPagesAsync()
+    {
+        bool reloadSources = _sourcesLoaded;
+        bool reloadRepository = _repositoryLoaded;
+        bool reloadSchedule = _scheduleLoaded;
+        bool reloadRetention = _retentionLoaded;
+
+        _sourcesLoaded = false;
+        _repositoryLoaded = false;
+        _scheduleLoaded = false;
+        _retentionLoaded = false;
+
+        if (reloadSources)
+        {
+            await LoadBackupSourcesAsync();
+        }
+        if (reloadRepository)
+        {
+            await LoadRepositoryAsync();
+        }
+        if (reloadSchedule)
+        {
+            await LoadScheduleAsync();
+        }
+        if (reloadRetention)
+        {
+            await LoadRetentionAsync();
+        }
+    }
+
     private bool TryReadDurationSeconds(
         NumberBox box,
         string fieldName,
@@ -210,12 +278,38 @@ public sealed partial class MainWindow : Window
         try
         {
             ServiceSnapshot status = await _service.GetStatusAsync();
-            StatusTitle.Text = status.Headline;
-            StatusDescription.Text = status.Description;
-            StatusCardTitle.Text = status.Headline;
-            StatusCardDescription.Text = status.Description;
-            RunBackupButton.IsEnabled = status.CanRunBackup;
-            CancelBackupButton.IsEnabled = status.CanCancelBackup;
+            _lastServiceSnapshot = status;
+            bool attemptChanged = status.LastAttempt is not null
+                && status.LastAttempt != _manualBackupBaselineAttempt;
+            bool stalePreRequestStatus = _manualBackupPending
+                && !attemptChanged
+                && status.State is not ("running" or "waiting");
+            if (stalePreRequestStatus)
+            {
+                ApplyStatus(
+                    "Backup requested",
+                    "The service accepted the request and is preparing to start the backup.",
+                    canRunBackup: false,
+                    canCancelBackup: false);
+            }
+            else
+            {
+                ApplyStatus(
+                    status.Headline,
+                    status.Description,
+                    status.CanRunBackup,
+                    status.CanCancelBackup);
+            }
+
+            if (_manualBackupPending
+                && attemptChanged
+                && status.State is not ("running" or "waiting"))
+            {
+                _manualBackupPending = false;
+                _manualBackupRequestedAt = null;
+                _historyLoaded = false;
+            }
+            UpdateStatusRefreshCadence();
             return status;
         }
         catch (Exception exception)
@@ -231,12 +325,59 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async void StatusRefreshTimer_Tick(object? sender, object e)
+    {
+        if (_statusRefreshInProgress)
+        {
+            return;
+        }
+
+        _statusRefreshInProgress = true;
+        try
+        {
+            await RefreshStatusAsync();
+        }
+        finally
+        {
+            _statusRefreshInProgress = false;
+        }
+    }
+
+    private void UpdateStatusRefreshCadence()
+    {
+        _statusRefreshTimer.Interval = _lastServiceSnapshot?.State == "running"
+            ? TimeSpan.FromSeconds(1)
+            : _manualBackupPending
+                && _manualBackupRequestedAt is DateTimeOffset requestedAt
+                && DateTimeOffset.UtcNow - requestedAt < TimeSpan.FromSeconds(15)
+                    ? TimeSpan.FromMilliseconds(500)
+                    : _manualBackupPending
+                        ? TimeSpan.FromSeconds(5)
+                        : TimeSpan.FromSeconds(15);
+    }
+
+    private void ApplyStatus(
+        string headline,
+        string description,
+        bool canRunBackup,
+        bool canCancelBackup)
+    {
+        StatusTitle.Text = headline;
+        StatusDescription.Text = description;
+        StatusCardTitle.Text = headline;
+        StatusCardDescription.Text = description;
+        RunBackupButton.IsEnabled = canRunBackup;
+        CancelBackupButton.IsEnabled = canCancelBackup;
+    }
+
     private void ShowConnectionError(Exception exception)
     {
         MessageBar.Severity = InfoBarSeverity.Error;
         MessageBar.Message = exception is OperationCanceledException
             ? "The backup service did not respond in time."
-            : exception.Message;
+            : string.IsNullOrWhiteSpace(exception.Message)
+                ? $"The operation failed unexpectedly (0x{exception.HResult:X8})."
+                : exception.Message;
         MessageBar.IsOpen = true;
     }
 

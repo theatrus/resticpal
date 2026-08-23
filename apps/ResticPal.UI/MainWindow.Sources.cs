@@ -1,9 +1,8 @@
 using System.Collections.ObjectModel;
+using Microsoft.Windows.Storage.Pickers;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using ResticPal.UI.Services;
-using Windows.Storage;
-using Windows.Storage.Pickers;
 
 namespace ResticPal.UI;
 
@@ -47,11 +46,12 @@ public sealed partial class MainWindow
     {
         await RunGuardedAsync("sources-add", async () =>
         {
-            var picker = new FolderPicker();
-            picker.FileTypeFilter.Add("*");
-            nint windowHandle = WinRT.Interop.WindowNative.GetWindowHandle(this);
-            WinRT.Interop.InitializeWithWindow.Initialize(picker, windowHandle);
-            StorageFolder? folder = await picker.PickSingleFolderAsync();
+            var picker = new FolderPicker(AppWindow.Id)
+            {
+                CommitButtonText = "Add folder",
+                Title = "Choose a folder to back up",
+            };
+            PickFolderResult? folder = await picker.PickSingleFolderAsync();
             if (folder is null
                 || BackupPaths.Any(path =>
                     string.Equals(path, folder.Path, StringComparison.OrdinalIgnoreCase)))

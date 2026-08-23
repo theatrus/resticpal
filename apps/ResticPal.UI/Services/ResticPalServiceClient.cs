@@ -28,6 +28,10 @@ internal sealed class ResticPalServiceClient
             : null;
         string repositoryMode = status.GetProperty("repository_mode").GetString() ?? "standard";
         string? repositoryName = status.GetProperty("repository_display_name").GetString();
+        DateTimeOffset? lastAttempt = status.TryGetProperty("last_attempt", out JsonElement lastAttemptElement)
+            && lastAttemptElement.ValueKind == JsonValueKind.String
+                ? lastAttemptElement.GetDateTimeOffset()
+                : null;
 
         (string headline, string description, bool canRun, bool canCancel) = stateName switch
         {
@@ -50,6 +54,31 @@ internal sealed class ResticPalServiceClient
                 "Update starting",
                 "Backups are held briefly while a resticpal update starts.",
                 false,
+                false),
+            "waiting" when waitingReason == "battery" => (
+                "Backup waiting for AC power",
+                "Backups on battery are disabled by the current schedule policy.",
+                true,
+                false),
+            "waiting" when waitingReason == "network" => (
+                "Backup waiting for network",
+                "The repository requires a network connection. The request remains queued.",
+                true,
+                false),
+            "waiting" when waitingReason == "metered_network" => (
+                "Backup waiting for an unmetered network",
+                "Backups over metered connections are disabled by the current schedule policy.",
+                true,
+                false),
+            "waiting" when waitingReason == "wake_grace" => (
+                "Backup waiting after wake",
+                "The configured wake grace period is still active. The request remains queued.",
+                true,
+                false),
+            "waiting" when waitingReason == "policy_backoff" => (
+                "Backup retry scheduled",
+                "The service will retry after its failure backoff period.",
+                true,
                 false),
             "waiting" => (
                 "Backup waiting",
@@ -84,7 +113,13 @@ internal sealed class ResticPalServiceClient
             _ => ("Unknown service state", stateName, false, false),
         };
 
-        return new ServiceSnapshot(stateName, headline, description, canRun, canCancel);
+        return new ServiceSnapshot(
+            stateName,
+            headline,
+            description,
+            canRun,
+            canCancel,
+            lastAttempt);
     }
 
     public async Task<ManagementConfiguration> GetManagementAsync(
@@ -607,7 +642,8 @@ internal sealed record ServiceSnapshot(
     string Headline,
     string Description,
     bool CanRunBackup,
-    bool CanCancelBackup);
+    bool CanCancelBackup,
+    DateTimeOffset? LastAttempt);
 
 internal sealed record CommandResult(bool Accepted, string Message);
 
