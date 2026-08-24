@@ -5,7 +5,7 @@ param(
     [string] $Version,
     [string] $OutputDirectory,
     [ValidateSet('GitHub', 'UpdatesHost')]
-    [string] $PackageHost = 'GitHub',
+    [string] $PackageHost = 'UpdatesHost',
     [string] $KeyPath = (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Dropbox\resticpal\keys\updates')
 )
 
@@ -31,6 +31,42 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
 $expectedMsiName = "resticpal-$Version-x64.msi"
 if ([IO.Path]::GetFileName($resolvedMsiPath) -cne $expectedMsiName) {
     throw "Expected MSI name $expectedMsiName, got $([IO.Path]::GetFileName($resolvedMsiPath))."
+}
+$installer = New-Object -ComObject WindowsInstaller.Installer
+$database = $null
+$view = $null
+$record = $null
+try {
+    $database = $installer.GetType().InvokeMember(
+        'OpenDatabase', 'InvokeMethod', $null, $installer, @($resolvedMsiPath, 0))
+    $view = $database.GetType().InvokeMember(
+        'OpenView',
+        'InvokeMethod',
+        $null,
+        $database,
+        @("SELECT `Value` FROM `Property` WHERE `Property`='ProductVersion'"))
+    $view.GetType().InvokeMember(
+        'Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+    $record = $view.GetType().InvokeMember(
+        'Fetch', 'InvokeMethod', $null, $view, $null)
+    if ($null -eq $record) {
+        throw 'The release MSI has no ProductVersion property.'
+    }
+    $msiProductVersion = $record.GetType().InvokeMember(
+        'StringData', 'GetProperty', $null, $record, @(1))
+    if ($msiProductVersion -cne $Version) {
+        throw "The release MSI ProductVersion is $msiProductVersion, not $Version."
+    }
+} finally {
+    if ($null -ne $view) {
+        $view.GetType().InvokeMember(
+            'Close', 'InvokeMethod', $null, $view, $null) | Out-Null
+    }
+    foreach ($comObject in @($record, $view, $database, $installer)) {
+        if ($null -ne $comObject) {
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($comObject) | Out-Null
+        }
+    }
 }
 $tag = "v$Version"
 $releaseBaseUrl = if ($PackageHost -eq 'UpdatesHost') {

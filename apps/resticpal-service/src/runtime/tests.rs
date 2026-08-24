@@ -604,6 +604,39 @@ fn battery_policy_blocks_until_power_conditions_change() {
 }
 
 #[test]
+fn manual_backup_runs_on_battery_when_unattended_backups_are_disallowed() {
+    let (runtime, events) = runtime(true);
+    runtime.config_write().schedule.allow_on_battery = false;
+    let now = Utc::now();
+    let on_battery = SystemConditions {
+        on_battery: true,
+        ..available_conditions()
+    };
+
+    // The same power state blocks the overdue unattended run.
+    assert_eq!(
+        runtime.evaluate_schedule(now, on_battery),
+        ScheduleAction::None
+    );
+    assert!(matches!(
+        runtime.status().state,
+        BackupState::Waiting {
+            reason: resticpal_core::status::WaitingReason::Battery
+        }
+    ));
+
+    let response = runtime.handle_request(Request::new(63, RequestCommand::RunBackupNow), USER);
+    assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+    assert_eq!(events.recv().expect("runtime event"), RuntimeEvent::RunNow);
+    assert_eq!(
+        runtime.evaluate_schedule(now, on_battery),
+        ScheduleAction::Start {
+            trigger: BackupTrigger::Manual
+        }
+    );
+}
+
+#[test]
 fn failed_backups_use_bounded_exponential_retry_delays() {
     let (runtime, _events) = runtime(true);
     let now = Utc::now();

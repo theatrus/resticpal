@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using ResticPal.UI.Services;
@@ -11,15 +12,24 @@ namespace ResticPal.UI;
 /// </summary>
 public sealed partial class MainWindow : Window
 {
+    private const string ConfigurationRefreshDeferredMessage =
+        "Managed settings changed, but resticpal kept your unsaved configuration and credential inputs. Save them, or discard them to refresh the managed values.";
     private readonly ResticPalServiceClient _service = new();
     private readonly ResticPalUpdateService _updates = new();
+    private readonly ManagedConfigurationSynchronization _managedConfigurationSynchronization =
+        new();
+    private readonly ConfigurationPageSynchronizationPlan _configurationSynchronizationPlan =
+        new();
+    private readonly ConfigurationEditGate _configurationEditGate = new();
     private readonly bool _showOnboarding;
     private readonly bool _showUpdates;
     private readonly HashSet<string> _activeOperations = new(StringComparer.Ordinal);
     private readonly DispatcherTimer _statusRefreshTimer = new();
     private bool _statusRefreshInProgress;
+    private bool _discardConfigurationEditsRequested;
+    private bool _configurationRefreshDeferredForEdits;
     private bool _manualBackupPending;
-    private DateTimeOffset? _manualBackupRequestedAt;
+    private long? _manualBackupRequestedTimestamp;
     private DateTimeOffset? _manualBackupBaselineAttempt;
     private ServiceSnapshot? _lastServiceSnapshot;
 
@@ -28,6 +38,8 @@ public sealed partial class MainWindow : Window
         _showOnboarding = showOnboarding;
         _showUpdates = showUpdates;
         InitializeComponent();
+        BackupPaths.CollectionChanged += (_, _) => RefreshSourcesControlState();
+        RefreshConfigurationControlStates();
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "resticpal.ico"));
         _statusRefreshTimer.Interval = TimeSpan.FromSeconds(15);
         _statusRefreshTimer.Tick += StatusRefreshTimer_Tick;
@@ -118,13 +130,13 @@ public sealed partial class MainWindow : Window
         {
             DateTimeOffset? baselineAttempt = _lastServiceSnapshot?.LastAttempt;
             CommandResult result = await _service.RunBackupNowAsync();
-            MessageBar.Severity = result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning;
-            MessageBar.Message = result.Message;
-            MessageBar.IsOpen = true;
+            ShowMessage(
+                result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning,
+                result.Message);
             if (result.Accepted)
             {
                 _manualBackupPending = true;
-                _manualBackupRequestedAt = DateTimeOffset.UtcNow;
+                _manualBackupRequestedTimestamp = Stopwatch.GetTimestamp();
                 _manualBackupBaselineAttempt = baselineAttempt;
                 ApplyStatus(
                     "Backup requested",
@@ -133,7 +145,13 @@ public sealed partial class MainWindow : Window
                     canCancelBackup: false);
                 UpdateStatusRefreshCadence();
                 _statusRefreshTimer.Start();
-                await Task.Delay(TimeSpan.FromMilliseconds(250));
+                TimeSpan remainingDisplay;
+                while ((remainingDisplay =
+                        ManualBackupStatusTransition.RemainingMinimumDisplay(
+                            ManualBackupRequestElapsed())) > TimeSpan.Zero)
+                {
+                    await Task.Delay(remainingDisplay);
+                }
             }
         }
         catch (Exception exception)
@@ -152,9 +170,9 @@ public sealed partial class MainWindow : Window
         try
         {
             CommandResult result = await _service.CancelBackupAsync();
-            MessageBar.Severity = result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning;
-            MessageBar.Message = result.Message;
-            MessageBar.IsOpen = true;
+            ShowMessage(
+                result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning,
+                result.Message);
         }
         catch (Exception exception)
         {
@@ -189,44 +207,253 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            setBusy?.Invoke(false);
             _activeOperations.Remove(operation);
+            setBusy?.Invoke(false);
         }
     }
 
     /// <summary>
     /// Invalidates every view backed by effective configuration and eagerly
-    /// reloads the ones the administrator has already visited. Enrollment and
-    /// unenrollment can replace several independently locked fields at once;
-    /// keeping the old page caches would expose stale values and edit controls.
+    /// reloads the ones the administrator has already visited. Enrollment,
+    /// unenrollment, and background policy revisions can replace several
+    /// independently locked fields at once; keeping old page caches would
+    /// expose stale values and edit controls.
     /// </summary>
-    private async Task SynchronizeConfigurationPagesAsync()
+    private async Task<bool> SynchronizeConfigurationPagesCoreAsync(
+        string? targetRevision,
+        bool forceSynchronization)
     {
-        bool reloadSources = _sourcesLoaded;
-        bool reloadRepository = _repositoryLoaded;
-        bool reloadSchedule = _scheduleLoaded;
-        bool reloadRetention = _retentionLoaded;
+        ConfigurationPageKind eligiblePages = EligibleConfigurationPages();
+        _configurationSynchronizationPlan.Begin(
+            targetRevision,
+            forceSynchronization,
+            eligiblePages);
 
-        _sourcesLoaded = false;
-        _repositoryLoaded = false;
-        _scheduleLoaded = false;
-        _retentionLoaded = false;
+        // A save may have loaded the pending page before its final status
+        // refresh. In that case there is nothing left to race, even though the
+        // save operation remains active until RunGuardedAsync unwinds.
+        if (!_configurationSynchronizationPlan.HasPending)
+        {
+            ClearConfigurationRefreshDeferred();
+            return true;
+        }
 
-        if (reloadSources)
+        // A load/save already in flight may have captured the previous policy.
+        // Let it finish and retry on the next status poll. The plan retains
+        // already refreshed pages, so a busy or dirty page never causes clean
+        // siblings to be fetched repeatedly.
+        if (ConfigurationPageOperationActive())
         {
-            await LoadBackupSourcesAsync();
+            return false;
         }
-        if (reloadRepository)
+
+        bool discardEdits = _discardConfigurationEditsRequested;
+        bool reloadAnyPage = PendingConfigurationPagesThatCanReload(discardEdits)
+            != ConfigurationPageKind.None;
+        if (reloadAnyPage)
         {
-            await LoadRepositoryAsync();
+            IDisposable reloadScope = _configurationEditGate.BeginReload();
+            RefreshConfigurationControlStates();
+            try
+            {
+                await ReloadPendingConfigurationPageAsync(
+                    ConfigurationPageKind.Sources,
+                    SourcesHaveUnsavedChanges(),
+                    discardEdits,
+                    async () =>
+                    {
+                        _sourcesLoaded = false;
+                        await LoadBackupSourcesAsync();
+                        return _sourcesLoaded;
+                    });
+                await ReloadPendingConfigurationPageAsync(
+                    ConfigurationPageKind.Repository,
+                    RepositoryHasUnsavedChanges(),
+                    discardEdits,
+                    async () =>
+                    {
+                        _repositoryLoaded = false;
+                        await LoadRepositoryAsync();
+                        return _repositoryLoaded;
+                    });
+                await ReloadPendingConfigurationPageAsync(
+                    ConfigurationPageKind.Schedule,
+                    ScheduleHasUnsavedChanges(),
+                    discardEdits,
+                    async () =>
+                    {
+                        _scheduleLoaded = false;
+                        await LoadScheduleAsync();
+                        return _scheduleLoaded;
+                    });
+                await ReloadPendingConfigurationPageAsync(
+                    ConfigurationPageKind.Retention,
+                    RetentionHasUnsavedChanges(),
+                    discardEdits,
+                    async () =>
+                    {
+                        _retentionLoaded = false;
+                        await LoadRetentionAsync();
+                        return _retentionLoaded;
+                    });
+            }
+            finally
+            {
+                reloadScope.Dispose();
+                // Each inner RunGuardedAsync finishes while the outer reload
+                // scope is active, so its Set*Busy(false) deliberately leaves
+                // controls disabled. Recompute after disposal to restore the
+                // baseline/lock-aware enabled state.
+                RefreshConfigurationControlStates();
+            }
         }
-        if (reloadSchedule)
+
+        ConfigurationPageEditState remainingEdits = CurrentConfigurationPageEdits();
+        if (_configurationSynchronizationPlan.HasPending
+            && remainingEdits.HasUnsavedChanges
+            && !discardEdits)
         {
-            await LoadScheduleAsync();
+            ShowConfigurationRefreshDeferred();
         }
-        if (reloadRetention)
+        else if (!_configurationSynchronizationPlan.HasPending)
         {
-            await LoadRetentionAsync();
+            ClearConfigurationRefreshDeferred();
+        }
+
+        return !_configurationSynchronizationPlan.HasPending;
+    }
+
+    private ConfigurationPageKind EligibleConfigurationPages()
+    {
+        ConfigurationPageKind pages = ConfigurationPageKind.None;
+        if (_loadedBackupSources is not null || SourcesPanel.Visibility == Visibility.Visible)
+        {
+            pages |= ConfigurationPageKind.Sources;
+        }
+        if (_repositoryConfigurationApplied
+            || RepositoryPanel.Visibility == Visibility.Visible)
+        {
+            pages |= ConfigurationPageKind.Repository;
+        }
+        if (_loadedScheduleConfiguration is not null
+            || SchedulePanel.Visibility == Visibility.Visible)
+        {
+            pages |= ConfigurationPageKind.Schedule;
+        }
+        if (_loadedRetentionConfiguration is not null
+            || RetentionPanel.Visibility == Visibility.Visible)
+        {
+            pages |= ConfigurationPageKind.Retention;
+        }
+        return pages;
+    }
+
+    private ConfigurationPageKind PendingConfigurationPagesThatCanReload(bool discardEdits)
+    {
+        ConfigurationPageKind pages = ConfigurationPageKind.None;
+        AddIfReloadable(
+            ConfigurationPageKind.Sources,
+            SourcesHaveUnsavedChanges());
+        AddIfReloadable(
+            ConfigurationPageKind.Repository,
+            RepositoryHasUnsavedChanges());
+        AddIfReloadable(
+            ConfigurationPageKind.Schedule,
+            ScheduleHasUnsavedChanges());
+        AddIfReloadable(
+            ConfigurationPageKind.Retention,
+            RetentionHasUnsavedChanges());
+        return pages;
+
+        void AddIfReloadable(ConfigurationPageKind page, bool hasUnsavedChanges)
+        {
+            if (_configurationSynchronizationPlan.Needs(page)
+                && (discardEdits || !hasUnsavedChanges))
+            {
+                pages |= page;
+            }
+        }
+    }
+
+    private async Task ReloadPendingConfigurationPageAsync(
+        ConfigurationPageKind page,
+        bool hasUnsavedChanges,
+        bool discardEdits,
+        Func<Task<bool>> reload)
+    {
+        if (!_configurationSynchronizationPlan.Needs(page)
+            || hasUnsavedChanges && !discardEdits)
+        {
+            return;
+        }
+
+        if (await reload())
+        {
+            _configurationSynchronizationPlan.Complete(page);
+        }
+    }
+
+    private bool ConfigurationPageOperationActive() =>
+        ConfigurationPageOperationActive("sources-")
+        || ConfigurationPageOperationActive("repository-")
+        || ConfigurationPageOperationActive("schedule-")
+        || ConfigurationPageOperationActive("retention-");
+
+    private bool ConfigurationPageOperationActive(string operationPrefix) =>
+        _activeOperations.Any(operation =>
+            operation.StartsWith(operationPrefix, StringComparison.Ordinal));
+
+    private ConfigurationPageEditState CurrentConfigurationPageEdits() => new(
+        SourcesHaveUnsavedChanges(),
+        RepositoryHasUnsavedChanges(),
+        ScheduleHasUnsavedChanges(),
+        RetentionHasUnsavedChanges());
+
+    private void ShowConfigurationRefreshDeferred()
+    {
+        if (_configurationRefreshDeferredForEdits)
+        {
+            return;
+        }
+
+        _configurationRefreshDeferredForEdits = true;
+        DiscardConfigurationEditsButton.IsEnabled = true;
+        ManagedRefreshInfoBar.Message = ConfigurationRefreshDeferredMessage;
+        ManagedRefreshInfoBar.IsOpen = true;
+    }
+
+    private void ClearConfigurationRefreshDeferred()
+    {
+        _configurationRefreshDeferredForEdits = false;
+        DiscardConfigurationEditsButton.IsEnabled = true;
+        ManagedRefreshInfoBar.IsOpen = false;
+    }
+
+    private void RefreshConfigurationControlStates()
+    {
+        NavigationRoot.IsEnabled = !_configurationEditGate.ReloadInProgress;
+        RefreshSourcesControlState();
+        SetRepositoryBusy(false);
+        SetScheduleBusy(false);
+        SetRetentionBusy(false);
+    }
+
+    private async void DiscardConfigurationEditsButton_Click(object sender, RoutedEventArgs e)
+    {
+        DiscardConfigurationEditsButton.IsEnabled = false;
+        _discardConfigurationEditsRequested = true;
+        IDisposable reloadScope = _configurationEditGate.BeginReload();
+        RefreshConfigurationControlStates();
+        try
+        {
+            await RefreshStatusAsync(synchronizeConfiguration: true);
+        }
+        finally
+        {
+            _discardConfigurationEditsRequested = false;
+            reloadScope.Dispose();
+            RefreshConfigurationControlStates();
+            DiscardConfigurationEditsButton.IsEnabled = true;
         }
     }
 
@@ -273,7 +500,8 @@ public sealed partial class MainWindow : Window
         return true;
     }
 
-    private async Task<ServiceSnapshot?> RefreshStatusAsync()
+    private async Task<ServiceSnapshot?> RefreshStatusAsync(
+        bool synchronizeConfiguration = false)
     {
         try
         {
@@ -281,10 +509,16 @@ public sealed partial class MainWindow : Window
             _lastServiceSnapshot = status;
             bool attemptChanged = status.LastAttempt is not null
                 && status.LastAttempt != _manualBackupBaselineAttempt;
-            bool stalePreRequestStatus = _manualBackupPending
-                && !attemptChanged
-                && status.State is not ("running" or "waiting");
-            if (stalePreRequestStatus)
+            ManualBackupStatusDecision transition = ManualBackupStatusTransition.Evaluate(
+                _manualBackupPending,
+                ManualBackupRequestElapsed(),
+                attemptChanged,
+                status.State);
+            if (transition.ClearPending)
+            {
+                ClearManualBackupPending();
+            }
+            if (transition.ShowRequested)
             {
                 ApplyStatus(
                     "Backup requested",
@@ -300,16 +534,16 @@ public sealed partial class MainWindow : Window
                     status.CanRunBackup,
                     status.CanCancelBackup);
             }
-
-            if (_manualBackupPending
-                && attemptChanged
-                && status.State is not ("running" or "waiting"))
-            {
-                _manualBackupPending = false;
-                _manualBackupRequestedAt = null;
-                _historyLoaded = false;
-            }
             UpdateStatusRefreshCadence();
+            bool configurationSynchronized =
+                await _managedConfigurationSynchronization.ObserveAsync(
+                    status.ManagedRevision,
+                    synchronizeConfiguration,
+                    SynchronizeConfigurationPagesCoreAsync);
+            if (configurationSynchronized && !_managedConfigurationSynchronization.Pending)
+            {
+                ClearConfigurationRefreshDeferred();
+            }
             return status;
         }
         catch (Exception exception)
@@ -348,12 +582,24 @@ public sealed partial class MainWindow : Window
         _statusRefreshTimer.Interval = _lastServiceSnapshot?.State == "running"
             ? TimeSpan.FromSeconds(1)
             : _manualBackupPending
-                && _manualBackupRequestedAt is DateTimeOffset requestedAt
-                && DateTimeOffset.UtcNow - requestedAt < TimeSpan.FromSeconds(15)
+                && ManualBackupRequestElapsed() < TimeSpan.FromSeconds(15)
                     ? TimeSpan.FromMilliseconds(500)
                     : _manualBackupPending
                         ? TimeSpan.FromSeconds(5)
                         : TimeSpan.FromSeconds(15);
+    }
+
+    private TimeSpan ManualBackupRequestElapsed() =>
+        _manualBackupRequestedTimestamp is long requestedTimestamp
+            ? Stopwatch.GetElapsedTime(requestedTimestamp)
+            : TimeSpan.Zero;
+
+    private void ClearManualBackupPending()
+    {
+        _manualBackupPending = false;
+        _manualBackupRequestedTimestamp = null;
+        _manualBackupBaselineAttempt = null;
+        _historyLoaded = false;
     }
 
     private void ApplyStatus(

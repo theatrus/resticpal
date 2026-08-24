@@ -69,6 +69,128 @@ public static class ResticPalNativeTest
     }
 }
 '@
+$automationReferences = @(
+    [Windows.Automation.AutomationElement].Assembly.Location
+    [Windows.Automation.TreeScope].Assembly.Location
+)
+Add-Type -ReferencedAssemblies $automationReferences -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Automation;
+
+public sealed class ResticPalAutomationNameObserver : IDisposable
+{
+    private readonly AutomationElement element;
+    private readonly string expectedText;
+    private readonly IntPtr observed;
+    private readonly AutomationPropertyChangedEventHandler handler;
+    private string observedNames = string.Empty;
+    private bool disposed;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateEvent(
+        IntPtr eventAttributes,
+        bool manualReset,
+        bool initialState,
+        string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetEvent(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public ResticPalAutomationNameObserver(AutomationElement element, string expectedText)
+    {
+        if (element == null)
+        {
+            throw new ArgumentNullException("element");
+        }
+        if (string.IsNullOrWhiteSpace(expectedText))
+        {
+            throw new ArgumentException("Expected text is required.", "expectedText");
+        }
+
+        this.element = element;
+        this.expectedText = expectedText;
+        observed = CreateEvent(IntPtr.Zero, true, false, null);
+        if (observed == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Could not create the UIAutomation observer event.");
+        }
+        handler = OnPropertyChanged;
+        try
+        {
+            Automation.AddAutomationPropertyChangedEventHandler(
+                element,
+                TreeScope.Element,
+                handler,
+                AutomationElement.NameProperty);
+            Record(element.Current.Name);
+        }
+        catch
+        {
+            CloseHandle(observed);
+            throw;
+        }
+    }
+
+    public bool Wait(int timeoutMilliseconds)
+    {
+        if (timeoutMilliseconds < 0)
+        {
+            throw new ArgumentOutOfRangeException("timeoutMilliseconds");
+        }
+        return WaitForSingleObject(observed, (uint)timeoutMilliseconds) == 0;
+    }
+
+    public string ObservedNames
+    {
+        get { return observedNames; }
+    }
+
+    private void OnPropertyChanged(object sender, AutomationPropertyChangedEventArgs args)
+    {
+        if (args.Property == AutomationElement.NameProperty)
+        {
+            Record(Convert.ToString(args.NewValue));
+        }
+    }
+
+    private void Record(string value)
+    {
+        value = value ?? string.Empty;
+        observedNames = observedNames.Length == 0
+            ? value
+            : observedNames + " | " + value;
+        if (value.IndexOf(expectedText, StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            SetEvent(observed);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (disposed)
+        {
+            return;
+        }
+        disposed = true;
+        try
+        {
+            Automation.RemoveAutomationPropertyChangedEventHandler(element, handler);
+        }
+        catch (ElementNotAvailableException)
+        {
+            // The window closed after the assertion; no handler remains to leak.
+        }
+        CloseHandle(observed);
+    }
+}
+'@
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
@@ -408,6 +530,26 @@ function Wait-Backup([TimeSpan] $Timeout, [string] $PreviousSnapshotId = '') {
     throw 'Timed out waiting for the installed-service backup.'
 }
 
+function Write-RandomTestFile([string] $Path, [int] $SizeInMiB) {
+    $buffer = [byte[]]::new(1024 * 1024)
+    $random = [Security.Cryptography.RandomNumberGenerator]::Create()
+    $stream = [IO.File]::Open(
+        $Path,
+        [IO.FileMode]::Create,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
+    try {
+        for ($index = 0; $index -lt $SizeInMiB; $index++) {
+            $random.GetBytes($buffer)
+            $stream.Write($buffer, 0, $buffer.Length)
+        }
+    } finally {
+        $stream.Dispose()
+        $random.Dispose()
+    }
+}
+
 function Wait-DiagnosticEvents([string[]] $EventIds, [TimeSpan] $Timeout) {
     $deadline = [DateTime]::UtcNow + $Timeout
     do {
@@ -669,6 +811,33 @@ try {
             value = 'resticpal-e2e-disposable-password'
         })
     }
+
+    # With sources present and an unverified repository, the overview must
+    # expose the service's waiting state instead of presenting stale setup or
+    # protected copy. Clear the sources again before initialization so the
+    # scheduler cannot race the remainder of repository setup.
+    Assert-Accepted @{
+        type = 'update_backup_sources'
+        paths = @($sourceRoot)
+        exclusions = @()
+    }
+    $overviewItem = Wait-AutomationElement $updatesUiProcess 'OverviewItem' ([TimeSpan]::FromSeconds(10))
+    $overviewSelection = $overviewItem.GetCurrentPattern(
+        [Windows.Automation.SelectionItemPattern]::Pattern
+    )
+    $overviewSelection.Select()
+    Wait-AutomationTextContains `
+        $updatesUiProcess `
+        'StatusCardTitle' `
+        'Repository setup required' `
+        ([TimeSpan]::FromSeconds(10)) | Out-Null
+    Write-Host 'The overview status card displayed the repository-validation waiting state.'
+    Assert-Accepted @{
+        type = 'update_backup_sources'
+        paths = @()
+        exclusions = @()
+    }
+
     Assert-Accepted @{ type = 'initialize_repository' }
     Wait-RepositoryOperation 'initialize' ([TimeSpan]::FromMinutes(2))
 
@@ -702,17 +871,34 @@ try {
     }
     $automaticRun = Wait-Backup ([TimeSpan]::FromMinutes(3))
     Write-Host "Initial configuration automatically started append-only snapshot $($automaticRun.snapshot_id)."
-    $overviewItem = Wait-AutomationElement $updatesUiProcess 'OverviewItem' ([TimeSpan]::FromSeconds(10))
-    $overviewSelection = $overviewItem.GetCurrentPattern(
-        [Windows.Automation.SelectionItemPattern]::Pattern
-    )
+    # Give the manual run enough real work that the one-second active-backup
+    # refresh cadence must render its running state before completion.
+    Write-RandomTestFile (Join-Path $sourceRoot 'manual-status-transition.bin') 256
     $overviewSelection.Select()
     $runBackupButton = Wait-AutomationElementEnabled $updatesUiProcess 'RunBackupButton' ([TimeSpan]::FromSeconds(10))
     $runBackupInvoke = $runBackupButton.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)
-    $runBackupInvoke.Invoke()
+    # Subscribe before invoking: the requested state intentionally gives way
+    # to running quickly, so polling after the click can miss a transition that
+    # was rendered correctly. The native UIA callback records even a brief Name
+    # change without relying on a PowerShell callback runspace.
+    $statusCardTitle = Wait-AutomationElement $updatesUiProcess 'StatusCardTitle' ([TimeSpan]::FromSeconds(10))
+    $requestedObserver = [ResticPalAutomationNameObserver]::new(
+        $statusCardTitle,
+        'Backup requested'
+    )
+    try {
+        $runBackupInvoke.Invoke()
+        if (-not $requestedObserver.Wait(10000)) {
+            throw "The status card never rendered the requested state. Observed: $($requestedObserver.ObservedNames)"
+        }
+    } finally {
+        $requestedObserver.Dispose()
+    }
     Wait-AutomationTextContains $updatesUiProcess 'MessageBar' 'Backup requested' ([TimeSpan]::FromSeconds(10)) | Out-Null
+    Wait-AutomationTextContains $updatesUiProcess 'StatusCardTitle' 'Backup in progress' ([TimeSpan]::FromSeconds(30)) | Out-Null
     $run = Wait-Backup ([TimeSpan]::FromMinutes(3)) $automaticRun.snapshot_id
-    Write-Host "The Run backup now button started append-only snapshot $($run.snapshot_id) and acknowledged the queued state."
+    Wait-AutomationTextContains $updatesUiProcess 'StatusCardTitle' 'Protected' ([TimeSpan]::FromSeconds(15)) | Out-Null
+    Write-Host "The Run backup now status card rendered requested, running, and completed states for append-only snapshot $($run.snapshot_id)."
 
     $appendOnlyRetention = Invoke-ResticPalRequest @{ type = 'get_retention' }
     if ($appendOnlyRetention.type -ne 'retention' -or $appendOnlyRetention.configuration.repository_mode -ne 'append_only') {

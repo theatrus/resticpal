@@ -85,5 +85,35 @@ $appCastScript = Get-Content -LiteralPath (
 if (-not $appCastScript.Contains("--file-version', `$Version")) {
     throw 'New-UpdateAppcast.ps1 does not propagate the synchronized appcast version.'
 }
+if (-not $appCastScript.Contains("[string] `$PackageHost = 'UpdatesHost'")) {
+    throw 'New-UpdateAppcast.ps1 must default to the direct updates host.'
+}
+
+$publishScript = Get-Content -LiteralPath (
+    Join-Path $repositoryRoot 'scripts\Publish-Release.ps1') -Raw
+foreach ($releaseSafetyInvariant in @(
+    "[string] `$PackageHost = 'UpdatesHost'",
+    '[switch] $Stage',
+    '[switch] $Finalize',
+    '[string] $UpdateQualificationPath',
+    '$Run.headSha -cne $head',
+    "`$Run.status -cne 'completed' -or `$Run.conclusion -cne 'success'",
+    "`$Run.event -ceq 'push' -and `$Run.headBranch -ceq `$tag",
+    'release-manifest.json',
+    'schema = 2',
+    'previous-published-client-prompted-update',
+    'Assert-DirectPackageMirror -Msi $msi',
+    'Assert-RemoteTagTarget',
+    'Signed Windows CI run $RunId',
+    'Previous signed fallback feed $previousTag',
+    "'--notes-file', `$stagedNotes.FullName, '--draft'",
+    "'--draft=false', '--latest'",
+    'Assert-FeedAssetLabels',
+    'Assert-FinalizedReleaseAssets'
+)) {
+    if (-not $publishScript.Contains($releaseSafetyInvariant)) {
+        throw "Publish-Release.ps1 is missing release safety invariant: $releaseSafetyInvariant"
+    }
+}
 
 Write-Host "OK: Rust, WinUI, application manifest, installer input, and appcast source version are $version."

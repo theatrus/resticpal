@@ -15,6 +15,7 @@ public sealed partial class MainWindow
     private bool _repositorySecretsLocked;
     private bool _repositoryBusy;
     private bool _applyingRepositoryConfiguration;
+    private bool _repositoryConfigurationApplied;
     private bool _repositoryDirty;
     private string _loadedRepositoryDisplayName = string.Empty;
     private string _loadedRepositoryUrl = string.Empty;
@@ -26,6 +27,11 @@ public sealed partial class MainWindow
 
     private async void SaveRepositoryButton_Click(object sender, RoutedEventArgs e)
     {
+        if (!_repositoryConfigurationApplied || !RepositoryHasUnsavedChanges())
+        {
+            return;
+        }
+
         if (!TryReadRepositoryOptions(out IReadOnlyDictionary<string, string> options, out string error))
         {
             ShowMessage(InfoBarSeverity.Warning, error);
@@ -122,28 +128,13 @@ public sealed partial class MainWindow
             || RepositoryUrlBox is null
             || RepositoryModeBox is null
             || RepositoryOptionsBox is null
-            || RepositoryOperationMessage is null)
+            || RepositoryOperationMessage is null
+            || SaveRepositoryButton is null)
         {
             return;
         }
 
-        bool credentialsChanged = !_repositorySecretsLocked && (
-            !string.IsNullOrEmpty(ResticPasswordBox.Password)
-            || !string.IsNullOrEmpty(AwsAccessKeyBox.Password)
-            || !string.IsNullOrEmpty(AwsSecretKeyBox.Password)
-            || !string.IsNullOrEmpty(AwsSessionTokenBox.Password)
-            || !string.IsNullOrEmpty(AzureAccountKeyBox.Password)
-            || !string.IsNullOrEmpty(B2AccountKeyBox.Password)
-            || !string.IsNullOrEmpty(GoogleCredentialsBox.Text)
-            || !string.IsNullOrEmpty(RcloneConfigPasswordBox.Password)
-            || RemoveStoredCredentialsCheckBox.IsChecked == true);
-        _repositoryDirty =
-            !_repositoryDisplayNameLocked
-                && RepositoryDisplayNameBox.Text != _loadedRepositoryDisplayName
-            || !_repositoryUrlLocked && RepositoryUrlBox.Text != _loadedRepositoryUrl
-            || !_repositoryModeLocked && SelectedRepositoryMode() != _loadedRepositoryMode
-            || !_repositoryOptionsLocked && RepositoryOptionsBox.Text != _loadedRepositoryOptions
-            || credentialsChanged;
+        _repositoryDirty = RepositoryHasUnsavedChanges();
 
         if (_repositoryBusy)
         {
@@ -163,6 +154,32 @@ public sealed partial class MainWindow
             ShowRepositoryOperationStatus(_loadedRepositoryOperation);
         }
         SetRepositoryBusy(false);
+    }
+
+    private bool RepositoryHasUnsavedChanges()
+    {
+        if (!_repositoryConfigurationApplied || _applyingRepositoryConfiguration)
+        {
+            return false;
+        }
+
+        bool credentialsChanged = !_repositorySecretsLocked && (
+            !string.IsNullOrEmpty(ResticPasswordBox.Password)
+            || !string.IsNullOrEmpty(AwsAccessKeyBox.Password)
+            || !string.IsNullOrEmpty(AwsSecretKeyBox.Password)
+            || !string.IsNullOrEmpty(AwsSessionTokenBox.Password)
+            || !string.IsNullOrEmpty(AzureAccountKeyBox.Password)
+            || !string.IsNullOrEmpty(B2AccountKeyBox.Password)
+            || !string.IsNullOrEmpty(GoogleCredentialsBox.Text)
+            || !string.IsNullOrEmpty(RcloneConfigPasswordBox.Password)
+            || RemoveStoredCredentialsCheckBox.IsChecked == true);
+        return
+            !_repositoryDisplayNameLocked
+                && RepositoryDisplayNameBox.Text != _loadedRepositoryDisplayName
+            || !_repositoryUrlLocked && RepositoryUrlBox.Text != _loadedRepositoryUrl
+            || !_repositoryModeLocked && SelectedRepositoryMode() != _loadedRepositoryMode
+            || !_repositoryOptionsLocked && RepositoryOptionsBox.Text != _loadedRepositoryOptions
+            || credentialsChanged;
     }
 
     private async void ValidateRepositoryButton_Click(object sender, RoutedEventArgs e)
@@ -255,6 +272,7 @@ public sealed partial class MainWindow
                 _loadedRepositoryMode = SelectedRepositoryMode();
                 _loadedRepositoryOptions = optionsText;
                 _loadedRepositoryOperation = configuration.OperationStatus;
+                _repositoryConfigurationApplied = true;
                 _applyingRepositoryConfiguration = false;
                 _repositoryDirty = false;
 
@@ -293,14 +311,19 @@ public sealed partial class MainWindow
 
     private void SetRepositoryBusy(bool busy)
     {
-        _repositoryBusy = busy;
-        RepositoryProgress.IsActive = busy;
-        RepositoryDisplayNameBox.IsEnabled = !busy && !_repositoryDisplayNameLocked;
-        RepositoryKindBox.IsEnabled = !busy && !_repositoryUrlLocked;
-        RepositoryUrlBox.IsEnabled = !busy && !_repositoryUrlLocked;
-        RepositoryModeBox.IsEnabled = !busy && !_repositoryModeLocked;
-        RepositoryOptionsBox.IsEnabled = !busy && !_repositoryOptionsLocked;
-        bool credentialsEnabled = !busy && !_repositorySecretsLocked;
+        bool operationBusy = busy || ConfigurationPageOperationActive("repository-");
+        bool controlsDisabled = _configurationEditGate.ControlsDisabled(
+            operationBusy,
+            baselineAvailable: _repositoryConfigurationApplied);
+        _repositoryBusy = operationBusy;
+        RepositoryProgress.IsActive = operationBusy;
+        RepositoryDisplayNameBox.IsEnabled =
+            !controlsDisabled && !_repositoryDisplayNameLocked;
+        RepositoryKindBox.IsEnabled = !controlsDisabled && !_repositoryUrlLocked;
+        RepositoryUrlBox.IsEnabled = !controlsDisabled && !_repositoryUrlLocked;
+        RepositoryModeBox.IsEnabled = !controlsDisabled && !_repositoryModeLocked;
+        RepositoryOptionsBox.IsEnabled = !controlsDisabled && !_repositoryOptionsLocked;
+        bool credentialsEnabled = !controlsDisabled && !_repositorySecretsLocked;
         ResticPasswordBox.IsEnabled = credentialsEnabled;
         AwsAccessKeyBox.IsEnabled = credentialsEnabled;
         AwsSecretKeyBox.IsEnabled = credentialsEnabled;
@@ -311,10 +334,10 @@ public sealed partial class MainWindow
         RcloneConfigPasswordBox.IsEnabled = credentialsEnabled;
         RemoveStoredCredentialsCheckBox.IsEnabled =
             credentialsEnabled && _configuredRepositorySecrets.Count > 0;
-        SaveRepositoryButton.IsEnabled = !busy && _repositoryDirty;
-        ValidateRepositoryButton.IsEnabled = !busy && !_repositoryDirty;
+        SaveRepositoryButton.IsEnabled = !controlsDisabled && _repositoryDirty;
+        ValidateRepositoryButton.IsEnabled = !controlsDisabled && !_repositoryDirty;
         CreateRepositoryButton.IsEnabled =
-            !busy && !_repositoryDirty && SelectedRepositoryMode() == "standard";
+            !controlsDisabled && !_repositoryDirty && SelectedRepositoryMode() == "standard";
     }
 
     private string SelectedRepositoryMode() =>

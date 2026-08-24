@@ -61,6 +61,7 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="*" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
             <Grid>
@@ -171,6 +172,7 @@
                                 IsSpellCheckEnabled="False"
                                 MinHeight="120"
                                 PlaceholderText="**/node_modules/**"
+                                TextChanged="SourcesField_Changed"
                                 TextWrapping="NoWrap" />
                         </StackPanel>
 
@@ -327,6 +329,7 @@
                                     <CheckBox
                                         x:Name="RemoveStoredCredentialsCheckBox"
                                         Checked="RepositoryField_Changed"
+                                        Unchecked="RepositoryField_Changed"
                                         Content="Remove all currently stored repository credentials when saving" />
                                 </StackPanel>
                             </StackPanel>
@@ -390,6 +393,7 @@
                                     Minimum="1"
                                     SmallChange="1"
                                     SpinButtonPlacementMode="Compact"
+                                    ValueChanged="ScheduleNumberField_ValueChanged"
                                     Value="24" />
                                 <NumberBox
                                     x:Name="WakeGraceBox"
@@ -398,6 +402,7 @@
                                     Minimum="0"
                                     SmallChange="1"
                                     SpinButtonPlacementMode="Compact"
+                                    ValueChanged="ScheduleNumberField_ValueChanged"
                                     Value="5" />
                                 <TextBlock
                                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
@@ -410,6 +415,7 @@
                                     Minimum="0.0166666667"
                                     SmallChange="1"
                                     SpinButtonPlacementMode="Compact"
+                                    ValueChanged="ScheduleNumberField_ValueChanged"
                                     Value="120" />
                                 <TextBlock
                                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
@@ -419,14 +425,16 @@
                                     x:Name="AllowBatteryToggle"
                                     Header="Battery power"
                                     IsOn="True"
-                                    OffContent="Wait for AC power"
-                                    OnContent="Allow backups on battery" />
+                                    OffContent="Automatic backups wait for AC power"
+                                    OnContent="Allow automatic backups on battery"
+                                    Toggled="ScheduleToggle_Toggled" />
                                 <ToggleSwitch
                                     x:Name="AllowMeteredToggle"
                                     Header="Metered networks"
                                     IsOn="True"
                                     OffContent="Wait for an unmetered network"
-                                    OnContent="Allow backups on metered networks" />
+                                    OnContent="Allow backups on metered networks"
+                                    Toggled="ScheduleToggle_Toggled" />
                             </StackPanel>
                         </Border>
 
@@ -482,10 +490,10 @@
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
                                     </Grid.RowDefinitions>
-                                    <NumberBox x:Name="RetentionDailyBox" Header="Daily snapshots" Maximum="10000" Minimum="0" SpinButtonPlacementMode="Compact" Value="7" />
-                                    <NumberBox x:Name="RetentionWeeklyBox" Grid.Column="1" Header="Weekly snapshots" Maximum="10000" Minimum="0" SpinButtonPlacementMode="Compact" Value="5" />
-                                    <NumberBox x:Name="RetentionMonthlyBox" Grid.Row="1" Header="Monthly snapshots" Maximum="10000" Minimum="0" SpinButtonPlacementMode="Compact" Value="12" />
-                                    <NumberBox x:Name="RetentionYearlyBox" Grid.Row="1" Grid.Column="1" Header="Yearly snapshots" Maximum="10000" Minimum="0" SpinButtonPlacementMode="Compact" Value="3" />
+                                    <NumberBox x:Name="RetentionDailyBox" Header="Daily snapshots" Maximum="10000" Minimum="0" SpinButtonPlacementMode="Compact" Value="7" ValueChanged="RetentionNumberField_ValueChanged" />
+                                    <NumberBox x:Name="RetentionWeeklyBox" Grid.Column="1" Header="Weekly snapshots" Maximum="10000" Minimum="0" SpinButtonPlacementMode="Compact" Value="5" ValueChanged="RetentionNumberField_ValueChanged" />
+                                    <NumberBox x:Name="RetentionMonthlyBox" Grid.Row="1" Header="Monthly snapshots" Maximum="10000" Minimum="0" SpinButtonPlacementMode="Compact" Value="12" ValueChanged="RetentionNumberField_ValueChanged" />
+                                    <NumberBox x:Name="RetentionYearlyBox" Grid.Row="1" Grid.Column="1" Header="Yearly snapshots" Maximum="10000" Minimum="0" SpinButtonPlacementMode="Compact" Value="3" ValueChanged="RetentionNumberField_ValueChanged" />
                                 </Grid>
                                 <NumberBox
                                     x:Name="PruneIntervalBox"
@@ -493,6 +501,7 @@
                                     Maximum="365"
                                     Minimum="1"
                                     SpinButtonPlacementMode="Compact"
+                                    ValueChanged="RetentionNumberField_ValueChanged"
                                     Value="7" />
                                 <TextBlock
                                     x:Name="RetentionLastRunText"
@@ -815,8 +824,22 @@
             </Grid>
 
             <InfoBar
-                x:Name="MessageBar"
+                x:Name="ManagedRefreshInfoBar"
                 Grid.Row="1"
+                Margin="32,0,32,12"
+                IsClosable="False"
+                IsOpen="False"
+                Severity="Warning">
+                <InfoBar.ActionButton>
+                    <Button
+                        x:Name="DiscardConfigurationEditsButton"
+                        Click="DiscardConfigurationEditsButton_Click"
+                        Content="Discard edits and refresh" />
+                </InfoBar.ActionButton>
+            </InfoBar>
+            <InfoBar
+                x:Name="MessageBar"
+                Grid.Row="2"
                 Margin="32,0,32,20"
                 IsClosable="True"
                 IsOpen="False" />

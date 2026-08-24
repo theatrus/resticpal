@@ -45,6 +45,7 @@ internal sealed class ResticPalUpdateService : IDisposable
     {
         ThrowIfDisposed();
         cancellationToken.ThrowIfCancellationRequested();
+        var selection = new UpdateFeedSelection();
         foreach (SparkleUpdater updater in _updaters)
         {
             UpdateInfo result;
@@ -54,21 +55,34 @@ internal sealed class ResticPalUpdateService : IDisposable
             }
             catch when (!cancellationToken.IsCancellationRequested)
             {
+                selection.Observe(UpdateFeedObservation.Unavailable);
                 continue;
             }
             cancellationToken.ThrowIfCancellationRequested();
 
-            switch (result.Status)
+            UpdateFeedObservation observation = result.Status switch
             {
-                case UpdateStatus.UpdateAvailable when result.Updates.Count > 0:
+                UpdateStatus.UpdateAvailable when result.Updates.Count > 0 =>
+                    UpdateFeedObservation.Available,
+                UpdateStatus.UpdateNotAvailable or UpdateStatus.UserSkipped =>
+                    UpdateFeedObservation.Current,
+                _ => UpdateFeedObservation.Unavailable,
+            };
+            if (selection.Observe(observation) == UpdateFeedAction.UseAvailableUpdate)
+            {
+                // Available observations are only produced when this list is
+                // non-empty, keeping the pure selection helper independent of
+                // NetSparkle's object model.
+                if (result.Updates.Count > 0)
+                {
                     return UpdateCheckResult.Available(
                         new AvailableUpdate(updater, result.Updates[0]));
-                case UpdateStatus.UpdateNotAvailable:
-                case UpdateStatus.UserSkipped:
-                    return UpdateCheckResult.Current;
+                }
             }
         }
-        return UpdateCheckResult.Unavailable;
+        return selection.Complete() == UpdateFeedCompletion.Current
+            ? UpdateCheckResult.Current
+            : UpdateCheckResult.Unavailable;
     }
 
     internal async Task<DownloadedUpdate> DownloadAsync(
