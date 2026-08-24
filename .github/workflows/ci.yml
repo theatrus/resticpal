@@ -51,6 +51,9 @@ jobs:
       - name: Build WinUI application
         run: dotnet build ResticPal.slnx --configuration Debug
 
+      - name: Test WinUI-independent application logic
+        run: dotnet test tests/ResticPal.UI.Logic.Tests/ResticPal.UI.Logic.Tests.csproj --configuration Debug --no-build
+
   e2e:
     name: End-to-end Windows x64
     runs-on: windows-latest

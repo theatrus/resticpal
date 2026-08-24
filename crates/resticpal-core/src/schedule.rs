@@ -124,7 +124,10 @@ pub fn decide(config: &ScheduleConfig, snapshot: &SchedulerSnapshot) -> Schedule
     if snapshot.network_required && !snapshot.network_available {
         blockers.push(ScheduleBlocker::NetworkUnavailable);
     }
-    if snapshot.on_battery && !config.allow_on_battery {
+    // The battery setting governs unattended work. An explicit Run Backup Now
+    // request represents the user's decision to spend battery power for this
+    // one run, so it bypasses this gate without changing the saved policy.
+    if !snapshot.manual_requested && snapshot.on_battery && !config.allow_on_battery {
         blockers.push(ScheduleBlocker::BatteryDisallowed);
     }
     if snapshot.metered_network && !config.allow_metered_network {
@@ -198,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_request_bypasses_wake_grace_but_not_safety_constraints() {
+    fn manual_request_bypasses_wake_grace_and_battery_policy() {
         let config = ScheduleConfig {
             allow_on_battery: false,
             ..ScheduleConfig::default()
@@ -210,9 +213,33 @@ mod tests {
 
         assert_eq!(
             decide(&config, &state),
+            ScheduleDecision::Start {
+                trigger: BackupTrigger::Manual,
+            }
+        );
+    }
+
+    #[test]
+    fn manual_request_still_observes_network_constraints() {
+        let config = ScheduleConfig {
+            allow_on_battery: false,
+            allow_metered_network: false,
+            ..ScheduleConfig::default()
+        };
+        let mut state = snapshot(timestamp(9, 1));
+        state.manual_requested = true;
+        state.network_available = false;
+        state.on_battery = true;
+        state.metered_network = true;
+
+        assert_eq!(
+            decide(&config, &state),
             ScheduleDecision::Waiting {
                 trigger: BackupTrigger::Manual,
-                blockers: vec![ScheduleBlocker::BatteryDisallowed],
+                blockers: vec![
+                    ScheduleBlocker::NetworkUnavailable,
+                    ScheduleBlocker::MeteredNetworkDisallowed,
+                ],
                 retry_at: None,
             }
         );

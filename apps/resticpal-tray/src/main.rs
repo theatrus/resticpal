@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::VecDeque;
 use std::fs;
 use std::mem::size_of;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -18,17 +20,19 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
+    NIM_MODIFY, NIM_SETVERSION, NIN_BALLOONHIDE, NIN_BALLOONSHOW, NIN_BALLOONTIMEOUT,
+    NIN_BALLOONUSERCLICK, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
     GetCursorPos, GetMessageTime, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, KillTimer,
     LR_DEFAULTCOLOR, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK, MENU_ITEM_FLAGS, MSG,
-    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow,
-    SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-    WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER,
-    WNDCLASSW, WS_OVERLAPPED,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    SW_SHOWNORMAL, SetForegroundWindow, SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu,
+    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{Error, Result, w};
 
@@ -47,9 +51,13 @@ const UPDATE_RETRY_TIMER_ID: usize = 4;
 const BACKUP_STATUS_TIMER_ID: usize = 5;
 const BACKUP_STATUS_INTERVAL_MS: u32 = 1_000;
 const BACKUP_WAITING_INTERVAL_MS: u32 = 30_000;
+const BACKUP_FAST_POLL_TICKS: u64 = 15;
+const BACKUP_MONITOR_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const UPDATE_CHECK_INTERVAL_MS: u32 = 6 * 60 * 60 * 1_000;
 const UPDATE_RETRY_INTERVAL_MS: u32 = 5 * 60 * 1_000;
 const UPDATE_AVAILABLE_MESSAGE: u32 = WM_APP + 2;
+const NIN_KEYSELECT_EVENT: u32 = NIN_SELECT | 1;
+const MAX_PENDING_BALLOON_ROUTES: usize = 16;
 const UPDATE_PROMPT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const UPDATE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_UPDATE_APPCAST_BYTES: usize = 256 * 1024;
@@ -72,18 +80,68 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static ONBOARDING_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static LAST_LEFT_CLICK_MESSAGE_TIME: AtomicU64 = AtomicU64::new(u64::MAX);
 static UI_LAUNCH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static TASKBAR_CREATED_MESSAGE: AtomicU64 = AtomicU64::new(0);
+static TRAY_ICON_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static BALLOON_ROUTES: OnceLock<Mutex<BalloonRouteState>> = OnceLock::new();
 static BACKUP_MONITOR_BASELINE_ATTEMPT: AtomicI64 = AtomicI64::new(i64::MIN);
+static BACKUP_MONITOR_BASELINE_KNOWN: AtomicBool = AtomicBool::new(false);
+static BACKUP_MONITOR_BASELINE_HAS_ATTEMPT: AtomicBool = AtomicBool::new(false);
 static BACKUP_MONITOR_TICKS: AtomicU64 = AtomicU64::new(0);
+static BACKUP_MONITOR_STARTED: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 static BACKUP_MONITOR_OBSERVED_RUNNING: AtomicBool = AtomicBool::new(false);
 static BACKUP_STARTED_NOTIFICATION_SHOWN: AtomicBool = AtomicBool::new(false);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiDestination {
     Default,
     Setup,
     Updates,
+}
+
+#[derive(Default)]
+struct BalloonRouteState {
+    pending: VecDeque<UiDestination>,
+    active: Option<UiDestination>,
+}
+
+impl BalloonRouteState {
+    fn reserve(&mut self, destination: UiDestination) -> bool {
+        if self.pending.len() >= MAX_PENDING_BALLOON_ROUTES {
+            return false;
+        }
+        self.pending.push_back(destination);
+        true
+    }
+
+    fn cancel_latest(&mut self) {
+        self.pending.pop_back();
+    }
+
+    fn shown(&mut self) {
+        if let Some(destination) = self.pending.pop_front() {
+            self.active = Some(destination);
+        }
+    }
+
+    fn dismissed(&mut self) {
+        if self.active.take().is_none() {
+            self.pending.pop_front();
+        }
+    }
+
+    fn clicked(&mut self) -> UiDestination {
+        self.active
+            .take()
+            .or_else(|| self.pending.pop_front())
+            .unwrap_or(UiDestination::Default)
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.active = None;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +155,28 @@ enum TrayIconAction {
 struct UpdateSource {
     appcast_url: &'static str,
     signature_url: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BackupAttemptBaseline {
+    known: bool,
+    attempt: Option<i64>,
+}
+
+impl BackupAttemptBaseline {
+    const UNKNOWN: Self = Self {
+        known: false,
+        attempt: None,
+    };
+
+    fn from_status(status: ServiceStatus) -> Self {
+        Self {
+            known: true,
+            attempt: status
+                .last_attempt
+                .map(|attempt| attempt.timestamp_millis()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +272,14 @@ fn run() -> Result<()> {
     // SAFETY: loading predefined Windows resources does not transfer ownership.
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }?;
     let tray_icon = TrayIcon::load()?;
+    // Explorer broadcasts this registered message after recreating its taskbar.
+    // The notification icon otherwise disappears while this process keeps running.
+    let taskbar_created_message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+    if taskbar_created_message == 0 {
+        return Err(Error::from_thread());
+    }
+    TASKBAR_CREATED_MESSAGE.store(u64::from(taskbar_created_message), Ordering::Relaxed);
+    TRAY_ICON_HANDLE.store(tray_icon.handle.0 as isize, Ordering::Relaxed);
 
     let window_class = WNDCLASSW {
         hCursor: cursor,
@@ -267,11 +355,16 @@ fn add_tray_icon(window: HWND, icon: HICON) -> Result<()> {
     copy_wide(&tooltip, &mut data.szTip);
 
     // SAFETY: data is fully initialized and points to the live hidden window.
-    if unsafe { Shell_NotifyIconW(NIM_ADD, &raw const data) }.as_bool() {
-        Ok(())
-    } else {
-        Err(Error::from_thread())
+    if !unsafe { Shell_NotifyIconW(NIM_ADD, &raw const data) }.as_bool() {
+        return Err(Error::from_thread());
     }
+
+    data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+    if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &raw const data) }.as_bool() {
+        remove_tray_icon(window);
+        return Err(Error::from_thread());
+    }
+    Ok(())
 }
 
 fn select_icon_image(bytes: &[u8], preferred_size: u16) -> Option<&[u8]> {
@@ -366,9 +459,32 @@ unsafe extern "system" fn window_proc(
 }
 
 fn window_proc_inner(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if is_taskbar_created_message(
+        message,
+        u32::try_from(TASKBAR_CREATED_MESSAGE.load(Ordering::Relaxed)).unwrap_or_default(),
+    ) {
+        let icon = TRAY_ICON_HANDLE.load(Ordering::Relaxed);
+        if icon != 0 {
+            with_balloon_routes(BalloonRouteState::clear);
+            let _ = add_tray_icon(window, HICON(icon as *mut core::ffi::c_void));
+        }
+        return LRESULT(0);
+    }
+
     match message {
         TRAY_CALLBACK => {
-            match tray_icon_action(u32::try_from(lparam.0).unwrap_or_default()) {
+            let event = tray_callback_event(lparam.0);
+            if event == NIN_BALLOONSHOW {
+                with_balloon_routes(BalloonRouteState::shown);
+                return LRESULT(0);
+            }
+            if event == NIN_BALLOONHIDE || event == NIN_BALLOONTIMEOUT {
+                with_balloon_routes(BalloonRouteState::dismissed);
+                return LRESULT(0);
+            }
+            let balloon_opens_updates = event == NIN_BALLOONUSERCLICK
+                && with_balloon_routes(BalloonRouteState::clicked) == UiDestination::Updates;
+            match tray_icon_action(event, balloon_opens_updates) {
                 Some(TrayIconAction::OpenSettings) => {
                     // SAFETY: these functions only read system input timing state.
                     let message_time = unsafe { GetMessageTime() } as u32;
@@ -442,6 +558,18 @@ fn window_proc_inner(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM)
             unsafe { DefWindowProcW(window, message, wparam, lparam) }
         }
     }
+}
+
+fn is_taskbar_created_message(message: u32, registered_message: u32) -> bool {
+    registered_message != 0 && message == registered_message
+}
+
+fn with_balloon_routes<T>(action: impl FnOnce(&mut BalloonRouteState) -> T) -> T {
+    let routes = BALLOON_ROUTES.get_or_init(|| Mutex::new(BalloonRouteState::default()));
+    let mut routes = routes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    action(&mut routes)
 }
 
 fn show_context_menu(window: HWND) -> Result<()> {
@@ -520,11 +648,20 @@ fn tray_left_click_is_distinct(
         .is_none_or(|previous| message_time.wrapping_sub(previous) > double_click_time)
 }
 
-fn tray_icon_action(event: u32) -> Option<TrayIconAction> {
+fn tray_callback_event(raw_lparam: isize) -> u32 {
+    // NOTIFYICON_VERSION_4 packs the event into LOWORD(lParam) and the icon ID
+    // into HIWORD(lParam); older versions put the event in the full value.
+    u32::try_from((raw_lparam as usize) & usize::from(u16::MAX)).unwrap_or_default()
+}
+
+fn tray_icon_action(event: u32, balloon_opens_updates: bool) -> Option<TrayIconAction> {
     match event {
-        WM_LBUTTONUP | WM_LBUTTONDBLCLK => Some(TrayIconAction::OpenSettings),
-        NIN_BALLOONUSERCLICK => Some(TrayIconAction::OpenUpdates),
-        WM_RBUTTONUP => Some(TrayIconAction::ShowContextMenu),
+        WM_LBUTTONUP | WM_LBUTTONDBLCLK | NIN_SELECT | NIN_KEYSELECT_EVENT => {
+            Some(TrayIconAction::OpenSettings)
+        }
+        NIN_BALLOONUSERCLICK if balloon_opens_updates => Some(TrayIconAction::OpenUpdates),
+        NIN_BALLOONUSERCLICK => Some(TrayIconAction::OpenSettings),
+        WM_RBUTTONUP | WM_CONTEXTMENU => Some(TrayIconAction::ShowContextMenu),
         _ => None,
     }
 }
@@ -674,7 +811,15 @@ fn check_update_sources(
     sources: &[UpdateSource],
     mut check: impl FnMut(UpdateSource) -> Option<UpdateCheck>,
 ) -> Option<UpdateCheck> {
-    sources.iter().copied().find_map(&mut check)
+    let mut current_feed_seen = false;
+    for source in sources.iter().copied() {
+        match check(source) {
+            Some(available @ UpdateCheck::Available(_)) => return Some(available),
+            Some(UpdateCheck::Current) => current_feed_seen = true,
+            None => {}
+        }
+    }
+    current_feed_seen.then_some(UpdateCheck::Current)
 }
 
 fn check_update_source(agent: &ureq::Agent, source: UpdateSource) -> Option<UpdateCheck> {
@@ -861,10 +1006,16 @@ fn show_update_notification(window: HWND) -> Result<()> {
         window,
         "resticpal update available",
         "A signed resticpal update is ready. Click to review and install it.",
+        UiDestination::Updates,
     )
 }
 
-fn show_tray_notification(window: HWND, title: &str, message: &str) -> Result<()> {
+fn show_tray_notification(
+    window: HWND,
+    title: &str,
+    message: &str,
+    destination: UiDestination,
+) -> Result<()> {
     let mut data = NOTIFYICONDATAW {
         cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>())
             .expect("NOTIFYICONDATAW size fits in u32"),
@@ -877,11 +1028,15 @@ fn show_tray_notification(window: HWND, title: &str, message: &str) -> Result<()
     copy_wide(title, &mut data.szInfoTitle);
     copy_wide(message, &mut data.szInfo);
     data.Anonymous.uTimeout = 10_000;
+    if !with_balloon_routes(|routes| routes.reserve(destination)) {
+        return Ok(());
+    }
 
     // SAFETY: data identifies the notification icon owned by the live window.
     if unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const data) }.as_bool() {
         Ok(())
     } else {
+        with_balloon_routes(BalloonRouteState::cancel_latest);
         Err(Error::from_thread())
     }
 }
@@ -889,13 +1044,12 @@ fn show_tray_notification(window: HWND, title: &str, message: &str) -> Result<()
 fn send_backup_action(window: HWND, command: RequestCommand) {
     let run_backup = matches!(&command, RequestCommand::RunBackupNow);
     let baseline_attempt = if run_backup {
-        fetch_service_status()
-            .ok()
-            .flatten()
-            .and_then(|status| status.last_attempt)
-            .map_or(i64::MIN, |attempt| attempt.timestamp_millis())
+        fetch_service_status().ok().flatten().map_or(
+            BackupAttemptBaseline::UNKNOWN,
+            BackupAttemptBaseline::from_status,
+        )
     } else {
-        i64::MIN
+        BackupAttemptBaseline::UNKNOWN
     };
     match send_request(command) {
         Ok(Response {
@@ -910,6 +1064,7 @@ fn send_backup_action(window: HWND, command: RequestCommand) {
                     "Cancellation requested"
                 },
                 &message,
+                UiDestination::Default,
             );
             let _ = refresh_tray_status(window);
             start_backup_status_monitor(window, baseline_attempt, !run_backup);
@@ -1011,9 +1166,16 @@ fn refresh_tray_status(window: HWND) -> std::result::Result<Option<ServiceStatus
     }
 }
 
-fn start_backup_status_monitor(window: HWND, baseline_attempt: i64, observed_running: bool) {
-    BACKUP_MONITOR_BASELINE_ATTEMPT.store(baseline_attempt, Ordering::Relaxed);
+fn start_backup_status_monitor(
+    window: HWND,
+    baseline: BackupAttemptBaseline,
+    observed_running: bool,
+) {
+    BACKUP_MONITOR_BASELINE_ATTEMPT.store(baseline.attempt.unwrap_or(i64::MIN), Ordering::Relaxed);
+    BACKUP_MONITOR_BASELINE_KNOWN.store(baseline.known, Ordering::Relaxed);
+    BACKUP_MONITOR_BASELINE_HAS_ATTEMPT.store(baseline.attempt.is_some(), Ordering::Relaxed);
     BACKUP_MONITOR_TICKS.store(0, Ordering::Relaxed);
+    with_backup_monitor_started(|started| *started = Some(Instant::now()));
     BACKUP_MONITOR_OBSERVED_RUNNING.store(observed_running, Ordering::Relaxed);
     BACKUP_STARTED_NOTIFICATION_SHOWN.store(observed_running, Ordering::Relaxed);
     // SAFETY: the timer belongs to the tray's live hidden window and is replaced
@@ -1032,7 +1194,14 @@ fn poll_backup_status(window: HWND) {
     let status = match refresh_tray_status(window) {
         Ok(Some(status)) => status,
         _ => {
-            if BACKUP_MONITOR_TICKS.fetch_add(1, Ordering::Relaxed) + 1 == 15 {
+            let ticks = BACKUP_MONITOR_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+            if backup_monitor_timed_out(Instant::now()) {
+                finish_backup_status_monitor(
+                    window,
+                    "Backup status unavailable",
+                    "resticpal stopped the dedicated status watch. Open the app to review the service.",
+                );
+            } else if ticks == BACKUP_FAST_POLL_TICKS {
                 // SAFETY: resetting the same live timer reduces polling while
                 // the service is temporarily unavailable.
                 unsafe {
@@ -1048,11 +1217,27 @@ fn poll_backup_status(window: HWND) {
         }
     };
     let ticks = BACKUP_MONITOR_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if backup_monitor_timed_out(Instant::now()) {
+        finish_backup_status_monitor(
+            window,
+            "Backup still pending",
+            "resticpal stopped the dedicated status watch after two hours. Open the app to review current conditions.",
+        );
+        return;
+    }
     let observed_running = BACKUP_MONITOR_OBSERVED_RUNNING.load(Ordering::Relaxed);
-    let attempt_changed = status.last_attempt.is_some_and(|attempt| {
-        attempt.timestamp_millis() != BACKUP_MONITOR_BASELINE_ATTEMPT.load(Ordering::Relaxed)
-    });
-    if ticks == 15
+    let baseline_known = BACKUP_MONITOR_BASELINE_KNOWN.load(Ordering::Relaxed);
+    let baseline_attempt = BACKUP_MONITOR_BASELINE_HAS_ATTEMPT
+        .load(Ordering::Relaxed)
+        .then(|| BACKUP_MONITOR_BASELINE_ATTEMPT.load(Ordering::Relaxed));
+    let attempt_changed = backup_attempt_changed(
+        baseline_known,
+        baseline_attempt,
+        status
+            .last_attempt
+            .map(|attempt| attempt.timestamp_millis()),
+    );
+    if ticks == BACKUP_FAST_POLL_TICKS
         && !observed_running
         && !attempt_changed
         && !matches!(status.state, BackupState::Running { .. })
@@ -1061,6 +1246,7 @@ fn poll_backup_status(window: HWND) {
             window,
             "Backup waiting",
             "The request is still queued. resticpal will keep watching its power, network, and service conditions.",
+            UiDestination::Default,
         );
         // SAFETY: resetting the same live timer reduces idle polling while a
         // start condition remains unavailable.
@@ -1082,6 +1268,7 @@ fn poll_backup_status(window: HWND) {
                     window,
                     "Backup started",
                     "resticpal is now protecting this PC.",
+                    UiDestination::Default,
                 );
             }
         }
@@ -1113,14 +1300,47 @@ fn poll_backup_status(window: HWND) {
                 "The active backup was cancelled.",
             );
         }
+        BackupState::Unconfigured | BackupState::Paused => {
+            finish_backup_status_monitor(
+                window,
+                "Backup request stopped",
+                "The service can no longer run the requested backup. Open resticpal to review its configuration.",
+            );
+        }
         _ => {}
     }
+}
+
+fn backup_monitor_timed_out(now: Instant) -> bool {
+    with_backup_monitor_started(|started| {
+        started.is_some_and(|started| {
+            now.checked_duration_since(started)
+                .is_some_and(|elapsed| elapsed >= BACKUP_MONITOR_TIMEOUT)
+        })
+    })
+}
+
+fn with_backup_monitor_started<T>(action: impl FnOnce(&mut Option<Instant>) -> T) -> T {
+    let started = BACKUP_MONITOR_STARTED.get_or_init(|| Mutex::new(None));
+    let mut started = started
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    action(&mut started)
+}
+
+fn backup_attempt_changed(
+    baseline_known: bool,
+    baseline_attempt: Option<i64>,
+    last_attempt: Option<i64>,
+) -> bool {
+    baseline_known && last_attempt.is_some() && last_attempt != baseline_attempt
 }
 
 fn finish_backup_status_monitor(window: HWND, title: &str, message: &str) {
     // SAFETY: this removes only the backup status timer owned by this window.
     let _ = unsafe { KillTimer(Some(window), BACKUP_STATUS_TIMER_ID) };
-    let _ = show_tray_notification(window, title, message);
+    with_backup_monitor_started(|started| *started = None);
+    let _ = show_tray_notification(window, title, message, UiDestination::Default);
 }
 
 fn send_request(command: RequestCommand) -> std::result::Result<Response, NamedPipeError> {
@@ -1201,18 +1421,64 @@ mod tests {
 
     #[test]
     fn tray_mouse_events_map_to_open_and_context_actions() {
+        let version_four_left_click = isize::try_from(
+            (usize::try_from(TRAY_ICON_ID).unwrap() << 16) | usize::try_from(WM_LBUTTONUP).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tray_callback_event(version_four_left_click), WM_LBUTTONUP);
         assert_eq!(
-            tray_icon_action(WM_LBUTTONUP),
+            tray_icon_action(WM_LBUTTONUP, false),
             Some(TrayIconAction::OpenSettings)
         );
         assert_eq!(
-            tray_icon_action(WM_LBUTTONDBLCLK),
+            tray_icon_action(WM_LBUTTONDBLCLK, false),
             Some(TrayIconAction::OpenSettings)
         );
         assert_eq!(
-            tray_icon_action(WM_RBUTTONUP),
+            tray_icon_action(WM_RBUTTONUP, false),
             Some(TrayIconAction::ShowContextMenu)
         );
+        assert_eq!(
+            tray_icon_action(NIN_BALLOONUSERCLICK, false),
+            Some(TrayIconAction::OpenSettings)
+        );
+        assert_eq!(
+            tray_icon_action(NIN_BALLOONUSERCLICK, true),
+            Some(TrayIconAction::OpenUpdates)
+        );
+        assert_eq!(
+            tray_icon_action(NIN_SELECT, false),
+            Some(TrayIconAction::OpenSettings)
+        );
+        assert_eq!(
+            tray_icon_action(NIN_KEYSELECT_EVENT, false),
+            Some(TrayIconAction::OpenSettings)
+        );
+        assert_eq!(
+            tray_icon_action(WM_CONTEXTMENU, false),
+            Some(TrayIconAction::ShowContextMenu)
+        );
+    }
+
+    #[test]
+    fn balloon_clicks_follow_the_route_that_became_visible() {
+        let mut routes = BalloonRouteState::default();
+        assert!(routes.reserve(UiDestination::Updates));
+        assert!(routes.reserve(UiDestination::Default));
+
+        routes.shown();
+        assert_eq!(routes.clicked(), UiDestination::Updates);
+        routes.shown();
+        assert_eq!(routes.clicked(), UiDestination::Default);
+        assert_eq!(routes.clicked(), UiDestination::Default);
+    }
+
+    #[test]
+    fn explorer_restart_message_is_matched_only_after_registration() {
+        assert!(!is_taskbar_created_message(0, 0));
+        assert!(!is_taskbar_created_message(42, 0));
+        assert!(is_taskbar_created_message(42, 42));
+        assert!(!is_taskbar_created_message(41, 42));
     }
 
     #[test]
@@ -1248,6 +1514,22 @@ mod tests {
         assert!(should_launch_onboarding(false, &BackupState::Unconfigured));
         assert!(!should_launch_onboarding(true, &BackupState::Unconfigured));
         assert!(!should_launch_onboarding(false, &BackupState::Idle));
+    }
+
+    #[test]
+    fn backup_completion_requires_a_known_changed_attempt_or_observed_run() {
+        assert!(!backup_attempt_changed(false, None, Some(1_000)));
+        assert!(backup_attempt_changed(true, None, Some(1_000)));
+        assert!(!backup_attempt_changed(true, Some(1_000), Some(1_000)));
+        assert!(backup_attempt_changed(true, Some(1_000), Some(2_000)));
+        assert!(!backup_attempt_changed(true, Some(1_000), None));
+        let started = Instant::now();
+        with_backup_monitor_started(|value| *value = Some(started));
+        assert!(!backup_monitor_timed_out(
+            started + BACKUP_MONITOR_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(backup_monitor_timed_out(started + BACKUP_MONITOR_TIMEOUT));
+        with_backup_monitor_started(|value| *value = None);
     }
 
     #[test]
@@ -1322,12 +1604,38 @@ mod tests {
         );
 
         checked.clear();
+        let fallback_available = check_update_sources(UPDATE_APPCAST_SOURCES, |source| {
+            checked.push(source.appcast_url);
+            if checked.len() == 1 {
+                Some(UpdateCheck::Current)
+            } else {
+                Some(UpdateCheck::Available(UpdatePackage {
+                    version: "9.0.0".to_owned(),
+                    url: "https://example.test/update.msi".to_owned(),
+                    signature: "signature".to_owned(),
+                    length: 1,
+                }))
+            }
+        });
+        assert!(matches!(
+            fallback_available,
+            Some(UpdateCheck::Available(_))
+        ));
+        assert_eq!(checked.len(), 2);
+
+        checked.clear();
         let current = check_update_sources(UPDATE_APPCAST_SOURCES, |source| {
             checked.push(source.appcast_url);
             Some(UpdateCheck::Current)
         });
         assert_eq!(current, Some(UpdateCheck::Current));
-        assert_eq!(checked, vec!["https://updates.resticpal.com/appcast.xml"]);
+        assert_eq!(
+            checked,
+            vec![
+                "https://updates.resticpal.com/appcast.xml",
+                "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml",
+            ]
+        );
     }
 
     #[test]

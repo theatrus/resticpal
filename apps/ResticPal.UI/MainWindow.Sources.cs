@@ -12,6 +12,7 @@ public sealed partial class MainWindow
     private bool _sourcesLoaded;
     private bool _pathsLocked;
     private bool _exclusionsLocked;
+    private BackupSourcesConfiguration? _loadedBackupSources;
 
     public ObservableCollection<string> BackupPaths { get; } = new();
 
@@ -60,7 +61,7 @@ public sealed partial class MainWindow
             }
 
             BackupPaths.Add(folder.Path);
-        });
+        }, SetSourcesBusy);
     }
 
     private void RemoveSourceButton_Click(object sender, RoutedEventArgs e)
@@ -73,16 +74,26 @@ public sealed partial class MainWindow
 
     private async void SaveSourcesButton_Click(object sender, RoutedEventArgs e)
     {
+        if (_loadedBackupSources is null)
+        {
+            return;
+        }
+
+        bool pathsChanged = SourcesPathsChanged();
+        bool exclusionsChanged = SourcesExclusionsChanged();
+        if (!pathsChanged && !exclusionsChanged)
+        {
+            RefreshSourcesControlState();
+            return;
+        }
+
+        string[] paths = BackupPaths.ToArray();
+        string[] exclusions = ReadExclusions();
         await RunGuardedAsync("sources-save", async () =>
         {
-            string[] exclusions = ExclusionsBox.Text
-                .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Where(value => !string.IsNullOrWhiteSpace(value))
-                .Distinct(StringComparer.Ordinal)
-                .ToArray();
             CommandResult result = await _service.UpdateBackupSourcesAsync(
-                _pathsLocked ? null : BackupPaths.ToArray(),
-                _exclusionsLocked ? null : exclusions);
+                ConfigurationFieldDiff.ReferenceOrNull(pathsChanged, paths),
+                ConfigurationFieldDiff.ReferenceOrNull(exclusionsChanged, exclusions));
             ShowMessage(
                 result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning,
                 result.Message);
@@ -115,16 +126,71 @@ public sealed partial class MainWindow
                 (false, true) => "Exclusions are managed by your organization. Local backup paths remain editable.",
                 _ => string.Empty,
             };
+            _loadedBackupSources = configuration;
             _sourcesLoaded = true;
         }, SetSourcesBusy);
 
+    private string[] ReadExclusions() => ExclusionsBox.Text
+        .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Where(value => !string.IsNullOrWhiteSpace(value))
+        .Distinct(StringComparer.Ordinal)
+        .ToArray();
+
+    private bool SourcesPathsChanged()
+    {
+        if (_loadedBackupSources is not BackupSourcesConfiguration loaded)
+        {
+            return false;
+        }
+
+        return ConfigurationFieldDiff.Changed(
+            _pathsLocked,
+            string.Join('\0', BackupPaths),
+            string.Join('\0', loaded.Paths),
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private bool SourcesExclusionsChanged()
+    {
+        if (_loadedBackupSources is not BackupSourcesConfiguration loaded)
+        {
+            return false;
+        }
+
+        return ConfigurationFieldDiff.Changed(
+            _exclusionsLocked,
+            ExclusionsBox.Text,
+            string.Join(Environment.NewLine, loaded.Exclusions),
+            StringComparer.Ordinal);
+    }
+
+    private bool SourcesHaveUnsavedChanges() =>
+        SourcesPathsChanged() || SourcesExclusionsChanged();
+
+    private void SourcesField_Changed(object sender, TextChangedEventArgs e)
+    {
+        RefreshSourcesControlState();
+    }
+
+    private void RefreshSourcesControlState()
+    {
+        if (SaveSourcesButton is not null)
+        {
+            SetSourcesBusy(false);
+        }
+    }
+
     private void SetSourcesBusy(bool busy)
     {
-        SourcesProgress.IsActive = busy;
-        DiscoverSourcesButton.IsEnabled = !busy && !_pathsLocked;
-        AddSourceButton.IsEnabled = !busy && !_pathsLocked;
-        RemoveSourceButton.IsEnabled = !busy && !_pathsLocked;
-        ExclusionsBox.IsEnabled = !busy && !_exclusionsLocked;
-        SaveSourcesButton.IsEnabled = !busy && !(_pathsLocked && _exclusionsLocked);
+        bool operationBusy = busy || ConfigurationPageOperationActive("sources-");
+        bool controlsDisabled = _configurationEditGate.ControlsDisabled(
+            operationBusy,
+            baselineAvailable: _loadedBackupSources is not null);
+        SourcesProgress.IsActive = operationBusy;
+        DiscoverSourcesButton.IsEnabled = !controlsDisabled && !_pathsLocked;
+        AddSourceButton.IsEnabled = !controlsDisabled && !_pathsLocked;
+        RemoveSourceButton.IsEnabled = !controlsDisabled && !_pathsLocked;
+        ExclusionsBox.IsEnabled = !controlsDisabled && !_exclusionsLocked;
+        SaveSourcesButton.IsEnabled = !controlsDisabled && SourcesHaveUnsavedChanges();
     }
 }

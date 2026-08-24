@@ -32,6 +32,7 @@ internal sealed class ResticPalServiceClient
             && lastAttemptElement.ValueKind == JsonValueKind.String
                 ? lastAttemptElement.GetDateTimeOffset()
                 : null;
+        string? managedRevision = ReadOptionalString(status, "managed_revision");
 
         (string headline, string description, bool canRun, bool canCancel) = stateName switch
         {
@@ -119,7 +120,8 @@ internal sealed class ResticPalServiceClient
             description,
             canRun,
             canCancel,
-            lastAttempt);
+            lastAttempt,
+            managedRevision);
     }
 
     public async Task<ManagementConfiguration> GetManagementAsync(
@@ -643,7 +645,8 @@ internal sealed record ServiceSnapshot(
     string Description,
     bool CanRunBackup,
     bool CanCancelBackup,
-    DateTimeOffset? LastAttempt);
+    DateTimeOffset? LastAttempt,
+    string? ManagedRevision);
 
 internal sealed record CommandResult(bool Accepted, string Message);
 

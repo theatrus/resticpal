@@ -2,5 +2,7 @@
   <Folder Name="/apps/">
     <Project Path="apps/ResticPal.UI/ResticPal.UI.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ResticPal.UI.Logic.Tests/ResticPal.UI.Logic.Tests.csproj" />
+  </Folder>
 </Solution>
-
