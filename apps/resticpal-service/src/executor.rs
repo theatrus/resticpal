@@ -539,6 +539,16 @@ pub(crate) fn validate_backup_source_paths(
     sources: &[PathBuf],
     data_directory: Option<&Path>,
 ) -> Result<(), InvocationError> {
+    let mut protected_paths = data_directory
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    if let Some(data_directory) = data_directory
+        && let Ok(canonical_data_directory) = std::fs::canonicalize(data_directory)
+    {
+        protected_paths.push(ordinary_windows_path(&canonical_data_directory));
+    }
+
     for source in sources {
         if source_is_network_path(source) {
             // A UNC path can refer back to this machine through an administrative
@@ -552,8 +562,21 @@ pub(crate) fn validate_backup_source_paths(
         if source_uses_unsupported_local_namespace(source) {
             return Err(InvocationError::UnsupportedBackupSourceNamespace);
         }
-        if let Ok(canonical_source) = std::fs::canonicalize(source) {
-            let canonical_source = ordinary_windows_path(&canonical_source);
+        let canonical_source = std::fs::canonicalize(source)
+            .ok()
+            .map(|source| ordinary_windows_path(&source));
+        if protected_paths.iter().any(|protected| {
+            windows_path_is_same_or_descendant(source, protected)
+                || canonical_source.as_ref().is_some_and(|canonical_source| {
+                    windows_path_is_same_or_descendant(canonical_source, protected)
+                })
+        }) {
+            // Report the protected-data violation even when the source reached
+            // it through an alias. This is both the more specific diagnosis and
+            // the security boundary the namespace check exists to defend.
+            return Err(InvocationError::ProtectedBackupSource);
+        }
+        if let Some(canonical_source) = canonical_source {
             let equivalent = windows_path_is_same_or_descendant(source, &canonical_source)
                 && windows_path_is_same_or_descendant(&canonical_source, source);
             if !equivalent {
@@ -564,19 +587,6 @@ pub(crate) fn validate_backup_source_paths(
                 // can be bypassed.
                 return Err(InvocationError::UnsupportedBackupSourceNamespace);
             }
-        }
-    }
-    if let Some(data_directory) = data_directory {
-        let mut protected_paths = vec![data_directory.to_path_buf()];
-        if let Ok(canonical_data_directory) = std::fs::canonicalize(data_directory) {
-            protected_paths.push(ordinary_windows_path(&canonical_data_directory));
-        }
-        if sources.iter().any(|source| {
-            protected_paths
-                .iter()
-                .any(|protected| windows_path_is_same_or_descendant(source, protected))
-        }) {
-            return Err(InvocationError::ProtectedBackupSource);
         }
     }
     Ok(())
@@ -2473,8 +2483,14 @@ C:\Missing Source does not exist, skipping
     fn exercise_real_restic_local_repository(use_vss: bool) {
         let restic = real_restic_executable();
         let temporary = tempfile::tempdir().expect("temporary directory");
-        let repository = temporary.path().join("repository");
-        let source = temporary.path().join("source");
+        // Hosted Windows runners can expose TEMP through an 8.3 spelling such
+        // as RUNNER~1. The successful lifecycle must use the ordinary resolved
+        // spelling; alias rejection is exercised separately below.
+        let temporary_root = ordinary_windows_path(
+            &fs::canonicalize(temporary.path()).expect("canonical temporary directory"),
+        );
+        let repository = temporary_root.join("repository");
+        let source = temporary_root.join("source");
         let data_directory = source.join("ProgramData").join("ResticPal");
         let cache_directory = data_directory.join("Cache");
         fs::create_dir(&source).expect("source directory");
