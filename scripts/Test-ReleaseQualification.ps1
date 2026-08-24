@@ -72,7 +72,7 @@ function Copy-TestJsonObject {
 
 function New-TestManifest {
     return [ordered]@{
-        schema = 4
+        schema = 5
         version = '1.0.7'
         tag = 'v1.0.7'
         head_sha = ('e' * 40)
@@ -96,13 +96,13 @@ function New-TestManifest {
             }
             legacy_appcast = [ordered]@{
                 name = 'appcast.xml'
-                length = 966
-                sha256 = '24bf69c40dc2fc81d4c1db1f23d4d44bd43c53ec26b1f9f0457eb48c9b393c87'
+                length = 200
+                sha256 = ('b' * 64)
             }
             legacy_appcast_signature = [ordered]@{
                 name = 'appcast.xml.signature'
-                length = 88
-                sha256 = 'a8c669aec1223ae927920d85509168940d6528d62fe20865a9de765ac9a4e6f2'
+                length = 64
+                sha256 = ('c' * 64)
             }
             checksums = [ordered]@{
                 name = 'SHA256SUMS.txt'
@@ -116,10 +116,10 @@ function New-TestManifest {
             signature = $script:testPackageSignature
             length = 1000
         }
-        frozen_legacy_feed = [ordered]@{
-            version = '1.0.5'
-            appcast_sha256 = '24bf69c40dc2fc81d4c1db1f23d4d44bd43c53ec26b1f9f0457eb48c9b393c87'
-            appcast_signature_sha256 = 'a8c669aec1223ae927920d85509168940d6528d62fe20865a9de765ac9a4e6f2'
+        dual_named_feed = [ordered]@{
+            version = '1.0.7'
+            appcast_sha256 = ('b' * 64)
+            appcast_signature_sha256 = ('c' * 64)
         }
         qualification_files = [ordered]@{
             probe_appcast_v2 = [ordered]@{
@@ -348,6 +348,7 @@ function New-TestOrdinaryScenario {
     $manifest.version = '1.0.8'
     $manifest.tag = 'v1.0.8'
     $manifest.files.msi.name = 'resticpal-1.0.8-x64.msi'
+    $manifest.dual_named_feed.version = '1.0.8'
     $manifest.update_package.version = '1.0.8'
     $manifest.update_package.url =
         'https://updates.resticpal.com/releases/v1.0.8/resticpal-1.0.8-x64.msi'
@@ -883,7 +884,7 @@ try {
         $loaded = Write-AndReadTestEvidence `
             (New-TestEvidence prompted) 'manifest-schema-string.json'
         $manifest = New-TestManifest
-        $manifest.schema = '3'
+        $manifest.schema = '5'
         Assert-UpdateQualificationEvidence `
             -LoadedEvidence $loaded `
             -Manifest $manifest `
@@ -894,9 +895,24 @@ try {
             -PublishedRelease (New-TestPublishedRelease) | Out-Null
     } '*release_manifest.schema must be a non-negative JSON integer*'
 
-    Invoke-FailingTest 'rejects any change to the frozen legacy feed bytes' {
+    Invoke-FailingTest 'rejects the previous manifest schema' {
         $loaded = Write-AndReadTestEvidence `
-            (New-TestEvidence prompted) 'legacy-feed-changed.json'
+            (New-TestEvidence prompted) 'manifest-schema-four.json'
+        $manifest = New-TestManifest
+        $manifest.schema = 4
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.7' `
+            -Tag 'v1.0.7' `
+            -PreviousVersion '1.0.6' `
+            -PublishedRelease (New-TestPublishedRelease) | Out-Null
+    } '*release_manifest.schema must be the integer 5*'
+
+    Invoke-FailingTest 'rejects a legacy appcast hash that differs from v2' {
+        $loaded = Write-AndReadTestEvidence `
+            (New-TestEvidence prompted) 'legacy-appcast-hash-changed.json'
         $manifest = Copy-TestJsonObject (New-TestManifest)
         $manifest.files.legacy_appcast.sha256 = ('0' * 64)
         Assert-UpdateQualificationEvidence `
@@ -907,7 +923,97 @@ try {
             -Tag 'v1.0.7' `
             -PreviousVersion '1.0.6' `
             -PublishedRelease (New-TestPublishedRelease) | Out-Null
-    } '*does not preserve the byte-pinned legacy v1.0.5 feed*'
+    } '*legacy appcast records must be byte-identical to the v2 appcast records*'
+
+    Invoke-FailingTest 'rejects a legacy appcast length that differs from v2' {
+        $loaded = Write-AndReadTestEvidence `
+            (New-TestEvidence prompted) 'legacy-appcast-length-changed.json'
+        $manifest = Copy-TestJsonObject (New-TestManifest)
+        $manifest.files.legacy_appcast.length++
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.7' `
+            -Tag 'v1.0.7' `
+            -PreviousVersion '1.0.6' `
+            -PublishedRelease (New-TestPublishedRelease) | Out-Null
+    } '*legacy appcast records must be byte-identical to the v2 appcast records*'
+
+    Invoke-FailingTest 'rejects a legacy signature hash that differs from v2' {
+        $loaded = Write-AndReadTestEvidence `
+            (New-TestEvidence prompted) 'legacy-signature-hash-changed.json'
+        $manifest = Copy-TestJsonObject (New-TestManifest)
+        $manifest.files.legacy_appcast_signature.sha256 = ('0' * 64)
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.7' `
+            -Tag 'v1.0.7' `
+            -PreviousVersion '1.0.6' `
+            -PublishedRelease (New-TestPublishedRelease) | Out-Null
+    } '*legacy appcast records must be byte-identical to the v2 appcast records*'
+
+    Invoke-FailingTest 'rejects a legacy signature length that differs from v2' {
+        $loaded = Write-AndReadTestEvidence `
+            (New-TestEvidence prompted) 'legacy-signature-length-changed.json'
+        $manifest = Copy-TestJsonObject (New-TestManifest)
+        $manifest.files.legacy_appcast_signature.length++
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.7' `
+            -Tag 'v1.0.7' `
+            -PreviousVersion '1.0.6' `
+            -PublishedRelease (New-TestPublishedRelease) | Out-Null
+    } '*legacy appcast records must be byte-identical to the v2 appcast records*'
+
+    Invoke-FailingTest 'rejects a dual-named feed bound to another version' {
+        $loaded = Write-AndReadTestEvidence `
+            (New-TestEvidence prompted) 'dual-named-version-changed.json'
+        $manifest = Copy-TestJsonObject (New-TestManifest)
+        $manifest.dual_named_feed.version = '1.0.6'
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.7' `
+            -Tag 'v1.0.7' `
+            -PreviousVersion '1.0.6' `
+            -PublishedRelease (New-TestPublishedRelease) | Out-Null
+    } '*dual_named_feed must bind the release version*'
+
+    Invoke-FailingTest 'rejects a dual-named feed with another appcast hash' {
+        $loaded = Write-AndReadTestEvidence `
+            (New-TestEvidence prompted) 'dual-named-appcast-changed.json'
+        $manifest = Copy-TestJsonObject (New-TestManifest)
+        $manifest.dual_named_feed.appcast_sha256 = ('0' * 64)
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.7' `
+            -Tag 'v1.0.7' `
+            -PreviousVersion '1.0.6' `
+            -PublishedRelease (New-TestPublishedRelease) | Out-Null
+    } '*dual_named_feed must bind the release version*'
+
+    Invoke-FailingTest 'rejects a dual-named feed with another signature hash' {
+        $loaded = Write-AndReadTestEvidence `
+            (New-TestEvidence prompted) 'dual-named-signature-changed.json'
+        $manifest = Copy-TestJsonObject (New-TestManifest)
+        $manifest.dual_named_feed.appcast_signature_sha256 = ('0' * 64)
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.7' `
+            -Tag 'v1.0.7' `
+            -PreviousVersion '1.0.6' `
+            -PublishedRelease (New-TestPublishedRelease) | Out-Null
+    } '*dual_named_feed must bind the release version*'
 
     Invoke-FailingTest 'rejects prepared package metadata outside the exact v2 enclosure URL' {
         $loaded = Write-AndReadTestEvidence `

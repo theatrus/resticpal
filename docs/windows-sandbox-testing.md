@@ -43,7 +43,7 @@ Only one automated Sandbox session may be active at a time. The launcher refuses
 
 The ordinary `-UpgradeFromMsiPath` lifecycle proves MSI major-upgrade behavior by invoking the new installer directly. It does not prove that an already-published NetSparkle client preserves the `.msi` extension after a redirected download. Use the dedicated update test for that release-blocking check.
 
-First download the old installer from its published GitHub release and obtain a manually dispatched, Authenticode-signed candidate. Stage the new release before preparing its v2 appcast. Every stage carries the frozen v1.0.5 legacy pair; v1.0.7 deliberately carries no v2 pair, while later stages carry the previous signed v2 pair. This lets the deployment hook populate and verify the direct package mirror without exposing the candidate to either client generation.
+First download the old installer from its published GitHub release and obtain a manually dispatched, Authenticode-signed candidate. Stage the new release before preparing either appcast name. The stage contains only the exact MSI, checksum, license, and notices; it must contain no appcast assets. This lets the deployed legacy hook populate and verify the direct package mirror while leaving the currently live feed untouched.
 
 ```powershell
 New-Item -ItemType Directory -Path artifacts\published\v1.0.6 -Force | Out-Null
@@ -53,8 +53,8 @@ gh release download v1.0.6 `
     --dir artifacts\published\v1.0.6
 
 gh workflow run ci.yml --ref main
-# Wait for the manual run to pass, then stage its signed package assets together
-# with the frozen legacy pair (and previous v2 pair after v1.0.7).
+# Wait for the manual run to pass, then stage only its signed package assets.
+# No appcast or appcast signature is published in this phase.
 .\scripts\Publish-Release.ps1 `
     -RunId <signed-run-id> `
     -ReleaseNotesPath C:\path\to\release-notes.md `
@@ -62,7 +62,8 @@ gh workflow run ci.yml --ref main
 
 # Wait for updates.resticpal.com/releases/v1.0.7/resticpal-1.0.7-x64.msi
 # to return the staged MSI directly with the signed artifact's exact length
-# and SHA-256. Preparation repeats that check before signing the appcast.
+# and SHA-256. Preparation repeats that check before signing the canonical
+# appcast-v2.xml and creating byte-identical appcast.xml aliases.
 .\scripts\Publish-Release.ps1 -RunId <signed-run-id>
 ```
 
@@ -120,7 +121,7 @@ three installed executable versions change to the candidate; the service returns
 as LocalSystem; the automatic setting survives the upgrade; and exactly one
 replacement tray remains in the interactive session.
 
-Results are written under `artifacts\windows-sandbox-update`. Keep both resulting `result.json` files, their `guest.log` files, `test-artifacts\staged-update.json`, origin request logs, and MSI logs with the release evidence. Finalization requires both passing results and binds their hashes plus normalized evidence into the prepared release manifest before uploading either v2 metadata file:
+Results are written under `artifacts\windows-sandbox-update`. Keep both resulting `result.json` files, their `guest.log` files, `test-artifacts\staged-update.json`, origin request logs, and MSI logs with the release evidence. Both the prompted and automatic v1.0.6→v1.0.7 results are release blockers. Finalization binds their hashes plus normalized evidence into the prepared schema-5 manifest before uploading either signed name pair:
 
 ```powershell
 .\scripts\Publish-Release.ps1 `
@@ -131,7 +132,7 @@ Results are written under `artifacts\windows-sandbox-update`. Keep both resultin
     -Finalize
 ```
 
-The Sandbox test does not mutate either public appcast. Until qualification-bound finalization succeeds, the staged GitHub release retains the frozen legacy pair and, after v1.0.7, the previous v2 pair. Finalization adds or replaces only the candidate v2 pair; the legacy v1.0.5 pair is never advanced.
+The Sandbox test does not mutate either public appcast. Until qualification-bound finalization succeeds, the staged GitHub release has no appcast assets and the old live legacy feed remains unchanged. Finalization uploads the final checksum and canonical signed `appcast-v2.xml` pair first, then its byte-identical legacy signature and `appcast.xml` last. That last upload exposes the qualified update through the legacy GitHub fallback; the following release edit makes the deployed hook advance the legacy live feed. The hook does not mirror the v2 name, so new clients temporarily receive the same signed v2 bytes from their GitHub fallback after the primary returns 404.
 
 ## Sandbox connection failures
 

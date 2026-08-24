@@ -130,7 +130,7 @@ foreach ($requiredFeed in @(
 if ($updateTrust.Contains('https://updates.resticpal.com/appcast.xml') -or
     $updateTrust.Contains(
         'https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml')) {
-    throw 'The WinUI updater must not consume the frozen legacy update feed.'
+    throw 'The WinUI updater must not consume the legacy update feed.'
 }
 
 $publishScript = Get-Content -LiteralPath (
@@ -145,25 +145,98 @@ foreach ($releaseSafetyInvariant in @(
     "`$Run.status -cne 'completed' -or `$Run.conclusion -cne 'success'",
     "`$Run.event -ceq 'push' -and `$Run.headBranch -ceq `$tag",
     'release-manifest.json',
-    'schema = 4',
+    'schema = 5',
+    'dual_named_feed = [ordered]@{',
     'Assert-UpdateQualificationPair',
     'Test-UpdateQualificationBindingState',
     'Assert-DirectPackageMirror -Msi $msi',
     'Assert-RemoteTagTarget',
+    'Assert-LatestStableReleaseIsCandidate',
+    'if ([Version]$Version -ne $firstV2Version) {',
+    'This one-time dual-named legacy bridge is restricted to v1.0.7.',
     'Signed Windows CI run $RunId',
-    'Frozen legacy feed v1.0.5',
+    "`$packageAssetNames = @(`$expectedMsiName, 'SHA256SUMS.txt', `$license.Name, `$notices.Name)",
+    '$stageAssetNames = @($packageAssetNames)',
+    '$stageRequiredAssetNames = @($packageAssetNames)',
+    '$finalAssetNames = @($packageAssetNames + $legacyFeedAssetNames + $v2FeedAssetNames)',
+    'Stage must never add, replace, or carry an appcast',
+    'Assert-DualNamedFeed',
+    'Copy-Item -LiteralPath $appCast.FullName -Destination $legacyAppCastPath -Force',
+    '-LiteralPath $appCastSignature.FullName',
+    '-Destination $legacyAppCastSignaturePath',
+    'Signed dual update feed $Version',
+    "if (`$metadata.File.Name -ceq 'appcast.xml')",
+    'This is the irreversible rollout boundary for legacy clients.',
+    'Write-FinalReleaseNotes',
+    '<!-- resticpal-release-deploy:',
+    'releases/download/$tag/SHA256SUMS.txt',
+    'releases/download/$tag/appcast.xml',
+    "-Url 'https://updates.resticpal.com/appcast.xml'",
+    "-Url 'https://updates.resticpal.com/appcast.xml.signature'",
+    "-Url 'https://github.com/theatrus/resticpal/releases/latest/download/appcast-v2.xml'",
+    "-Url 'https://github.com/theatrus/resticpal/releases/latest/download/appcast-v2.xml.signature'",
+    "-Url 'https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml'",
+    "-Url 'https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml.signature'",
+    'Wait-HostedFileMatches',
     'appcast-v2.xml',
-    '$frozenLegacyAppCastSha256',
-    '$frozenLegacyAppCastSignatureSha256',
     'New-UpdateQualificationProbe.ps1',
     "'--notes-file', `$stagedNotes.FullName, '--draft'",
-    "'--draft=false', '--latest'",
+    "'--draft=false', '--title', `"resticpal `$Version`"",
     'Assert-FeedAssetLabels',
     'Assert-FinalizedReleaseAssets'
 )) {
     if (-not $publishScript.Contains($releaseSafetyInvariant)) {
         throw "Publish-Release.ps1 is missing release safety invariant: $releaseSafetyInvariant"
     }
+}
+
+foreach ($obsoleteReleaseFlow in @(
+    'Get-FrozenLegacyFeed',
+    'frozenLegacy',
+    'Frozen legacy feed',
+    'Get-PreviousSignedV2Feed',
+    'carry-forward'
+)) {
+    if ($publishScript.IndexOf(
+            $obsoleteReleaseFlow,
+            [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        throw "Publish-Release.ps1 retains obsolete release flow: $obsoleteReleaseFlow"
+    }
+}
+
+$latestCandidateCheckCount = [Regex]::Matches(
+    $publishScript,
+    '(?m)^\s*Assert-LatestStableReleaseIsCandidate\s*$').Count
+if ($latestCandidateCheckCount -ne 6) {
+    throw ("Publish-Release.ps1 must enforce the actual latest release at six " +
+           "critical call sites; found $latestCandidateCheckCount.")
+}
+$forceLatestCount = [Regex]::Matches(
+    $publishScript,
+    "'--latest'").Count
+if ($forceLatestCount -ne 0) {
+    throw ("Publish-Release.ps1 must never force --latest across a concurrent release; " +
+           "found $forceLatestCount occurrences.")
+}
+
+$orderedUploadTokens = @(
+    '$orderedMetadata = @(',
+    '[pscustomobject]@{ File = $checksumFile; Label = $null }',
+    '[pscustomobject]@{ File = $appCastSignature; Label = $finalFeedLabel }',
+    '[pscustomobject]@{ File = $appCast; Label = $finalFeedLabel }',
+    '[pscustomobject]@{ File = $legacyAppCastSignature; Label = $finalFeedLabel }',
+    '[pscustomobject]@{ File = $legacyAppCast; Label = $finalFeedLabel }'
+)
+$orderedUploadCursor = 0
+foreach ($orderedUploadToken in $orderedUploadTokens) {
+    $orderedUploadIndex = $publishScript.IndexOf(
+        $orderedUploadToken,
+        $orderedUploadCursor,
+        [StringComparison]::Ordinal)
+    if ($orderedUploadIndex -lt 0) {
+        throw "Publish-Release.ps1 does not preserve safe metadata upload order at: $orderedUploadToken"
+    }
+    $orderedUploadCursor = $orderedUploadIndex + $orderedUploadToken.Length
 }
 
 if (-not $publishScript.Contains(

@@ -644,8 +644,8 @@ function Assert-UpdateQualificationEvidence {
     Assert-QualificationJsonObject -Value $Manifest -Path 'release_manifest'
     $manifestSchema = Get-RequiredQualificationUInt64 `
         -InputObject $Manifest -Name schema -Path 'release_manifest'
-    if ($manifestSchema -ne 4) {
-        throw 'release_manifest.schema must be the integer 4.'
+    if ($manifestSchema -ne 5) {
+        throw 'release_manifest.schema must be the integer 5.'
     }
     $manifestVersion = Get-RequiredQualificationString `
         -InputObject $Manifest -Name version -Path 'release_manifest'
@@ -682,29 +682,31 @@ function Assert-UpdateQualificationEvidence {
     Assert-QualificationExactString `
         -Actual $legacySignatureRecord.Name -Expected 'appcast.xml.signature' `
         -Path 'release_manifest.files.legacy_appcast_signature.name'
-    if ($legacyAppcastRecord.Length -ne 966 -or
-        $legacyAppcastRecord.Sha256 -cne '24bf69c40dc2fc81d4c1db1f23d4d44bd43c53ec26b1f9f0457eb48c9b393c87' -or
-        $legacySignatureRecord.Length -ne 88 -or
-        $legacySignatureRecord.Sha256 -cne 'a8c669aec1223ae927920d85509168940d6528d62fe20865a9de765ac9a4e6f2') {
-        throw 'release_manifest.files does not preserve the byte-pinned legacy v1.0.5 feed.'
+    if ($legacyAppcastRecord.Length -ne $appcastRecord.Length -or
+        $legacyAppcastRecord.Sha256 -cne $appcastRecord.Sha256 -or
+        $legacySignatureRecord.Length -ne $signatureRecord.Length -or
+        $legacySignatureRecord.Sha256 -cne $signatureRecord.Sha256) {
+        throw ('release_manifest legacy appcast records must be byte-identical ' +
+               'to the v2 appcast records except for their filenames.')
     }
-    $frozenLegacy = Get-RequiredQualificationProperty `
-        -InputObject $Manifest -Name frozen_legacy_feed -Path 'release_manifest'
+    $dualNamedFeed = Get-RequiredQualificationProperty `
+        -InputObject $Manifest -Name dual_named_feed -Path 'release_manifest'
     Assert-QualificationJsonObject `
-        -Value $frozenLegacy -Path 'release_manifest.frozen_legacy_feed'
-    $frozenLegacyVersion = Get-RequiredQualificationString `
-        -InputObject $frozenLegacy -Name version `
-        -Path 'release_manifest.frozen_legacy_feed'
-    $frozenLegacyAppcastHash = Get-RequiredQualificationHash `
-        -InputObject $frozenLegacy -Name appcast_sha256 `
-        -Path 'release_manifest.frozen_legacy_feed'
-    $frozenLegacySignatureHash = Get-RequiredQualificationHash `
-        -InputObject $frozenLegacy -Name appcast_signature_sha256 `
-        -Path 'release_manifest.frozen_legacy_feed'
-    if ($frozenLegacyVersion -cne '1.0.5' -or
-        $frozenLegacyAppcastHash -cne $legacyAppcastRecord.Sha256 -or
-        $frozenLegacySignatureHash -cne $legacySignatureRecord.Sha256) {
-        throw 'release_manifest.frozen_legacy_feed does not match the byte-pinned legacy file records.'
+        -Value $dualNamedFeed -Path 'release_manifest.dual_named_feed'
+    $dualNamedFeedVersion = Get-RequiredQualificationString `
+        -InputObject $dualNamedFeed -Name version `
+        -Path 'release_manifest.dual_named_feed'
+    $dualNamedFeedAppcastHash = Get-RequiredQualificationHash `
+        -InputObject $dualNamedFeed -Name appcast_sha256 `
+        -Path 'release_manifest.dual_named_feed'
+    $dualNamedFeedSignatureHash = Get-RequiredQualificationHash `
+        -InputObject $dualNamedFeed -Name appcast_signature_sha256 `
+        -Path 'release_manifest.dual_named_feed'
+    if ($dualNamedFeedVersion -cne $Version -or
+        $dualNamedFeedAppcastHash -cne $legacyAppcastRecord.Sha256 -or
+        $dualNamedFeedSignatureHash -cne $legacySignatureRecord.Sha256) {
+        throw ('release_manifest.dual_named_feed must bind the release version ' +
+               'and byte-identical legacy appcast file hashes.')
     }
 
     $updatePackageValue = Get-RequiredQualificationProperty `
