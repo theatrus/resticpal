@@ -145,28 +145,46 @@ foreach ($releaseSafetyInvariant in @(
     "`$Run.status -cne 'completed' -or `$Run.conclusion -cne 'success'",
     "`$Run.event -ceq 'push' -and `$Run.headBranch -ceq `$tag",
     'release-manifest.json',
-    'schema = 5',
-    'dual_named_feed = [ordered]@{',
+    '$bridgeManifestSchema = [uint64]5',
+    'schema = if ($bridgeQualification)',
+    '$steadyStateManifestSchema = [uint64]6',
+    '$frozenLegacyAppCastLength = [uint64]969',
+    "`$frozenLegacyAppCastSha256 = 'eeffa6fc466c0d3f5c95043538742665732a044118286ff94368c163fef7a4e2'",
+    '$frozenLegacySignatureLength = [uint64]88',
+    "`$frozenLegacySignatureSha256 = '85d591ce0a7d936be3da429583737838f3ef075565a483c32dc7faaa6085d377'",
+    '$manifest[''dual_named_feed''] = [ordered]@{',
+    'candidate_v2_feed',
+    'frozen_legacy_feed',
     'Assert-UpdateQualificationPair',
     'Test-UpdateQualificationBindingState',
     'Assert-DirectPackageMirror -Msi $msi',
     'Assert-RemoteTagTarget',
     'Assert-LatestStableReleaseIsCandidate',
-    'if ([Version]$Version -ne $firstV2Version) {',
-    'This one-time dual-named legacy bridge is restricted to v1.0.7.',
+    'if ($parsedReleaseVersion -lt $firstV2Version) {',
+    '$isOneTimeBridgeRelease = ($parsedReleaseVersion -eq $firstV2Version)',
     'Signed Windows CI run $RunId',
     "`$packageAssetNames = @(`$expectedMsiName, 'SHA256SUMS.txt', `$license.Name, `$notices.Name)",
     '$stageAssetNames = @($packageAssetNames)',
     '$stageRequiredAssetNames = @($packageAssetNames)',
+    '$finalizationBaseAssetNames = @($expectedMsiName, $license.Name, $notices.Name)',
     '$finalAssetNames = @($packageAssetNames + $legacyFeedAssetNames + $v2FeedAssetNames)',
+    '$checksumAssets = @($release.assets | Where-Object name -CEQ $checksumFile.Name)',
+    '$checksumAssets.Count -eq 1',
+    '$checksumAssets.Count -eq 0',
+    'uploaded first and required again before either go-live boundary.',
     'Stage must never add, replace, or carry an appcast',
-    'Assert-DualNamedFeed',
+    'Assert-OneTimeBridgeFeed',
+    'Assert-FrozenLegacyFeed',
+    'Get-FrozenLegacyFeed',
     'Copy-Item -LiteralPath $appCast.FullName -Destination $legacyAppCastPath -Force',
     '-LiteralPath $appCastSignature.FullName',
     '-Destination $legacyAppCastSignaturePath',
+    'Signed v2 update feed $Version',
     'Signed dual update feed $Version',
-    "if (`$metadata.File.Name -ceq 'appcast.xml')",
-    'This is the irreversible rollout boundary for legacy clients.',
+    'Frozen legacy update feed $frozenLegacyVersion',
+    "`$metadata.File.Name -ceq 'appcast.xml'",
+    "`$metadata.File.Name -ceq 'appcast-v2.xml'",
+    'candidate v2 XML',
     'Write-StagedReleaseNotes',
     '$stageDeploymentId = [Guid]::NewGuid().ToString(''N'')',
     '<!-- resticpal-stage-deploy: $stageDeploymentId -->',
@@ -174,6 +192,8 @@ foreach ($releaseSafetyInvariant in @(
     '<!-- resticpal-release-deploy:',
     'releases/download/$tag/SHA256SUMS.txt',
     'releases/download/$tag/appcast.xml',
+    "-Url 'https://updates.resticpal.com/appcast-v2.xml'",
+    "-Url 'https://updates.resticpal.com/appcast-v2.xml.signature'",
     "-Url 'https://updates.resticpal.com/appcast.xml'",
     "-Url 'https://updates.resticpal.com/appcast.xml.signature'",
     "-Url 'https://github.com/theatrus/resticpal/releases/latest/download/appcast-v2.xml'",
@@ -210,11 +230,8 @@ foreach ($stageRecoveryInvariant in @(
 }
 
 foreach ($obsoleteReleaseFlow in @(
-    'Get-FrozenLegacyFeed',
-    'frozenLegacy',
-    'Frozen legacy feed',
-    'Get-PreviousSignedV2Feed',
-    'carry-forward'
+    'Assert-DualNamedFeed',
+    'This one-time dual-named legacy bridge is restricted to v1.0.7.'
 )) {
     if ($publishScript.IndexOf(
             $obsoleteReleaseFlow,
@@ -238,24 +255,75 @@ if ($forceLatestCount -ne 0) {
            "found $forceLatestCount occurrences.")
 }
 
-$orderedUploadTokens = @(
-    '$orderedMetadata = @(',
-    '[pscustomobject]@{ File = $checksumFile; Label = $null }',
-    '[pscustomobject]@{ File = $appCastSignature; Label = $finalFeedLabel }',
-    '[pscustomobject]@{ File = $appCast; Label = $finalFeedLabel }',
-    '[pscustomobject]@{ File = $legacyAppCastSignature; Label = $finalFeedLabel }',
-    '[pscustomobject]@{ File = $legacyAppCast; Label = $finalFeedLabel }'
-)
-$orderedUploadCursor = 0
-foreach ($orderedUploadToken in $orderedUploadTokens) {
-    $orderedUploadIndex = $publishScript.IndexOf(
-        $orderedUploadToken,
-        $orderedUploadCursor,
-        [StringComparison]::Ordinal)
-    if ($orderedUploadIndex -lt 0) {
-        throw "Publish-Release.ps1 does not preserve safe metadata upload order at: $orderedUploadToken"
+$checksumRepairBlock = [Regex]::Match(
+    $publishScript,
+    ('(?s)\$checksumAssets = @\(\$release\.assets \| Where-Object name -CEQ ' +
+     '\$checksumFile\.Name\)(?<body>.*?)\r?\n\s*Set-QualificationBindings'))
+if (-not $checksumRepairBlock.Success) {
+    throw 'Publish-Release.ps1 must retain the anchored interrupted-checksum repair preflight.'
+}
+$checksumRepairBody = $checksumRepairBlock.Groups['body'].Value
+foreach ($checksumInvariant in @(
+    '$checksumAssets.Count -eq 1 -and',
+    '-not (Test-RemoteAssetMatches -Release $release -File $stageChecksumFile) -and',
+    '-not (Test-RemoteAssetMatches -Release $release -File $checksumFile)',
+    '$checksumAssets.Count -eq 0',
+    'it will be restored before update metadata advances.'
+)) {
+    if (-not $checksumRepairBody.Contains($checksumInvariant)) {
+        throw "Publish-Release.ps1 checksum repair preflight is missing: $checksumInvariant"
     }
-    $orderedUploadCursor = $orderedUploadIndex + $orderedUploadToken.Length
+}
+$missingChecksumBranch = [Regex]::Match(
+    $checksumRepairBody,
+    '(?s)if \(\$checksumAssets\.Count -eq 0\) \{(?<body>.*?)\r?\n\s*\}')
+if (-not $missingChecksumBranch.Success -or
+    $missingChecksumBranch.Groups['body'].Value.Contains('throw')) {
+    throw 'A missing checksum must remain a non-fatal interrupted --clobber repair state.'
+}
+
+$orderedUploadBlock = [Regex]::Match(
+    $publishScript,
+    ('(?s)\$orderedMetadata = if \(\$isOneTimeBridgeRelease\) \{' +
+     '(?<bridge>.*?)\r?\n\s*\} else \{(?<steady>.*?)\r?\n\s*\}' +
+     '\r?\n\s*foreach \(\$metadata in \$orderedMetadata\)'))
+if (-not $orderedUploadBlock.Success) {
+    throw 'Publish-Release.ps1 must retain one anchored bridge/steady metadata upload block.'
+}
+foreach ($uploadOrder in @(
+    [pscustomobject]@{
+        Name = 'v1.0.7 bridge'
+        Body = $orderedUploadBlock.Groups['bridge'].Value
+        Tokens = @(
+            '[pscustomobject]@{ File = $checksumFile; Label = $null }',
+            '[pscustomobject]@{ File = $appCastSignature; Label = $v2FeedLabel }',
+            '[pscustomobject]@{ File = $appCast; Label = $v2FeedLabel }',
+            '[pscustomobject]@{ File = $legacyAppCastSignature; Label = $legacyFeedLabel }',
+            '[pscustomobject]@{ File = $legacyAppCast; Label = $legacyFeedLabel }')
+    },
+    [pscustomobject]@{
+        Name = 'v1.0.8+ steady-state'
+        Body = $orderedUploadBlock.Groups['steady'].Value
+        Tokens = @(
+            '[pscustomobject]@{ File = $checksumFile; Label = $null }',
+            '[pscustomobject]@{ File = $legacyAppCastSignature; Label = $legacyFeedLabel }',
+            '[pscustomobject]@{ File = $legacyAppCast; Label = $legacyFeedLabel }',
+            '[pscustomobject]@{ File = $appCastSignature; Label = $v2FeedLabel }',
+            '[pscustomobject]@{ File = $appCast; Label = $v2FeedLabel }')
+    }
+)) {
+    $uploadCursor = 0
+    foreach ($token in $uploadOrder.Tokens) {
+        $tokenIndex = $uploadOrder.Body.IndexOf(
+            $token,
+            $uploadCursor,
+            [StringComparison]::Ordinal)
+        if ($tokenIndex -lt 0) {
+            throw ("Publish-Release.ps1 does not preserve the anchored " +
+                   "$($uploadOrder.Name) upload order at: $token")
+        }
+        $uploadCursor = $tokenIndex + $token.Length
+    }
 }
 
 if (-not $publishScript.Contains(
@@ -271,6 +339,13 @@ foreach ($qualificationInvariant in @(
     'previous-published-client-prompted-update',
     'previous-published-client-automatic-update',
     'previous-published-service-automatic-update-bridge',
+    'release_manifest.candidate_v2_feed',
+    'release_manifest.frozen_legacy_feed',
+    'published_release_api must contain exactly one frozen',
+    '$script:FrozenLegacyAppCastLength = [uint64]969',
+    'eeffa6fc466c0d3f5c95043538742665732a044118286ff94368c163fef7a4e2',
+    '$script:FrozenLegacySignatureLength = [uint64]88',
+    '85d591ce0a7d936be3da429583737838f3ef075565a483c32dc7faaa6085d377',
     'qualification-harness-via-published-service-ipc',
     'update_signature_invalid',
     'candidate_tray_probe',

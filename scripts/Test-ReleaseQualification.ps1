@@ -345,10 +345,35 @@ function New-TestEvidence {
 
 function New-TestOrdinaryScenario {
     $manifest = Copy-TestJsonObject (New-TestManifest)
+    $manifest.schema = 6
     $manifest.version = '1.0.8'
     $manifest.tag = 'v1.0.8'
     $manifest.files.msi.name = 'resticpal-1.0.8-x64.msi'
-    $manifest.dual_named_feed.version = '1.0.8'
+    $manifest.files.legacy_appcast.length = $script:FrozenLegacyAppCastLength
+    $manifest.files.legacy_appcast.sha256 = $script:FrozenLegacyAppCastSha256
+    $manifest.files.legacy_appcast_signature.length =
+        $script:FrozenLegacySignatureLength
+    $manifest.files.legacy_appcast_signature.sha256 =
+        $script:FrozenLegacySignatureSha256
+    $manifest.PSObject.Properties.Remove('dual_named_feed')
+    $manifest | Add-Member -NotePropertyName candidate_v2_feed -NotePropertyValue (
+        [pscustomobject]@{
+            version = '1.0.8'
+            appcast_sha256 = ('b' * 64)
+            appcast_signature_sha256 = ('c' * 64)
+        })
+    $manifest | Add-Member -NotePropertyName frozen_legacy_feed -NotePropertyValue (
+        [pscustomobject]@{
+            version = '1.0.7'
+            baseline_tag = 'v1.0.7'
+            baseline_release_url =
+                'https://github.com/theatrus/resticpal/releases/tag/v1.0.7'
+            source_tag = 'v1.0.7'
+            source_release_url =
+                'https://github.com/theatrus/resticpal/releases/tag/v1.0.7'
+            appcast_sha256 = $script:FrozenLegacyAppCastSha256
+            appcast_signature_sha256 = $script:FrozenLegacySignatureSha256
+        })
     $manifest.update_package.version = '1.0.8'
     $manifest.update_package.url =
         'https://updates.resticpal.com/releases/v1.0.8/resticpal-1.0.8-x64.msi'
@@ -356,35 +381,49 @@ function New-TestOrdinaryScenario {
     $manifest.automatic_qualification.strategy = 'published-client-tray'
     $manifest.automatic_qualification.probe = $null
 
-    $evidence = Copy-TestJsonObject (New-TestEvidence automatic)
-    $evidence.schema = 1
-    $evidence.qualification = 'previous-published-client-automatic-update'
-    $evidence.published_version = '1.0.7'
-    $evidence.published_release.tag = 'v1.0.7'
-    $evidence.published_release.asset_name = 'resticpal-1.0.7-x64.msi'
-    $evidence.published_release.asset_url =
-        'https://github.com/theatrus/resticpal/releases/download/v1.0.7/resticpal-1.0.7-x64.msi'
-    $evidence.candidate_version = '1.0.8'
-    $evidence.enclosure_url =
-        'https://updates.resticpal.com/releases/v1.0.8/resticpal-1.0.8-x64.msi'
-    $evidence.staged_update.path =
-        'C:\ProgramData\ResticPal\Updates\resticpal-1.0.8-x64.msi'
-    $evidence.staged_update.file_name = 'resticpal-1.0.8-x64.msi'
-    $evidence.verification.installed_version = '1.0.8'
-    $evidence.verification.installed_ui_file_version = '1.0.8.0'
-    $evidence.verification.installed_service_file_version = '1.0.8.0'
-    $evidence.verification.installed_tray_file_version = '1.0.8.0'
-    $evidence.verification.candidate_installer_command_line =
-        'msiexec.exe /i "C:\ProgramData\ResticPal\Updates\resticpal-1.0.8-x64.msi" /qn /norestart'
-    $evidence.verification.update_dispatcher = 'published-client-tray'
-    $evidence.verification.signed_appcast_fetched_by_published_tray = $true
-    foreach ($name in @(
-            'prepared_signed_appcast_metadata_dispatched_by_qualification_harness',
-            'upgraded_service_protocol_version',
-            'upgraded_tray_protocol_version',
-            'dispatch_bridge',
-            'candidate_tray_probe')) {
-        $evidence.verification.PSObject.Properties.Remove($name)
+    function New-OrdinaryEvidence([string] $Mode) {
+        $automatic = $Mode -ceq 'automatic'
+        $evidence = Copy-TestJsonObject (New-TestEvidence $Mode)
+        $evidence.schema = 1
+        if ($automatic) {
+            $evidence.qualification = 'previous-published-client-automatic-update'
+        }
+        $evidence.published_version = '1.0.7'
+        $evidence.published_release.tag = 'v1.0.7'
+        $evidence.published_release.asset_name = 'resticpal-1.0.7-x64.msi'
+        $evidence.published_release.asset_url =
+            'https://github.com/theatrus/resticpal/releases/download/v1.0.7/resticpal-1.0.7-x64.msi'
+        $evidence.candidate_version = '1.0.8'
+        $evidence.enclosure_url =
+            'https://updates.resticpal.com/releases/v1.0.8/resticpal-1.0.8-x64.msi'
+        $evidence.staged_update.path = if ($automatic) {
+            'C:\ProgramData\ResticPal\Updates\resticpal-1.0.8-x64.msi'
+        } else {
+            'C:\Users\Test\AppData\Local\Temp\NetSparkle\resticpal-1.0.8-x64.msi'
+        }
+        $evidence.staged_update.file_name = 'resticpal-1.0.8-x64.msi'
+        $evidence.verification.installed_version = '1.0.8'
+        $evidence.verification.installed_ui_file_version = '1.0.8.0'
+        $evidence.verification.installed_service_file_version = '1.0.8.0'
+        $evidence.verification.installed_tray_file_version = '1.0.8.0'
+        $evidence.verification.candidate_installer_command_line = if ($automatic) {
+            'msiexec.exe /i "C:\ProgramData\ResticPal\Updates\resticpal-1.0.8-x64.msi" /qn /norestart'
+        } else {
+            'msiexec.exe /i "C:\Users\Test\AppData\Local\Temp\NetSparkle\resticpal-1.0.8-x64.msi"'
+        }
+        if ($automatic) {
+            $evidence.verification.update_dispatcher = 'published-client-tray'
+            $evidence.verification.signed_appcast_fetched_by_published_tray = $true
+        }
+        foreach ($name in @(
+                'prepared_signed_appcast_metadata_dispatched_by_qualification_harness',
+                'upgraded_service_protocol_version',
+                'upgraded_tray_protocol_version',
+                'dispatch_bridge',
+                'candidate_tray_probe')) {
+            $evidence.verification.PSObject.Properties.Remove($name)
+        }
+        return $evidence
     }
 
     $publishedRelease = Copy-TestJsonObject (New-TestPublishedRelease)
@@ -392,10 +431,25 @@ function New-TestOrdinaryScenario {
     $publishedRelease.assets[0].name = 'resticpal-1.0.7-x64.msi'
     $publishedRelease.assets[0].url =
         'https://github.com/theatrus/resticpal/releases/download/v1.0.7/resticpal-1.0.7-x64.msi'
+    $publishedRelease.assets = @(
+        $publishedRelease.assets[0],
+        [pscustomobject]@{
+            name = 'appcast.xml'
+            size = $script:FrozenLegacyAppCastLength
+            digest = ('sha256:' + $script:FrozenLegacyAppCastSha256)
+            url = 'https://github.com/theatrus/resticpal/releases/download/v1.0.7/appcast.xml'
+        },
+        [pscustomobject]@{
+            name = 'appcast.xml.signature'
+            size = $script:FrozenLegacySignatureLength
+            digest = ('sha256:' + $script:FrozenLegacySignatureSha256)
+            url = 'https://github.com/theatrus/resticpal/releases/download/v1.0.7/appcast.xml.signature'
+        })
     $publishedRelease.url = 'https://github.com/theatrus/resticpal/releases/tag/v1.0.7'
     return [pscustomobject]@{
         Manifest = $manifest
-        Evidence = $evidence
+        PromptedEvidence = New-OrdinaryEvidence prompted
+        AutomaticEvidence = New-OrdinaryEvidence automatic
         PublishedRelease = $publishedRelease
     }
 }
@@ -456,33 +510,41 @@ try {
             'The prompted confirmation proof was not bound.'
     }
 
-    Invoke-PassingTest 'requires the ordinary published tray after the one-time bridge' {
+    Invoke-PassingTest 'accepts ordinary v1.0.7 to v1.0.8 prompted and automatic schema-1 updates' {
         $scenario = New-TestOrdinaryScenario
-        $loaded = Write-AndReadTestEvidence `
-            $scenario.Evidence 'ordinary-automatic.json'
-        $binding = Assert-UpdateQualificationEvidence `
-            -LoadedEvidence $loaded `
+        $promptedLoaded = Write-AndReadTestEvidence `
+            $scenario.PromptedEvidence 'ordinary-prompted.json'
+        $automaticLoaded = Write-AndReadTestEvidence `
+            $scenario.AutomaticEvidence 'ordinary-automatic.json'
+        $bindings = Assert-UpdateQualificationPair `
+            -PromptedEvidence $promptedLoaded `
+            -AutomaticEvidence $automaticLoaded `
             -Manifest $scenario.Manifest `
-            -ExpectedInstallationMode automatic `
             -Version '1.0.8' `
             -Tag 'v1.0.8' `
             -PreviousVersion '1.0.7' `
             -PublishedRelease $scenario.PublishedRelease
         Assert-TestEqual `
-            $binding.verification.mode.update_dispatcher `
+            $bindings.prompted.schema ([uint32]1) `
+            'Ordinary prompted qualification did not remain schema 1.'
+        Assert-TestEqual `
+            $bindings.automatic.schema ([uint32]1) `
+            'Ordinary automatic qualification did not remain schema 1.'
+        Assert-TestEqual `
+            $bindings.automatic.verification.mode.update_dispatcher `
             'published-client-tray' `
             'Future automatic qualification did not bind the published tray.'
     }
 
     Invoke-FailingTest 'rejects the one-time service bridge on a future transition' {
         $scenario = New-TestOrdinaryScenario
-        $scenario.Evidence.schema = 2
-        $scenario.Evidence.qualification =
+        $scenario.AutomaticEvidence.schema = 2
+        $scenario.AutomaticEvidence.qualification =
             'previous-published-service-automatic-update-bridge'
-        $scenario.Evidence.verification.update_dispatcher =
+        $scenario.AutomaticEvidence.verification.update_dispatcher =
             'qualification-harness-via-published-service-ipc'
         $loaded = Write-AndReadTestEvidence `
-            $scenario.Evidence 'future-bridge.json'
+            $scenario.AutomaticEvidence 'future-bridge.json'
         Assert-UpdateQualificationEvidence `
             -LoadedEvidence $loaded `
             -Manifest $scenario.Manifest `
@@ -492,6 +554,85 @@ try {
             -PreviousVersion '1.0.7' `
             -PublishedRelease $scenario.PublishedRelease | Out-Null
     } '*evidence.schema must be the integer 1*'
+
+    Invoke-FailingTest 'rejects bridge manifest schema on a steady-state release' {
+        $scenario = New-TestOrdinaryScenario
+        $scenario.Manifest.schema = 5
+        $loaded = Write-AndReadTestEvidence `
+            $scenario.PromptedEvidence 'steady-schema-five.json'
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $scenario.Manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.8' `
+            -Tag 'v1.0.8' `
+            -PreviousVersion '1.0.7' `
+            -PublishedRelease $scenario.PublishedRelease | Out-Null
+    } '*release_manifest.schema must be the integer 6*'
+
+    Invoke-FailingTest 'rejects candidate v2 metadata bound to the frozen legacy hash' {
+        $scenario = New-TestOrdinaryScenario
+        $scenario.Manifest.candidate_v2_feed.appcast_sha256 =
+            $script:FrozenLegacyAppCastSha256
+        $loaded = Write-AndReadTestEvidence `
+            $scenario.PromptedEvidence 'candidate-v2-hash-changed.json'
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $scenario.Manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.8' `
+            -Tag 'v1.0.8' `
+            -PreviousVersion '1.0.7' `
+            -PublishedRelease $scenario.PublishedRelease | Out-Null
+    } '*candidate_v2_feed must bind the candidate version*'
+
+    Invoke-FailingTest 'rejects a self-consistent mutation of the frozen v1.0.7 bytes' {
+        $scenario = New-TestOrdinaryScenario
+        $mutatedHash = ('0' * 64)
+        $scenario.Manifest.files.legacy_appcast.sha256 = $mutatedHash
+        $scenario.Manifest.frozen_legacy_feed.appcast_sha256 = $mutatedHash
+        $scenario.PublishedRelease.assets[1].digest = "sha256:$mutatedHash"
+        $loaded = Write-AndReadTestEvidence `
+            $scenario.PromptedEvidence 'frozen-legacy-pin-mutated.json'
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $scenario.Manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.8' `
+            -Tag 'v1.0.8' `
+            -PreviousVersion '1.0.7' `
+            -PublishedRelease $scenario.PublishedRelease | Out-Null
+    } '*legacy records do not match the immutable v1.0.7 byte pins*'
+
+    Invoke-FailingTest 'rejects frozen legacy bytes not carried by the official previous release' {
+        $scenario = New-TestOrdinaryScenario
+        $scenario.PublishedRelease.assets[1].digest = ('sha256:' + ('0' * 64))
+        $loaded = Write-AndReadTestEvidence `
+            $scenario.PromptedEvidence 'frozen-legacy-official-hash-changed.json'
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $scenario.Manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.8' `
+            -Tag 'v1.0.8' `
+            -PreviousVersion '1.0.7' `
+            -PublishedRelease $scenario.PublishedRelease | Out-Null
+    } '*frozen appcast.xml does not match the official previous GitHub release asset*'
+
+    Invoke-FailingTest 'rejects a frozen legacy binding sourced from another release' {
+        $scenario = New-TestOrdinaryScenario
+        $scenario.Manifest.frozen_legacy_feed.source_tag = 'v1.0.6'
+        $loaded = Write-AndReadTestEvidence `
+            $scenario.PromptedEvidence 'frozen-legacy-source-changed.json'
+        Assert-UpdateQualificationEvidence `
+            -LoadedEvidence $loaded `
+            -Manifest $scenario.Manifest `
+            -ExpectedInstallationMode prompted `
+            -Version '1.0.8' `
+            -Tag 'v1.0.8' `
+            -PreviousVersion '1.0.7' `
+            -PublishedRelease $scenario.PublishedRelease | Out-Null
+    } '*frozen_legacy_feed must bind exact v1.0.7 bytes*'
 
     Invoke-PassingTest 'hashes and parses the same immutable byte snapshot' {
         $path = Join-Path $script:testRoot 'read-once.json'

@@ -73,7 +73,7 @@ All three policy transport paths now have an end-to-end implementation. A one-ti
 - Durable repository validation, scheduler state, and privacy-bounded SQLite run history; exact partial-backup paths stay local and require the elevated UI
 - Per-machine x64 MSI with a LocalSystem backup service, recovery policy, all-users tray and Start Menu integration, bundled restic, and data-preserving uninstall
 - StackFoundry LLC Authenticode signing for release-tag and explicitly dispatched MSI builds
-- Native tray and Settings checks of the detached Ed25519-signed appcast, using `updates.resticpal.com` first and GitHub Releases as a fallback; local or locked server policy can select service-installed, prompt-free signed MSI upgrades
+- Native tray checks of the detached Ed25519-signed appcast at login and every six hours, using `updates.resticpal.com` first and GitHub Releases as a fallback; local or locked server policy can select service-installed, prompt-free signed MSI upgrades
 - Optional companion server for signed manifests, latest-device status, and server-only retention/prune jobs
 
 ## The append-only model
@@ -131,7 +131,7 @@ The Sandbox launcher waits for a machine-readable result and returns the guest t
 
 GitHub Actions runs the same Rust and WinUI validation, then builds, validates, administratively extracts, and smoke-tests an x64 MSI. Ordinary `main` pushes, pull requests, and forks build unsigned; only version-tag pushes and intentional manual runs use Azure Trusted Signing for the executable payload and MSI. The neutral `resticpal-windows-x64` artifact includes SHA-256 checksums. The installed-service Windows Sandbox lifecycle remains a local test because GitHub-hosted runners do not expose the nested Sandbox environment used by the harness.
 
-Product releases start at `1.0.0`; the current source version is `1.0.7`. `Set-Version.ps1` moves the Rust, WinUI, manifest, MSI input, and appcast version together. NetSparkle release metadata is signed locally with the private key backed up outside GitHub, then published beside the signed MSI. See [the signed release guide](docs/releasing.md) for the key boundary and exact commands.
+Product releases start at `1.0.0`; the current source version is `1.0.8`. `Set-Version.ps1` moves the Rust, WinUI, manifest, MSI input, and appcast version together. NetSparkle release metadata is signed locally with the private key backed up outside GitHub, then published beside the signed MSI. See [the signed release guide](docs/releasing.md) for the key boundary and exact commands.
 
 ## For contributors
 
