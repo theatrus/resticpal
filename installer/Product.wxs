@@ -7,12 +7,21 @@
            Scope="perMachine"
            InstallerVersion="500"
            Compressed="yes">
+    <!-- Install/register the candidate before removing the old product. Stable
+         harvested component GUIDs let MSI retain a higher compatible bundled
+         .NET patch from the old package instead of costing the lower candidate
+         files out and then deleting their only copies during early removal. -->
     <MajorUpgrade DowngradeErrorMessage="A newer version of resticpal is already installed."
-                  Schedule="afterInstallInitialize" />
+                  Schedule="afterInstallExecute" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
     <Icon Id="ResticPalIcon.ico" SourceFile="$(BrandIcon)" />
     <Property Id="ARPPRODUCTICON" Value="ResticPalIcon.ico" />
     <Property Id="RESTICPAL_BOOTSTRAP_URL" Hidden="yes" Secure="yes" />
+    <!-- Do not let Restart Manager independently relaunch tray or Settings
+         command lines during a major upgrade. The package closes affected
+         applications, then explicitly launches one tray after InstallFinalize;
+         the tray remains the single interactive restart authority. -->
+    <Property Id="MSIDISABLERMRESTART" Value="1" />
     <util:CloseApplication Id="CloseResticPalTray"
                            Target="resticpal-tray.exe"
                            CloseMessage="yes"
@@ -99,8 +108,7 @@
                  Directory="PROGRAMDATADIR"
                  KeyPath="yes">
         <CreateFolder>
-          <util:PermissionEx User="BUILTIN\Administrators" GenericAll="yes" />
-          <util:PermissionEx User="NT AUTHORITY\SYSTEM" GenericAll="yes" />
+          <PermissionEx Sddl="O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
         </CreateFolder>
       </Component>
 

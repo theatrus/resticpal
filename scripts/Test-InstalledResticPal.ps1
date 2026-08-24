@@ -229,7 +229,7 @@ $installLog = Join-Path $artifactRoot "install-$timestamp.log"
 $baselineInstallLog = Join-Path $artifactRoot "baseline-install-$timestamp.log"
 $uninstallLog = Join-Path $artifactRoot "uninstall-$timestamp.log"
 $script:requestId = 0L
-$protocolVersion = 3
+$protocolVersion = 4
 $installedByTest = $false
 $installedPackagePath = $null
 $onboardingMarkerCreatedByTest = $false
@@ -258,6 +258,41 @@ function Wait-InteractiveProcess([string] $Name, [TimeSpan] $Timeout) {
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for $Name in interactive session $interactiveSessionId."
+}
+
+function Export-SettingsProcessSnapshot([string] $Path) {
+    $processes = @(
+        Get-Process -Name 'resticpal-ui' -ErrorAction SilentlyContinue |
+            Where-Object SessionId -eq $interactiveSessionId |
+            ForEach-Object {
+                $_.Refresh()
+                $cimProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue
+                $imagePath = try { $_.Path } catch { $null }
+                $fileVersion = if (-not [string]::IsNullOrWhiteSpace($imagePath) -and
+                    (Test-Path -LiteralPath $imagePath -PathType Leaf)) {
+                    [Diagnostics.FileVersionInfo]::GetVersionInfo($imagePath).FileVersion
+                } else {
+                    $null
+                }
+                $startTime = try {
+                    $_.StartTime.ToUniversalTime().ToString('O')
+                } catch {
+                    $null
+                }
+                [pscustomobject]@{
+                    process_id = $_.Id
+                    session_id = $_.SessionId
+                    start_time = $startTime
+                    main_window_handle = $_.MainWindowHandle.ToInt64()
+                    main_window_title = $_.MainWindowTitle
+                    image_path = $imagePath
+                    image_file_version = $fileVersion
+                    command_line = $cimProcess.CommandLine
+                    executable_path = $cimProcess.ExecutablePath
+                }
+            }
+    )
+    $processes | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
 function Wait-Path([string] $Path, [TimeSpan] $Timeout) {
@@ -444,7 +479,7 @@ function Invoke-ResticPalRequest([hashtable] $Command) {
 
     $client = [IO.Pipes.NamedPipeClientStream]::new(
         '.',
-        'ResticPal.v3',
+        'ResticPal.v4',
         [IO.Pipes.PipeDirection]::InOut,
         [IO.Pipes.PipeOptions]::None
     )
@@ -612,7 +647,15 @@ try {
     if ($serviceConfiguration.StartMode -ne 'Auto') {
         throw "Unexpected service start mode: $($serviceConfiguration.StartMode)"
     }
-    foreach ($fileName in @('resticpal-service.exe', 'resticpal-tray.exe', 'resticpal-ui.exe', 'restic.exe')) {
+    foreach ($fileName in @(
+        'resticpal-service.exe',
+        'resticpal-tray.exe',
+        'resticpal-ui.exe',
+        'restic.exe',
+        'coreclr.dll',
+        'hostfxr.dll',
+        'hostpolicy.dll'
+    )) {
         if (-not (Test-Path -LiteralPath (Join-Path $installRoot $fileName) -PathType Leaf)) {
             throw "Installed payload is missing $fileName"
         }
@@ -649,14 +692,35 @@ try {
     if ($onboardingUiProcesses.Count -ne 1) {
         throw "Expected one first-run settings process, found $($onboardingUiProcesses.Count)."
     }
+    try {
+        Wait-AutomationElement $uiProcess 'SettingsItem' ([TimeSpan]::FromSeconds(30)) | Out-Null
+    } catch {
+        Export-SettingsProcessSnapshot (Join-Path $artifactRoot 'settings-processes-on-first-launch-failure.json')
+        throw
+    }
+    $mutexProbeCreatedNew = $false
+    $mutexProbe = [Threading.Mutex]::new(
+        $false,
+        'Local\ResticPal.Settings',
+        [ref]$mutexProbeCreatedNew)
+    try {
+        if ($mutexProbeCreatedNew) {
+            throw 'The primary settings process did not retain its single-instance mutex.'
+        }
+    } finally {
+        $mutexProbe.Dispose()
+    }
 
+    $duplicateExitTimer = [Diagnostics.Stopwatch]::StartNew()
     $duplicateUiProcess = Start-Process `
         -FilePath (Join-Path $installRoot 'resticpal-ui.exe') `
         -ArgumentList '--setup' `
         -PassThru
-    if (-not $duplicateUiProcess.WaitForExit(10000)) {
+    if (-not $duplicateUiProcess.WaitForExit(30000)) {
         throw 'A duplicate settings launch did not yield to the existing window.'
     }
+    $duplicateExitTimer.Stop()
+    Write-Host "Duplicate settings process exited after $($duplicateExitTimer.ElapsedMilliseconds) ms."
     $remainingUiProcesses = @(Get-Process -Name 'resticpal-ui' -ErrorAction SilentlyContinue |
         Where-Object SessionId -eq $interactiveSessionId)
     if ($remainingUiProcesses.Count -ne 1 -or $remainingUiProcesses[0].Id -ne $uiProcess.Id) {
@@ -775,8 +839,16 @@ try {
     Write-Host 'The --updates launch opens the signed-update controls in the visible viewport.'
 
     $updateSettings = Invoke-ResticPalRequest @{ type = 'get_update_settings' }
-    if ($updateSettings.type -ne 'update_settings' -or $updateSettings.configuration.automatic_install) {
+    if ($updateSettings.type -ne 'update_settings' `
+        -or $updateSettings.configuration.automatic_install `
+        -or $updateSettings.configuration.automatic_install_locked) {
         throw 'Automatic update installation was not disabled by default.'
+    }
+    Assert-Accepted @{ type = 'update_update_settings'; automatic_install = $true }
+    $updateSettings = Invoke-ResticPalRequest @{ type = 'get_update_settings' }
+    if (-not $updateSettings.configuration.automatic_install `
+        -or $updateSettings.configuration.automatic_install_locked) {
+        throw 'Automatic update installation was not enabled through IPC.'
     }
     $invalidUpdate = Invoke-ResticPalRequest @{
         type = 'install_update'
@@ -789,11 +861,6 @@ try {
     }
     if ($invalidUpdate.type -ne 'rejected' -or $invalidUpdate.code -ne 'update_metadata_invalid') {
         throw 'The service accepted update metadata outside the pinned GitHub release path.'
-    }
-    Assert-Accepted @{ type = 'update_update_settings'; automatic_install = $true }
-    $updateSettings = Invoke-ResticPalRequest @{ type = 'get_update_settings' }
-    if (-not $updateSettings.configuration.automatic_install) {
-        throw 'Automatic update installation was not enabled through IPC.'
     }
 
     New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
@@ -957,7 +1024,8 @@ try {
         throw 'Retention state did not survive the installed service restart.'
     }
     $updatesAfterRestart = Invoke-ResticPalRequest @{ type = 'get_update_settings' }
-    if (-not $updatesAfterRestart.configuration.automatic_install) {
+    if (-not $updatesAfterRestart.configuration.automatic_install `
+        -or $updatesAfterRestart.configuration.automatic_install_locked) {
         throw 'The automatic-update setting did not survive the installed service restart.'
     }
     $testReachedPersistenceCheck = $true

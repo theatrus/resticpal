@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +48,9 @@ pub enum RequestCommand {
     Unenroll,
     GetRunHistory {
         limit: u16,
+    },
+    GetRunFailureDetails {
+        run_id: u64,
     },
     GetDiagnostics {
         limit: u16,
@@ -145,6 +148,9 @@ pub enum ResponsePayload {
     RunHistory {
         runs: Vec<BackupRunRecord>,
     },
+    RunFailureDetails {
+        details: BackupRunFailureDetails,
+    },
     BackupSources {
         configuration: BackupSourcesView,
     },
@@ -182,6 +188,28 @@ pub struct ManagementView {
     pub enrolled: bool,
     pub device_id: Option<String>,
     pub manifest_url: Option<String>,
+}
+
+/// Bounded, sensitive source paths for one local backup run. The service only
+/// returns this payload to an elevated local administrator and never includes
+/// it in diagnostics or managed status reports.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupRunFailureDetails {
+    pub run_id: u64,
+    pub items: Vec<String>,
+    pub omitted: u64,
+}
+
+impl std::fmt::Debug for BackupRunFailureDetails {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackupRunFailureDetails")
+            .field("run_id", &self.run_id)
+            .field("retained", &self.items.len())
+            .field("omitted", &self.omitted)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +319,7 @@ pub struct RetentionView {
 #[serde(deny_unknown_fields)]
 pub struct UpdateSettingsView {
     pub automatic_install: bool,
+    pub automatic_install_locked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +448,7 @@ pub enum FrameError {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::mem::size_of;
 
     use chrono::Utc;
     use resticpal_core::RepositoryMode;
@@ -446,6 +476,61 @@ mod tests {
         let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn sensitive_run_failure_detail_response_round_trips() {
+        let request = Request::new(44, RequestCommand::GetRunFailureDetails { run_id: 72 });
+        let response = Response::new(
+            44,
+            ResponsePayload::RunFailureDetails {
+                details: BackupRunFailureDetails {
+                    run_id: 72,
+                    items: vec![r"C:\Users\Example\locked.txt".to_owned()],
+                    omitted: 3,
+                },
+            },
+        );
+        let mut request_bytes = Vec::new();
+        let mut response_bytes = Vec::new();
+
+        write_frame(&mut request_bytes, &request).expect("request should serialize");
+        write_frame(&mut response_bytes, &response).expect("response should serialize");
+
+        assert_eq!(
+            read_frame::<Request>(Cursor::new(request_bytes)).expect("request should deserialize"),
+            request
+        );
+        assert_eq!(
+            read_frame::<Response>(Cursor::new(response_bytes))
+                .expect("response should deserialize"),
+            response
+        );
+        assert!(!format!("{response:?}").contains(r"C:\Users\Example\locked.txt"));
+    }
+
+    #[test]
+    fn maximum_local_failure_detail_payload_fits_the_protocol_frame() {
+        let response = Response::new(
+            45,
+            ResponsePayload::RunFailureDetails {
+                details: BackupRunFailureDetails {
+                    run_id: 1,
+                    // Backslashes exercise JSON's worst common Windows-path
+                    // escaping expansion.
+                    items: vec![
+                        "\\".repeat(resticpal_core::status::MAX_BACKUP_FAILED_ITEM_BYTES);
+                        resticpal_core::status::MAX_BACKUP_FAILED_ITEMS
+                    ],
+                    omitted: u64::MAX,
+                },
+            },
+        );
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &response).expect("bounded details fit the frame");
+
+        assert!(bytes.len() <= MAX_FRAME_BYTES + size_of::<u32>());
     }
 
     #[test]
@@ -489,6 +574,26 @@ mod tests {
         let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn managed_update_settings_response_round_trips_with_lock_state() {
+        let response = Response::new(
+            47,
+            ResponsePayload::UpdateSettings {
+                configuration: UpdateSettingsView {
+                    automatic_install: true,
+                    automatic_install_locked: true,
+                },
+            },
+        );
+        let mut bytes = Vec::new();
+
+        write_frame(&mut bytes, &response).expect("response should serialize");
+        let decoded: Response =
+            read_frame(Cursor::new(bytes)).expect("response should deserialize");
+
+        assert_eq!(decoded, response);
     }
 
     #[test]

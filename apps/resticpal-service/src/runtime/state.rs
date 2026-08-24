@@ -51,6 +51,10 @@ pub struct ServiceRuntime {
     pub(super) config: RwLock<EffectiveConfig>,
     pub(super) local_config: Mutex<LocalConfig>,
     pub(super) field_resolutions: RwLock<BTreeMap<PolicyField, FieldResolution>>,
+    /// Serializes every local/effective configuration mutation, including
+    /// managed-policy changes. Configuration writers replace whole snapshots,
+    /// so they must not derive and commit candidates concurrently.
+    pub(super) configuration_mutation: Mutex<()>,
     pub(super) config_store: Option<LocalConfigStore>,
     pub(super) credential_store: Option<DpapiSecretStore>,
     pub(super) state: Mutex<RuntimeState>,
@@ -197,6 +201,7 @@ impl ServiceRuntime {
             config: RwLock::new(resolved.effective),
             local_config: Mutex::new(local_config),
             field_resolutions: RwLock::new(resolved.fields),
+            configuration_mutation: Mutex::new(()),
             config_store,
             credential_store,
             state: Mutex::new(RuntimeState {
@@ -236,6 +241,7 @@ impl ServiceRuntime {
             config: RwLock::new(EffectiveConfig::default()),
             local_config: Mutex::new(LocalConfig::default()),
             field_resolutions: RwLock::new(BTreeMap::new()),
+            configuration_mutation: Mutex::new(()),
             config_store: Some(LocalConfigStore::new(path)),
             credential_store,
             state: Mutex::new(RuntimeState {

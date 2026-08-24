@@ -117,7 +117,7 @@ pub struct LocalRetentionConfig {
 pub struct LocalUpdateConfig {
     /// Install strictly signed product updates in the background through the
     /// LocalSystem service. This remains opt-in for existing installations.
-    pub automatic_install: bool,
+    pub automatic_install: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +331,7 @@ pub struct EffectiveConfig {
     pub repository: RepositoryConfig,
     pub schedule: ScheduleConfig,
     pub retention: RetentionConfig,
+    pub updates: UpdateConfig,
 }
 
 impl EffectiveConfig {
@@ -502,6 +503,13 @@ impl Default for RetentionConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// Whether strictly signed product updates may be installed automatically
+    /// by the LocalSystem service. Explicit opt-in remains the product default.
+    pub automatic_install: bool,
+}
+
 fn is_valid_option_name(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -619,6 +627,7 @@ mod tests {
         assert_eq!(config.retention.monthly, 12);
         assert_eq!(config.retention.yearly, 3);
         assert_eq!(config.retention.prune_interval_days, 7);
+        assert!(!config.updates.automatic_install);
     }
 
     #[test]
@@ -760,6 +769,27 @@ mod tests {
         assert_eq!(config.schedule.allow_on_battery, Some(false));
         assert_eq!(config.schedule.interval_hours, None);
         assert_eq!(config.repository.mode, Some(RepositoryMode::AppendOnly));
+        assert_eq!(config.updates.automatic_install, None);
+    }
+
+    #[test]
+    fn parses_existing_local_update_setting_as_an_explicit_override() {
+        let config = LocalConfig::from_toml(
+            r#"
+                schema_version = 1
+
+                [updates]
+                automatic_install = true
+            "#,
+        )
+        .expect("existing configuration should parse");
+
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.updates.automatic_install, Some(true));
+
+        let serialized = config.to_toml_pretty().expect("configuration serializes");
+        assert!(serialized.contains("schema_version = 1"));
+        assert!(serialized.contains("automatic_install = true"));
     }
 
     #[test]

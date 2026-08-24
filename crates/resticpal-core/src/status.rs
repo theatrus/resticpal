@@ -3,6 +3,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::RepositoryMode;
 
+/// Bounds sensitive per-run source detail retained locally. One explicit
+/// detail request therefore remains comfortably below the 1 MiB IPC frame.
+pub const MAX_BACKUP_FAILED_ITEMS: usize = 100;
+pub const MAX_BACKUP_FAILED_ITEM_BYTES: usize = 4 * 1024;
+
+/// Rejects values that could escape a bounded IPC frame or visually spoof
+/// another path when shown in the local UI.
+#[must_use]
+pub fn is_safe_backup_failed_item(item: &str) -> bool {
+    !item.is_empty()
+        && item.len() <= MAX_BACKUP_FAILED_ITEM_BYTES
+        && !item.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{202a}'
+                        | '\u{202b}'
+                        | '\u{202c}'
+                        | '\u{202d}'
+                        | '\u{202e}'
+                        | '\u{2066}'
+                        | '\u{2067}'
+                        | '\u{2068}'
+                        | '\u{2069}'
+                )
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum BackupState {
@@ -90,4 +118,29 @@ pub struct BackupRunRecord {
     pub data_added: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
+    /// Number of source items restic reported it could not read. The paths are
+    /// deliberately excluded from this generally readable history summary and
+    /// are available only through the administrator-authorized detail request.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failed_item_count: u64,
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_failure_items_are_bounded_and_safe_to_display() {
+        assert!(is_safe_backup_failed_item(r"C:\Users\Example\document.txt"));
+        assert!(!is_safe_backup_failed_item(""));
+        assert!(!is_safe_backup_failed_item("line\nbreak"));
+        assert!(!is_safe_backup_failed_item("spoof\u{202e}txt.exe"));
+        assert!(!is_safe_backup_failed_item(
+            &"x".repeat(MAX_BACKUP_FAILED_ITEM_BYTES + 1)
+        ));
+    }
 }

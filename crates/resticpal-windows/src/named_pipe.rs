@@ -12,8 +12,8 @@ use resticpal_protocol::{
 };
 use thiserror::Error;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
-    ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, LocalFree,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_LISTENING, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -32,7 +32,7 @@ use windows::Win32::System::Pipes::{
 };
 use windows::core::{BOOL, Error as WindowsError, HRESULT, PCWSTR, w};
 
-pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\ResticPal.v3";
+pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\ResticPal.v4";
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -155,12 +155,7 @@ impl NamedPipeClient {
             match OpenOptions::new().read(true).write(true).open(name) {
                 Ok(connection) => break connection,
                 Err(error) if Instant::now() < deadline => {
-                    if !matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound
-                            | io::ErrorKind::PermissionDenied
-                            | io::ErrorKind::WouldBlock
-                    ) {
+                    if !pipe_connect_error_is_retryable(&error) {
                         return Err(error.into());
                     }
                     thread::sleep(CONNECT_RETRY_DELAY);
@@ -204,6 +199,16 @@ impl NamedPipeClient {
         let _ = connection.write_all(&[0]);
         Ok(response)
     }
+}
+
+fn pipe_connect_error_is_retryable(error: &io::Error) -> bool {
+    // CreateFile returns ERROR_PIPE_BUSY while the service consumes the
+    // previous response acknowledgement and creates its next pipe instance.
+    // Rust does not classify that Win32 code as WouldBlock.
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+    ) || error.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32)
 }
 
 struct TimedClientConnection {
@@ -569,6 +574,71 @@ mod tests {
                 if error.kind() == io::ErrorKind::TimedOut
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn client_retries_while_the_only_pipe_instance_is_busy() {
+        let pipe_name = format!(
+            r"\\.\pipe\ResticPal.Test.{}.{}",
+            std::process::id(),
+            NEXT_PIPE.fetch_add(1, Ordering::Relaxed)
+        );
+        let server_name = pipe_name.clone();
+        let server = thread::spawn(move || {
+            let server = NamedPipeServer::new(&server_name).expect("server should initialize");
+            for message in ["first request", "second request"] {
+                server
+                    .serve_one(|request, _identity| {
+                        Response::new(
+                            request.request_id,
+                            ResponsePayload::Accepted {
+                                message: message.to_owned(),
+                            },
+                        )
+                    })
+                    .expect("server should handle both requests");
+            }
+        });
+
+        let first_request = Request::new(125, RequestCommand::GetStatus);
+        let mut first_connection = loop {
+            match OpenOptions::new().read(true).write(true).open(&pipe_name) {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    thread::sleep(CONNECT_RETRY_DELAY);
+                }
+                Err(error) => panic!("first client should connect: {error}"),
+            }
+        };
+        write_frame(&mut first_connection, &first_request).expect("first request frame");
+        let first_response: Response =
+            read_frame(&mut first_connection).expect("first response frame");
+        assert_eq!(first_response.request_id, first_request.request_id);
+
+        let busy_error = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pipe_name)
+            .expect_err("the only pipe instance should still be busy");
+        assert_eq!(busy_error.raw_os_error(), Some(ERROR_PIPE_BUSY.0 as i32));
+        assert!(pipe_connect_error_is_retryable(&busy_error));
+
+        let release_first = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(500));
+            first_connection
+                .write_all(&[0])
+                .expect("first response acknowledgement");
+        });
+        let second_request = Request::new(126, RequestCommand::GetStatus);
+        let started = Instant::now();
+        let second_response =
+            NamedPipeClient::request_at(&pipe_name, &second_request, Duration::from_secs(5))
+                .expect("second client should wait for the next pipe instance");
+
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(second_response.request_id, second_request.request_id);
+        release_first.join().expect("first client should finish");
         server.join().expect("server thread should finish");
     }
 

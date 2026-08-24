@@ -6,7 +6,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -14,8 +14,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use resticpal_core::config::{EffectiveConfig, SecretEnvironmentVariable};
-use resticpal_core::restic::{ResticCommandBuilder, ResticInvocation, ResticOperation};
-use resticpal_core::status::BackupProgress;
+use resticpal_core::restic::{
+    InvocationError, ResticCommandBuilder, ResticInvocation, ResticOperation,
+};
+use resticpal_core::status::{BackupProgress, MAX_BACKUP_FAILED_ITEMS, is_safe_backup_failed_item};
 use resticpal_windows::credentials::DpapiSecretStore;
 use serde::Deserialize;
 use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE};
@@ -31,7 +33,9 @@ use zeroize::Zeroizing;
 use crate::power_request::TimedSystemPowerRequest;
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 const REPOSITORY_OPERATION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const STALE_LOCK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_PENDING_PROGRESS_EVENTS: usize = 16;
@@ -145,13 +149,20 @@ impl ResticExecutor {
         cancellation: &CancellationToken,
         on_progress: impl FnMut(BackupProgress),
     ) -> BackupOutcome {
-        let invocation = match ResticCommandBuilder::new(self.executable.as_ref()).backup(config) {
-            Ok(invocation) => invocation,
-            Err(_) => return BackupOutcome::failed("invalid_configuration"),
-        };
+        let (unlock, backup) =
+            match build_backup_invocations(self.executable.as_ref().as_os_str(), config) {
+                Ok(invocations) => invocations,
+                Err(_) => return BackupOutcome::failed("invalid_configuration"),
+            };
+
+        let cleanup =
+            self.execute_repository_invocation(&unlock, STALE_LOCK_CLEANUP_TIMEOUT, cancellation);
+        if let Some(outcome) = backup_outcome_for_lock_cleanup(&cleanup) {
+            return outcome;
+        }
 
         self.execute_invocation(
-            &invocation,
+            &backup,
             Duration::from_secs(config.schedule.wake_lock_timeout_seconds),
             cancellation,
             on_progress,
@@ -269,28 +280,46 @@ impl ResticExecutor {
         };
         let stdout_thread = thread::spawn(move || drain(stdout));
         let stderr_thread = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
+        let mut job = Some(job);
         let started = Instant::now();
         let mut cancelled = false;
         let mut timed_out = false;
+        let mut termination_failed = false;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => {
                     if cancellation.is_cancelled() && !cancelled {
                         cancelled = true;
-                        let _ = job.terminate();
+                        termination_failed = !terminate_process_tree(
+                            job.take().expect("a running child retains its job"),
+                            &mut child,
+                        );
+                        break Err(());
                     } else if started.elapsed() >= timeout && !timed_out {
                         timed_out = true;
-                        let _ = job.terminate();
+                        termination_failed = !terminate_process_tree(
+                            job.take().expect("a running child retains its job"),
+                            &mut child,
+                        );
+                        break Err(());
                     }
                     thread::sleep(PROCESS_POLL_INTERVAL);
                 }
                 Err(_) => {
-                    let _ = job.terminate();
+                    termination_failed = !terminate_process_tree(
+                        job.take().expect("a running child retains its job"),
+                        &mut child,
+                    );
                     break Err(());
                 }
             }
         };
+        if termination_failed {
+            drop(stdout_thread);
+            drop(stderr_thread);
+            return RepositoryOutcome::failed("restic_termination_failed");
+        }
         let _ = stdout_thread.join();
         let stderr = stderr_thread.join().unwrap_or_default();
 
@@ -364,10 +393,13 @@ impl ResticExecutor {
             None => return BackupOutcome::failed("restic_output_unavailable"),
         };
         let (output_tx, output_rx) = mpsc::sync_channel(MAX_PENDING_PROGRESS_EVENTS);
-        let stdout_thread = thread::spawn(move || read_json_output(stdout, &output_tx));
-        let stderr_thread = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
+        let stdout_progress = output_tx.clone();
+        let stdout_thread = thread::spawn(move || read_json_output(stdout, &stdout_progress));
+        let stderr_thread = thread::spawn(move || read_stderr_output(stderr, &output_tx));
 
+        let mut job = Some(job);
         let mut cancelled = false;
+        let mut termination_failed = false;
         let status = loop {
             collect_progress_events(&output_rx, &mut on_progress);
 
@@ -376,19 +408,33 @@ impl ResticExecutor {
                 Ok(None) => {
                     if cancellation.is_cancelled() && !cancelled {
                         cancelled = true;
-                        let _ = job.terminate();
+                        termination_failed = !terminate_process_tree(
+                            job.take().expect("a running child retains its job"),
+                            &mut child,
+                        );
+                        break Err(());
                     }
                     thread::sleep(PROCESS_POLL_INTERVAL);
                 }
                 Err(_) => {
-                    let _ = job.terminate();
+                    termination_failed = !terminate_process_tree(
+                        job.take().expect("a running child retains its job"),
+                        &mut child,
+                    );
                     break Err(());
                 }
             }
         };
 
+        if termination_failed {
+            drop(stdout_thread);
+            drop(stderr_thread);
+            return BackupOutcome::failed("restic_termination_failed");
+        }
         let output_result = stdout_thread.join().unwrap_or(Err(OutputReadError));
-        let stderr = stderr_thread.join().unwrap_or_default();
+        let (stderr_output, stderr) = stderr_thread
+            .join()
+            .unwrap_or_else(|_| (Err(OutputReadError), Vec::new()));
         collect_progress_events(&output_rx, &mut on_progress);
         if cancelled {
             return BackupOutcome::cancelled();
@@ -397,7 +443,7 @@ impl ResticExecutor {
             Ok(status) => status,
             Err(()) => return BackupOutcome::failed("restic_wait_failed"),
         };
-        finish_outcome(status, output_result, &stderr)
+        finish_outcome(status, output_result, stderr_output, &stderr)
     }
 
     fn resolve_secrets(
@@ -412,6 +458,34 @@ impl ResticExecutor {
                     .map(|secret| (*variable, secret))
             })
             .collect()
+    }
+}
+
+/// Constructs the complete preflight-and-backup plan before starting either
+/// process. In particular, an invalid backup source configuration must not
+/// perform even the narrow lock cleanup mutation.
+fn build_backup_invocations(
+    executable: &std::ffi::OsStr,
+    config: &EffectiveConfig,
+) -> Result<(ResticInvocation, ResticInvocation), InvocationError> {
+    let builder = ResticCommandBuilder::new(executable);
+    let backup = builder.backup(config)?;
+    let unlock = builder.unlock(config)?;
+    Ok((unlock, backup))
+}
+
+fn backup_outcome_for_lock_cleanup(cleanup: &RepositoryOutcome) -> Option<BackupOutcome> {
+    match &cleanup.kind {
+        RepositoryOutcomeKind::Succeeded => None,
+        RepositoryOutcomeKind::Cancelled => Some(BackupOutcome::cancelled()),
+        RepositoryOutcomeKind::Failed { code } => {
+            let code = match code.as_str() {
+                "repository_operation_timed_out" => "stale_lock_cleanup_timed_out",
+                "repository_operation_failed" => "stale_lock_cleanup_failed",
+                classified => classified,
+            };
+            Some(BackupOutcome::failed(code))
+        }
     }
 }
 
@@ -454,6 +528,7 @@ pub struct BackupOutcome {
     pub kind: BackupOutcomeKind,
     pub summary: Option<BackupSummary>,
     pub warning_code: Option<String>,
+    pub failure_details: BackupFailureDetails,
 }
 
 impl BackupOutcome {
@@ -462,14 +537,20 @@ impl BackupOutcome {
             kind: BackupOutcomeKind::Succeeded,
             summary: Some(summary),
             warning_code: None,
+            failure_details: BackupFailureDetails::default(),
         }
     }
 
-    pub(crate) fn warnings(summary: BackupSummary, code: impl Into<String>) -> Self {
+    pub(crate) fn warnings(
+        summary: BackupSummary,
+        code: impl Into<String>,
+        failure_details: BackupFailureDetails,
+    ) -> Self {
         Self {
             kind: BackupOutcomeKind::SucceededWithWarnings,
             summary: Some(summary),
             warning_code: Some(code.into()),
+            failure_details,
         }
     }
 
@@ -478,6 +559,7 @@ impl BackupOutcome {
             kind: BackupOutcomeKind::Failed { code: code.into() },
             summary: None,
             warning_code: None,
+            failure_details: BackupFailureDetails::default(),
         }
     }
 
@@ -486,6 +568,7 @@ impl BackupOutcome {
             kind: BackupOutcomeKind::Cancelled,
             summary: None,
             warning_code: None,
+            failure_details: BackupFailureDetails::default(),
         }
     }
 
@@ -498,6 +581,65 @@ impl BackupOutcome {
             self.warning_code = Some(code.into());
         }
         self
+    }
+}
+
+/// Sensitive source names collected from restic's structured per-item errors.
+/// The custom debug representation prevents an incidental outcome log from
+/// copying paths into diagnostics or console output.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct BackupFailureDetails {
+    items: Vec<String>,
+    omitted: u64,
+}
+
+impl BackupFailureDetails {
+    #[cfg(test)]
+    pub(crate) fn from_items(items: Vec<String>, omitted: u64) -> Self {
+        let mut details = Self {
+            items: Vec::new(),
+            omitted,
+        };
+        for item in items {
+            details.push(item);
+        }
+        details
+    }
+
+    pub(crate) fn items(&self) -> &[String] {
+        &self.items
+    }
+
+    pub(crate) const fn omitted(&self) -> u64 {
+        self.omitted
+    }
+
+    fn push(&mut self, item: String) {
+        if self.items.iter().any(|existing| existing == &item) {
+            return;
+        }
+        if !is_safe_backup_failed_item(&item) || self.items.len() >= MAX_BACKUP_FAILED_ITEMS {
+            self.omitted = self.omitted.saturating_add(1);
+            return;
+        }
+        self.items.push(item);
+    }
+
+    fn merge(&mut self, other: Self) {
+        for item in other.items {
+            self.push(item);
+        }
+        self.omitted = self.omitted.saturating_add(other.omitted);
+    }
+}
+
+impl std::fmt::Debug for BackupFailureDetails {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackupFailureDetails")
+            .field("retained", &self.items.len())
+            .field("omitted", &self.omitted)
+            .finish()
     }
 }
 
@@ -580,6 +722,7 @@ pub enum RetentionOutcomeKind {
 fn finish_outcome(
     status: ExitStatus,
     output_result: Result<ParsedOutput, OutputReadError>,
+    stderr_output_result: Result<ParsedOutput, OutputReadError>,
     stderr: &[u8],
 ) -> BackupOutcome {
     if status.code() == Some(130) {
@@ -606,9 +749,13 @@ fn finish_outcome(
             None => BackupOutcome::failed("restic_terminated"),
         };
     };
+    let mut failure_details = parsed.failure_details;
+    if let Ok(stderr_output) = stderr_output_result {
+        failure_details.merge(stderr_output.failure_details);
+    }
     match status.code() {
         Some(0) => BackupOutcome::succeeded(summary),
-        Some(3) => BackupOutcome::warnings(summary, "restic_partial_source"),
+        Some(3) => BackupOutcome::warnings(summary, "restic_partial_source", failure_details),
         Some(code) => BackupOutcome::failed(
             classify_stderr(stderr)
                 .map(str::to_owned)
@@ -673,12 +820,15 @@ fn classify_stderr(stderr: &[u8]) -> Option<&'static str> {
 enum OutputEvent {
     Progress(BackupProgress),
     Summary(BackupSummary),
+    FailureItem(String),
+    FailureItemOmitted,
 }
 
 #[derive(Debug, Default)]
 struct ParsedOutput {
     summary: Option<BackupSummary>,
     invalid_message: bool,
+    failure_details: BackupFailureDetails,
 }
 
 fn collect_progress_events(
@@ -709,11 +859,54 @@ fn read_json_output(
                 let _ = progress.try_send(update);
             }
             Ok(Some(OutputEvent::Summary(summary))) => parsed.summary = Some(summary),
+            Ok(Some(OutputEvent::FailureItem(item))) => parsed.failure_details.push(item),
+            Ok(Some(OutputEvent::FailureItemOmitted)) => {
+                parsed.failure_details.omitted = parsed.failure_details.omitted.saturating_add(1);
+            }
             Ok(None) => {}
             Err(()) => parsed.invalid_message = true,
         }
     }
     Ok(parsed)
+}
+
+fn read_stderr_output(
+    stderr: impl Read,
+    progress: &mpsc::SyncSender<BackupProgress>,
+) -> (Result<ParsedOutput, OutputReadError>, Vec<u8>) {
+    let mut captured = PrefixCapturingReader::new(stderr, MAX_STDERR_BYTES);
+    let parsed = read_json_output(&mut captured, progress);
+    (parsed, captured.into_prefix())
+}
+
+struct PrefixCapturingReader<R> {
+    inner: R,
+    prefix: Vec<u8>,
+    limit: usize,
+}
+
+impl<R> PrefixCapturingReader<R> {
+    fn new(inner: R, limit: usize) -> Self {
+        Self {
+            inner,
+            prefix: Vec::with_capacity(limit.min(8 * 1024)),
+            limit,
+        }
+    }
+
+    fn into_prefix(self) -> Vec<u8> {
+        self.prefix
+    }
+}
+
+impl<R: Read> Read for PrefixCapturingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        let remaining = self.limit.saturating_sub(self.prefix.len());
+        self.prefix
+            .extend_from_slice(&buffer[..read.min(remaining)]);
+        Ok(read)
+    }
 }
 
 fn read_bounded_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<Option<bool>> {
@@ -766,9 +959,14 @@ struct WireMessage {
     data_added: u64,
     #[serde(default)]
     snapshot_id: Option<String>,
+    #[serde(default)]
+    item: Option<String>,
 }
 
 fn parse_output_event(line: &[u8]) -> Result<Option<OutputEvent>, ()> {
+    if let Some(item) = parse_plain_missing_item(line) {
+        return Ok(Some(OutputEvent::FailureItem(item)));
+    }
     let message: WireMessage = serde_json::from_slice(line).map_err(|_| ())?;
     match message.message_type.as_str() {
         "status" => Ok(Some(OutputEvent::Progress(BackupProgress {
@@ -788,8 +986,21 @@ fn parse_output_event(line: &[u8]) -> Result<Option<OutputEvent>, ()> {
             data_added: message.data_added,
             snapshot_id: message.snapshot_id,
         }))),
+        "error" => Ok(Some(match message.item {
+            Some(item) => OutputEvent::FailureItem(item),
+            None => OutputEvent::FailureItemOmitted,
+        })),
         _ => Ok(None),
     }
+}
+
+fn parse_plain_missing_item(line: &[u8]) -> Option<String> {
+    let line = std::str::from_utf8(line)
+        .ok()?
+        .trim_end_matches(['\r', '\n']);
+    line.strip_suffix(" does not exist, skipping")
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
 }
 
 fn drain(mut input: impl Read) {
@@ -838,6 +1049,26 @@ impl KillOnDropJob {
     }
 }
 
+/// Requests termination through the job, then closes the kill-on-close job and
+/// directly terminates the root child as a fallback. The caller may join pipe
+/// readers only after this function confirms that the child was reaped.
+fn terminate_process_tree(job: KillOnDropJob, child: &mut Child) -> bool {
+    let _ = job.terminate();
+    drop(job);
+    let _ = child.kill();
+
+    let deadline = Instant::now() + PROCESS_TERMINATION_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(PROCESS_POLL_INTERVAL);
+            }
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
 impl Drop for KillOnDropJob {
     fn drop(&mut self) {
         // KILL_ON_JOB_CLOSE ensures subprocesses cannot outlive the service.
@@ -855,6 +1086,7 @@ mod tests {
 
     use resticpal_core::config::RepositoryMode;
     use resticpal_core::restic::ResticOperation;
+    use resticpal_core::status::MAX_BACKUP_FAILED_ITEM_BYTES;
 
     use super::*;
 
@@ -922,6 +1154,56 @@ mod tests {
         config.backup.paths = vec![source.to_path_buf()];
         config.schedule.wake_lock_timeout_seconds = 60;
         config
+    }
+
+    fn repository_lock_count(repository: &Path) -> usize {
+        fs::read_dir(repository.join("locks"))
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or_default()
+    }
+
+    fn leave_stale_restic_lock(restic: &Path, repository: &Path, password: &str) {
+        let mut command = Command::new(restic);
+        command
+            .args(["backup", "--stdin", "--stdin-filename", "stale-lock-probe"])
+            .env_clear()
+            .env("RESTIC_REPOSITORY", repository)
+            .env("RESTIC_PASSWORD", password)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW.0);
+        for name in INHERITED_ENVIRONMENT {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let mut child = command.spawn().expect("start stale-lock restic process");
+        let stdin = child.stdin.take().expect("hold restic stdin open");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while repository_lock_count(repository) == 0 {
+            assert!(
+                child
+                    .try_wait()
+                    .expect("query stale-lock process")
+                    .is_none(),
+                "restic exited before acquiring the test lock"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "restic did not create the test lock"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        child.kill().expect("terminate restic without lock cleanup");
+        child.wait().expect("reap terminated restic process");
+        drop(stdin);
+        assert_eq!(
+            repository_lock_count(repository),
+            1,
+            "forced termination must leave exactly one stale lock"
+        );
     }
 
     fn powershell_invocation(script: &str) -> ResticInvocation {
@@ -1041,7 +1323,12 @@ mod tests {
         );
         assert!(parsed.summary.is_some(), "summary still parses");
 
-        let outcome = finish_outcome(ExitStatus::from_raw(0), Ok(parsed), b"");
+        let outcome = finish_outcome(
+            ExitStatus::from_raw(0),
+            Ok(parsed),
+            Ok(ParsedOutput::default()),
+            b"",
+        );
         assert_eq!(outcome.kind, BackupOutcomeKind::Succeeded);
         assert_eq!(
             outcome.summary.expect("summary").snapshot_id.as_deref(),
@@ -1143,7 +1430,7 @@ mod tests {
     #[test]
     fn repository_operation_has_a_hard_timeout() {
         let mut invocation = powershell_invocation("Start-Sleep -Seconds 30");
-        invocation.operation = ResticOperation::Initialize;
+        invocation.operation = ResticOperation::Unlock;
         let runner = executor(BTreeMap::new());
         let started = Instant::now();
 
@@ -1163,9 +1450,95 @@ mod tests {
     }
 
     #[test]
+    fn process_termination_falls_back_to_the_child_when_the_job_handle_is_invalid() {
+        let invocation = powershell_invocation("Start-Sleep -Seconds 30");
+        let mut command = command_for(&invocation, &[]);
+        let mut child = command.spawn().expect("start fallback process");
+        let started = Instant::now();
+
+        assert!(terminate_process_tree(
+            KillOnDropJob {
+                handle: HANDLE::default(),
+            },
+            &mut child,
+        ));
+        assert!(started.elapsed() < PROCESS_TERMINATION_GRACE);
+        assert!(child.try_wait().expect("query reaped child").is_some());
+    }
+
+    #[test]
+    fn stale_lock_cleanup_honors_backup_cancellation() {
+        let mut invocation = powershell_invocation("Start-Sleep -Seconds 30");
+        invocation.operation = ResticOperation::Unlock;
+        let runner = executor(BTreeMap::new());
+        let cancellation = CancellationToken::default();
+        let cancel_from_thread = cancellation.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            cancel_from_thread.cancel();
+        });
+        let started = Instant::now();
+
+        let outcome = runner.execute_repository_invocation(
+            &invocation,
+            Duration::from_secs(10),
+            &cancellation,
+        );
+        canceller.join().expect("canceller should finish");
+
+        assert_eq!(outcome.kind, RepositoryOutcomeKind::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stale_lock_cleanup_failure_blocks_backup_with_bounded_codes() {
+        assert!(
+            backup_outcome_for_lock_cleanup(&RepositoryOutcome {
+                kind: RepositoryOutcomeKind::Succeeded,
+            })
+            .is_none()
+        );
+
+        for (repository_code, expected_backup_code) in [
+            (
+                "repository_operation_timed_out",
+                "stale_lock_cleanup_timed_out",
+            ),
+            ("repository_operation_failed", "stale_lock_cleanup_failed"),
+            (
+                "restic_repository_unreachable",
+                "restic_repository_unreachable",
+            ),
+            ("credential_unavailable", "credential_unavailable"),
+        ] {
+            let outcome = backup_outcome_for_lock_cleanup(&RepositoryOutcome {
+                kind: RepositoryOutcomeKind::Failed {
+                    code: repository_code.to_owned(),
+                },
+            })
+            .expect("cleanup failure must block the backup");
+            assert_eq!(
+                outcome.kind,
+                BackupOutcomeKind::Failed {
+                    code: expected_backup_code.to_owned()
+                }
+            );
+        }
+
+        assert_eq!(
+            backup_outcome_for_lock_cleanup(&RepositoryOutcome {
+                kind: RepositoryOutcomeKind::Cancelled,
+            })
+            .expect("cleanup cancellation must cancel the backup")
+            .kind,
+            BackupOutcomeKind::Cancelled
+        );
+    }
+
+    #[test]
     fn restic_partial_source_exit_is_a_success_with_warnings() {
         let invocation = powershell_invocation(
-            r#"[Console]::Out.WriteLine('{"message_type":"summary","total_files_processed":2,"total_bytes_processed":20,"data_added":7,"snapshot_id":"partial"}'); exit 3"#,
+            r#"[Console]::Error.WriteLine('{"message_type":"error","error":{"message":"Access denied"},"during":"archival","item":"C:\\Users\\Example\\locked.txt"}'); [Console]::Out.WriteLine('{"message_type":"summary","total_files_processed":2,"total_bytes_processed":20,"data_added":7,"snapshot_id":"partial"}'); exit 3"#,
         );
         let runner = executor(BTreeMap::new());
 
@@ -1185,6 +1558,67 @@ mod tests {
             outcome.summary.expect("summary").snapshot_id.as_deref(),
             Some("partial")
         );
+        assert_eq!(
+            outcome.failure_details.items(),
+            [r"C:\Users\Example\locked.txt"]
+        );
+        assert_eq!(outcome.failure_details.omitted(), 0);
+        assert!(
+            !format!("{:?}", outcome.failure_details).contains(r"C:\Users\Example\locked.txt"),
+            "debug output must redact sensitive source paths"
+        );
+    }
+
+    #[test]
+    fn documented_error_and_plain_missing_source_messages_capture_only_bounded_items() {
+        let (progress_tx, _progress_rx) = mpsc::sync_channel(1);
+        let mut stderr = br#"{"message_type":"error","error":{"message":"failed to save a private file"},"during":"archival","item":"C:\\Users\\Example\\private.txt"}
+C:\Missing Source does not exist, skipping
+{"message_type":"error","error":{"message":"source name unavailable"},"during":"archival"}
+"#
+        .to_vec();
+        for index in 0..=MAX_BACKUP_FAILED_ITEMS {
+            stderr.extend_from_slice(
+                format!(
+                    "{{\"message_type\":\"error\",\"during\":\"archival\",\"item\":\"C:\\\\Data\\\\{index}.txt\"}}\n"
+                )
+                .as_bytes(),
+            );
+        }
+        stderr.extend_from_slice(
+            format!(
+                "{{\"message_type\":\"error\",\"item\":\"{}\"}}\n",
+                "x".repeat(MAX_BACKUP_FAILED_ITEM_BYTES + 1)
+            )
+            .as_bytes(),
+        );
+
+        let (parsed, captured) = read_stderr_output(stderr.as_slice(), &progress_tx);
+        let parsed = parsed.expect("stderr is readable");
+
+        assert_eq!(
+            parsed.failure_details.items().len(),
+            MAX_BACKUP_FAILED_ITEMS
+        );
+        assert_eq!(
+            parsed.failure_details.items()[0],
+            r"C:\Users\Example\private.txt"
+        );
+        assert_eq!(parsed.failure_details.items()[1], r"C:\Missing Source");
+        assert_eq!(parsed.failure_details.omitted(), 5);
+        assert_eq!(captured.len(), MAX_STDERR_BYTES.min(stderr.len()));
+    }
+
+    #[test]
+    fn unsafe_failure_item_text_is_omitted_from_local_details() {
+        let mut details = BackupFailureDetails::default();
+        details.push("C:\\Data\\safe.txt".to_owned());
+        details.push("C:\\Data\\safe.txt".to_owned());
+        details.push("C:\\Data\\spoof\u{202e}txt.exe".to_owned());
+        details.push("C:\\Data\\line\nbreak.txt".to_owned());
+
+        assert_eq!(details.items(), [r"C:\Data\safe.txt"]);
+        assert_eq!(details.omitted(), 2);
     }
 
     #[test]
@@ -1246,29 +1680,39 @@ mod tests {
     }
 
     #[test]
-    fn append_only_configuration_still_builds_only_a_backup_operation() {
+    fn append_only_backup_plan_contains_only_stale_unlock_then_backup() {
         let mut config = EffectiveConfig::default();
         config.repository.url = Some("local:C:/backup".to_owned());
         config.repository.mode = RepositoryMode::AppendOnly;
         config.backup.paths = vec![PathBuf::from(r"C:\data")];
 
-        let invocation = ResticCommandBuilder::new("restic.exe")
-            .backup(&config)
-            .expect("append-only permits backup");
+        let executable = OsString::from("restic.exe");
+        let (unlock, backup) = build_backup_invocations(executable.as_os_str(), &config)
+            .expect("append-only backup plan");
 
-        assert_eq!(invocation.operation, ResticOperation::Backup);
+        assert_eq!(unlock.operation, ResticOperation::Unlock);
+        assert_eq!(unlock.arguments, [OsString::from("unlock")]);
         assert!(
-            invocation
+            !unlock
+                .arguments
+                .iter()
+                .any(|argument| argument == OsStr::new("--remove-all"))
+        );
+        assert_eq!(backup.operation, ResticOperation::Backup);
+        assert!(
+            backup
                 .arguments
                 .iter()
                 .any(|argument| argument == OsStr::new("backup"))
         );
-        assert!(!invocation.arguments.iter().any(|argument| {
-            matches!(
-                argument.to_string_lossy().as_ref(),
-                "forget" | "prune" | "rewrite"
-            )
-        }));
+        for invocation in [&unlock, &backup] {
+            assert!(!invocation.arguments.iter().any(|argument| {
+                matches!(
+                    argument.to_string_lossy().as_ref(),
+                    "forget" | "prune" | "rewrite" | "migrate" | "repair" | "key"
+                )
+            }));
+        }
     }
 
     fn execute_real_backup(
@@ -1282,9 +1726,14 @@ mod tests {
             return runner.backup(config, cancellation, |_| {});
         }
 
-        let mut invocation = ResticCommandBuilder::new(restic)
-            .backup(config)
-            .expect("real backup invocation");
+        let (unlock, mut invocation) =
+            build_backup_invocations(restic.as_os_str(), config).expect("real backup invocations");
+        assert_eq!(
+            runner
+                .execute_repository_invocation(&unlock, STALE_LOCK_CLEANUP_TIMEOUT, cancellation,)
+                .kind,
+            RepositoryOutcomeKind::Succeeded
+        );
         let vss_flag = OsStr::new("--use-fs-snapshot");
         let position = invocation
             .arguments
@@ -1350,13 +1799,33 @@ mod tests {
         );
 
         config.repository.mode = RepositoryMode::AppendOnly;
+        leave_stale_restic_lock(&restic, &repository, "correct horse battery staple");
         let first = execute_real_backup(&runner, &restic, &config, &cancellation, use_vss);
         assert_eq!(first.kind, BackupOutcomeKind::Succeeded);
+        assert_eq!(
+            repository_lock_count(&repository),
+            0,
+            "the backup preflight must remove the stale lock and its own lock"
+        );
         let first_summary = first.summary.expect("first backup summary");
         assert!(first_summary.files_processed >= 1);
         assert!(first_summary.bytes_processed >= 14);
         assert!(first_summary.data_added > 0);
         assert!(first_summary.snapshot_id.is_some());
+
+        let missing_source = temporary.path().join("missing-source");
+        config.backup.paths.push(missing_source.clone());
+        let partial = execute_real_backup(&runner, &restic, &config, &cancellation, use_vss);
+        assert_eq!(partial.kind, BackupOutcomeKind::SucceededWithWarnings);
+        assert_eq!(
+            partial.warning_code.as_deref(),
+            Some("restic_partial_source")
+        );
+        assert_eq!(
+            partial.failure_details.items(),
+            [missing_source.to_string_lossy().into_owned()]
+        );
+        config.backup.paths.pop();
 
         let builder = ResticCommandBuilder::new(&restic);
         for operation in [ResticOperation::Snapshots, ResticOperation::Check] {

@@ -4,6 +4,7 @@ param(
     [uint64] $RunId,
     [string] $ReleaseNotesPath,
     [string] $UpdateQualificationPath,
+    [string] $AutomaticUpdateQualificationPath,
     [switch] $Stage,
     [switch] $Finalize,
     [switch] $Publish,
@@ -13,10 +14,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'ReleaseQualification.ps1')
 $repository = 'theatrus/resticpal'
 $workflowName = 'Windows CI'
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'artifacts')).TrimEnd('\')
+$frozenLegacyVersion = '1.0.5'
+$frozenLegacyTag = "v$frozenLegacyVersion"
+$frozenLegacyAppCastSha256 = '24bf69c40dc2fc81d4c1db1f23d4d44bd43c53ec26b1f9f0457eb48c9b393c87'
+$frozenLegacyAppCastSignatureSha256 = 'a8c669aec1223ae927920d85509168940d6528d62fe20865a9de765ac9a4e6f2'
+$firstV2Version = [Version]'1.0.7'
+$invalidProbePackageSignature = [Convert]::ToBase64String([byte[]]::new(64))
 
 if ($Publish) {
     throw '-Publish has been replaced by the safe two-phase flow: use -Stage, then -Finalize.'
@@ -24,8 +32,10 @@ if ($Publish) {
 if ($Stage -and $Finalize) {
     throw '-Stage and -Finalize are mutually exclusive.'
 }
-if (-not $Finalize -and -not [string]::IsNullOrWhiteSpace($UpdateQualificationPath)) {
-    throw '-UpdateQualificationPath is valid only with -Finalize.'
+if (-not $Finalize -and
+    (-not [string]::IsNullOrWhiteSpace($UpdateQualificationPath) -or
+     -not [string]::IsNullOrWhiteSpace($AutomaticUpdateQualificationPath))) {
+    throw '-UpdateQualificationPath and -AutomaticUpdateQualificationPath are valid only with -Finalize.'
 }
 if (($Stage -or $Finalize) -and $PackageHost -ne 'UpdatesHost') {
     throw 'Staged releases must use -PackageHost UpdatesHost so the release hook can mirror a direct MSI before the appcast advances.'
@@ -44,6 +54,9 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 }
 if ($Version -cne $sourceVersion) {
     throw "Requested release $Version does not match the source version $sourceVersion."
+}
+if ([Version]$Version -lt $firstV2Version) {
+    throw 'This release flow supports only v1.0.7 and later releases using the isolated v2 update feed.'
 }
 
 $head = (& git -C $repositoryRoot rev-parse HEAD).Trim()
@@ -417,10 +430,11 @@ function Test-AssetLabel {
 function Assert-FeedAssetLabels {
     param(
         [Parameter(Mandatory)] $Release,
+        [Parameter(Mandatory)] [string[]] $Names,
         [Parameter(Mandatory)] [string] $Label
     )
 
-    foreach ($name in @('appcast.xml', 'appcast.xml.signature')) {
+    foreach ($name in $Names) {
         if (-not (Test-AssetLabel -Release $Release -Name $name -Label $Label)) {
             throw "GitHub release $tag does not label $name as '$Label'."
         }
@@ -552,7 +566,7 @@ function Assert-PreparedAppCast {
     $expectedUrl = "https://updates.resticpal.com/releases/$tag/$($Msi.Name)"
     $invalid = (
         $null -eq $appCastLink -or
-        $appCastLink.InnerText -cne 'https://updates.resticpal.com/appcast.xml' -or
+        $appCastLink.InnerText -cne 'https://updates.resticpal.com/appcast-v2.xml' -or
         $null -eq $enclosure -or
         $enclosure.GetAttribute('url') -cne $expectedUrl -or
         $enclosure.GetAttribute('version', $namespace) -cne $Version -or
@@ -563,6 +577,43 @@ function Assert-PreparedAppCast {
     )
     if ($invalid) {
         throw 'The prepared appcast does not describe the exact direct-host release MSI.'
+    }
+}
+
+function Get-AppCastPackageMetadata {
+    param(
+        [Parameter(Mandatory)] [IO.FileInfo] $AppCast,
+        [Parameter(Mandatory)] [string] $ExpectedVersion
+    )
+
+    [xml] $document = Get-Content -LiteralPath $AppCast.FullName -Raw
+    $namespace = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
+    $enclosures = @($document.SelectNodes('/rss/channel/item/enclosure'))
+    if ($enclosures.Count -ne 1) {
+        throw "$($AppCast.Name) must contain exactly one update enclosure."
+    }
+    $enclosure = $enclosures[0]
+    $version = $enclosure.GetAttribute('version', $namespace)
+    $url = $enclosure.GetAttribute('url')
+    $signature = $enclosure.GetAttribute('signature', $namespace)
+    $lengthText = $enclosure.GetAttribute('length')
+    [uint64] $length = 0
+    if ($version -cne $ExpectedVersion -or
+        [string]::IsNullOrWhiteSpace($url) -or
+        [string]::IsNullOrWhiteSpace($signature) -or
+        -not [uint64]::TryParse(
+            $lengthText,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$length) -or
+        $length -eq 0) {
+        throw "$($AppCast.Name) does not contain complete signed package metadata."
+    }
+    return [ordered]@{
+        version = $version
+        url = $url
+        signature = $signature
+        length = [uint64]$length
     }
 }
 
@@ -579,10 +630,19 @@ function Assert-FinalizedReleaseAssets {
         -Release $Release `
         -AllowedNames $ExpectedAssetNames `
         -RequiredNames $ExpectedAssetNames
+    Assert-FeedAssetLabels `
+        -Release $Release `
+        -Names @('appcast.xml', 'appcast.xml.signature') `
+        -Label 'Frozen legacy feed v1.0.5'
+    Assert-FeedAssetLabels `
+        -Release $Release `
+        -Names @('appcast-v2.xml', 'appcast-v2.xml.signature') `
+        -Label "Signed v2 update feed $Version"
     foreach ($file in @($Msi, $License, $Notices)) {
         Assert-RemoteAssetMatches -Release $Release -File $file
     }
 
+    $frozenLegacyFeed = Get-FrozenLegacyFeed
     $validationRoot = Join-Path $releaseRoot (
         'finalized-validation-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $validationRoot | Out-Null
@@ -592,17 +652,35 @@ function Assert-FinalizedReleaseAssets {
                 'release', 'download', $tag, '--repo', $repository,
                 '--pattern', 'appcast.xml',
                 '--pattern', 'appcast.xml.signature',
+                '--pattern', 'appcast-v2.xml',
+                '--pattern', 'appcast-v2.xml.signature',
                 '--pattern', 'SHA256SUMS.txt',
                 '--dir', $validationRoot
             ) `
             -FailureMessage "Downloading finalized metadata for $tag failed"
 
-        $remoteAppCast = Get-Item -LiteralPath (Join-Path $validationRoot 'appcast.xml')
-        $remoteAppCastSignature = Get-Item -LiteralPath (
+        $remoteLegacyAppCast = Get-Item -LiteralPath (
+            Join-Path $validationRoot 'appcast.xml')
+        $remoteLegacyAppCastSignature = Get-Item -LiteralPath (
             Join-Path $validationRoot 'appcast.xml.signature')
+        $remoteAppCast = Get-Item -LiteralPath (
+            Join-Path $validationRoot 'appcast-v2.xml')
+        $remoteAppCastSignature = Get-Item -LiteralPath (
+            Join-Path $validationRoot 'appcast-v2.xml.signature')
         $remoteChecksums = Get-Item -LiteralPath (Join-Path $validationRoot 'SHA256SUMS.txt')
-        foreach ($file in @($remoteAppCast, $remoteAppCastSignature, $remoteChecksums)) {
+        foreach ($file in @(
+                $remoteLegacyAppCast,
+                $remoteLegacyAppCastSignature,
+                $remoteAppCast,
+                $remoteAppCastSignature,
+                $remoteChecksums)) {
             Assert-RemoteAssetMatches -Release $Release -File $file
+        }
+        if ((Get-FileHash -LiteralPath $remoteLegacyAppCast.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+                $frozenLegacyAppCastSha256 -or
+            (Get-FileHash -LiteralPath $remoteLegacyAppCastSignature.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+                $frozenLegacyAppCastSignatureSha256) {
+            throw 'The finalized release changed the byte-pinned legacy v1.0.5 feed.'
         }
         Assert-PreparedAppCast `
             -Msi $Msi `
@@ -611,7 +689,12 @@ function Assert-FinalizedReleaseAssets {
 
         $expectedChecksumPath = Join-Path $validationRoot 'SHA256SUMS.expected.txt'
         Write-ChecksumFile `
-            -Files @($Msi, $remoteAppCast, $remoteAppCastSignature) `
+            -Files @(
+                $Msi,
+                $remoteLegacyAppCast,
+                $remoteLegacyAppCastSignature,
+                $remoteAppCast,
+                $remoteAppCastSignature) `
             -Path $expectedChecksumPath
         $expectedChecksums = @(
             Get-Content -LiteralPath $expectedChecksumPath | Sort-Object)
@@ -619,7 +702,7 @@ function Assert-FinalizedReleaseAssets {
             Get-Content -LiteralPath $remoteChecksums.FullName | Sort-Object)
         if ($actualChecksums.Count -ne $expectedChecksums.Count -or
             ($actualChecksums -join "`n") -cne ($expectedChecksums -join "`n")) {
-            throw 'The finalized release checksum asset does not match its exact MSI and appcast bytes.'
+            throw 'The finalized release checksum asset does not match its exact MSI and frozen/v2 feed bytes.'
         }
         Assert-DirectPackageMirror -Msi $Msi
     } finally {
@@ -632,7 +715,13 @@ function Write-PreparedManifest {
         [Parameter(Mandatory)] [IO.FileInfo] $Msi,
         [Parameter(Mandatory)] [IO.FileInfo] $AppCast,
         [Parameter(Mandatory)] [IO.FileInfo] $AppCastSignature,
-        [Parameter(Mandatory)] [IO.FileInfo] $Checksums
+        [Parameter(Mandatory)] [IO.FileInfo] $LegacyAppCast,
+        [Parameter(Mandatory)] [IO.FileInfo] $LegacyAppCastSignature,
+        [Parameter(Mandatory)] [IO.FileInfo] $Checksums,
+        [AllowNull()] [IO.FileInfo] $ProbeAppCast,
+        [AllowNull()] [IO.FileInfo] $ProbeAppCastSignature,
+        [AllowNull()] [IO.FileInfo] $ProbePayload,
+        [Parameter(Mandatory)] [string] $PreviousVersion
     )
 
     function FileRecord([IO.FileInfo] $File) {
@@ -643,8 +732,68 @@ function Write-PreparedManifest {
         }
     }
 
+    $package = Get-AppCastPackageMetadata `
+        -AppCast $AppCast `
+        -ExpectedVersion $Version
+    if ($package.length -ne [uint64]$Msi.Length) {
+        throw 'The prepared v2 appcast package length does not match the candidate MSI.'
+    }
+    $bridgeQualification = (
+        $PreviousVersion -ceq '1.0.6' -and $Version -ceq '1.0.7')
+    if ($bridgeQualification -and
+        ($null -eq $ProbeAppCast -or $null -eq $ProbeAppCastSignature -or
+         $null -eq $ProbePayload)) {
+        throw 'The v1.0.6 to v1.0.7 bridge requires an invalid-package candidate-tray probe.'
+    }
+    if (-not $bridgeQualification -and
+        ($null -ne $ProbeAppCast -or $null -ne $ProbeAppCastSignature -or
+         $null -ne $ProbePayload)) {
+        throw 'Candidate-tray probe files are allowed only for the v1.0.6 to v1.0.7 bridge.'
+    }
+
+    $qualificationFiles = $null
+    $automaticQualification = [ordered]@{
+        strategy = if ($bridgeQualification) {
+            'published-service-ipc-bridge-with-candidate-tray-probe'
+        } else {
+            'published-client-tray'
+        }
+        probe = $null
+    }
+    if ($bridgeQualification) {
+        $parsedVersion = [Version]$Version
+        $probeVersion = '{0}.{1}.{2}' -f `
+            $parsedVersion.Major, $parsedVersion.Minor, ($parsedVersion.Build + 1)
+        $probePackage = Get-AppCastPackageMetadata `
+            -AppCast $ProbeAppCast `
+            -ExpectedVersion $probeVersion
+        # The generator advertises the next patch, not the current candidate.
+        if ($probePackage.version -cne $probeVersion -or
+            $probePackage.length -ne [uint64]$ProbePayload.Length -or
+            $probePackage.signature -cne $invalidProbePackageSignature -or
+            [IO.Path]::GetFileName(([Uri]$probePackage.url).AbsolutePath) -cne
+                $ProbePayload.Name) {
+            throw 'The candidate-tray probe appcast does not describe its exact sentinel payload.'
+        }
+        $qualificationFiles = [ordered]@{
+            probe_appcast_v2 = FileRecord $ProbeAppCast
+            probe_appcast_v2_signature = FileRecord $ProbeAppCastSignature
+            probe_payload = FileRecord $ProbePayload
+        }
+        $automaticQualification.probe = [ordered]@{
+            version = $probeVersion
+            appcast_sha256 = $qualificationFiles.probe_appcast_v2.sha256
+            appcast_signature_sha256 = $qualificationFiles.probe_appcast_v2_signature.sha256
+            payload_name = $ProbePayload.Name
+            payload_url = $probePackage.url
+            payload_length = [uint64]$ProbePayload.Length
+            payload_sha256 = $qualificationFiles.probe_payload.sha256
+            expected_signature = $probePackage.signature
+        }
+    }
+
     $manifest = [ordered]@{
-        schema = 2
+        schema = 4
         version = $Version
         tag = $tag
         head_sha = $head
@@ -652,13 +801,26 @@ function Write-PreparedManifest {
         package_host = $PackageHost
         files = [ordered]@{
             msi = FileRecord $Msi
-            appcast = FileRecord $AppCast
-            appcast_signature = FileRecord $AppCastSignature
+            appcast_v2 = FileRecord $AppCast
+            appcast_v2_signature = FileRecord $AppCastSignature
+            legacy_appcast = FileRecord $LegacyAppCast
+            legacy_appcast_signature = FileRecord $LegacyAppCastSignature
             checksums = FileRecord $Checksums
         }
-        qualification = $null
+        update_package = $package
+        frozen_legacy_feed = [ordered]@{
+            version = $frozenLegacyVersion
+            appcast_sha256 = $frozenLegacyAppCastSha256
+            appcast_signature_sha256 = $frozenLegacyAppCastSignatureSha256
+        }
+        qualification_files = $qualificationFiles
+        automatic_qualification = $automaticQualification
+        qualifications = [ordered]@{
+            prompted = $null
+            automatic = $null
+        }
     }
-    $json = $manifest | ConvertTo-Json -Depth 5
+    $json = $manifest | ConvertTo-Json -Depth 10
     [IO.File]::WriteAllText($preparedManifestPath, $json, [Text.UTF8Encoding]::new($false))
 }
 
@@ -703,7 +865,136 @@ function Get-PreviousStableReleaseVersion {
     return $candidates[0].Text
 }
 
-function Get-PreviousSignedFallbackFeed {
+function Assert-ReleaseVersionIsMonotonic {
+    param([AllowEmptyString()] [string] $ExpectedPreviousVersion = '')
+
+    $releaseList = Invoke-GhJson `
+        -Arguments @(
+            'release', 'list', '--repo', $repository, '--limit', '100',
+            '--json', 'tagName,isDraft,isPrerelease'
+        ) `
+        -FailureMessage 'Listing stable GitHub releases for version-order validation failed.'
+    $currentVersion = [Version]$Version
+    $stableReleases = @($releaseList | ForEach-Object {
+        if (-not $_.isDraft -and -not $_.isPrerelease -and
+            $_.tagName -cmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+            $parsed = [Version]$Matches['version']
+            [pscustomobject]@{
+                Tag = [string]$_.tagName
+                Text = [string]$Matches['version']
+                Parsed = $parsed
+            }
+        }
+    })
+    $blockingReleases = @($stableReleases | Where-Object {
+        $_.Parsed -gt $currentVersion -or
+        ($_.Parsed -eq $currentVersion -and $_.Tag -cne $tag)
+    } | Sort-Object Parsed -Descending)
+    if ($blockingReleases.Count -gt 0) {
+        throw ("Release $tag is not newer than every other published stable release. " +
+               "Newest blocking release: $($blockingReleases[0].Tag).")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedPreviousVersion)) {
+        $previousReleases = @($stableReleases | Where-Object {
+            $_.Parsed -lt $currentVersion
+        } | Sort-Object Parsed -Descending)
+        $actualPreviousVersion = if ($previousReleases.Count -eq 0) {
+            '<none>'
+        } else {
+            $previousReleases[0].Text
+        }
+        if ($actualPreviousVersion -cne $ExpectedPreviousVersion) {
+            throw ("The immediately previous stable release changed from " +
+                   "v$ExpectedPreviousVersion to v$actualPreviousVersion during release " +
+                   'processing. Restart preparation and qualify from the new previous client.')
+        }
+    }
+}
+
+function Get-FrozenLegacyFeed {
+    $legacyRelease = Invoke-GhJson `
+        -Arguments @(
+            'release', 'view', $frozenLegacyTag, '--repo', $repository,
+            '--json', 'tagName,isDraft,isPrerelease,assets,url'
+        ) `
+        -FailureMessage "Reading frozen legacy release $frozenLegacyTag failed."
+    if ($legacyRelease.tagName -cne $frozenLegacyTag -or
+        $legacyRelease.isDraft -or $legacyRelease.isPrerelease) {
+        throw "Frozen legacy release $frozenLegacyTag is not a published stable release."
+    }
+
+    $msiName = "resticpal-$frozenLegacyVersion-x64.msi"
+    $msiAssets = @($legacyRelease.assets | Where-Object name -CEQ $msiName)
+    $appCastAssets = @($legacyRelease.assets | Where-Object name -CEQ 'appcast.xml')
+    $signatureAssets = @(
+        $legacyRelease.assets | Where-Object name -CEQ 'appcast.xml.signature')
+    if ($msiAssets.Count -ne 1 -or $appCastAssets.Count -ne 1 -or
+        $signatureAssets.Count -ne 1) {
+        throw "$frozenLegacyTag does not contain one MSI and one legacy appcast pair."
+    }
+    if ($appCastAssets[0].digest -cne "sha256:$frozenLegacyAppCastSha256" -or
+        [uint64]$appCastAssets[0].size -ne 966 -or
+        $signatureAssets[0].digest -cne "sha256:$frozenLegacyAppCastSignatureSha256" -or
+        [uint64]$signatureAssets[0].size -ne 88) {
+        throw 'The frozen v1.0.5 legacy feed assets no longer match their byte-pinned identity.'
+    }
+
+    $legacyRoot = Join-Path $releaseRoot 'frozen-legacy-feed'
+    if (Test-Path -LiteralPath $legacyRoot) {
+        Remove-Item -LiteralPath $legacyRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $legacyRoot | Out-Null
+    Invoke-GhCommand `
+        -Arguments @(
+            'release', 'download', $frozenLegacyTag, '--repo', $repository,
+            '--pattern', 'appcast.xml',
+            '--pattern', 'appcast.xml.signature',
+            '--dir', $legacyRoot
+        ) `
+        -FailureMessage "Downloading frozen legacy feed from $frozenLegacyTag failed"
+    $appCast = Get-Item -LiteralPath (Join-Path $legacyRoot 'appcast.xml')
+    $appCastSignature = Get-Item -LiteralPath (
+        Join-Path $legacyRoot 'appcast.xml.signature')
+    Assert-RemoteAssetMatches -Release $legacyRelease -File $appCast
+    Assert-RemoteAssetMatches -Release $legacyRelease -File $appCastSignature
+    if ((Get-FileHash -LiteralPath $appCast.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+            $frozenLegacyAppCastSha256 -or
+        (Get-FileHash -LiteralPath $appCastSignature.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+            $frozenLegacyAppCastSignatureSha256) {
+        throw 'Downloaded frozen legacy feed bytes do not match their pinned SHA-256 digests.'
+    }
+    Assert-AppCastSignature -AppCast $appCast -AppCastSignature $appCastSignature
+
+    [xml] $document = Get-Content -LiteralPath $appCast.FullName -Raw
+    $namespace = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
+    $appCastLink = $document.SelectSingleNode('/rss/channel/link')
+    $enclosures = @($document.SelectNodes('/rss/channel/item/enclosure'))
+    $enclosure = if ($enclosures.Count -eq 1) { $enclosures[0] } else { $null }
+    $expectedUrl = "https://updates.resticpal.com/releases/$frozenLegacyTag/$msiName"
+    if ($null -eq $appCastLink -or
+        $appCastLink.InnerText -cne 'https://updates.resticpal.com/appcast.xml' -or
+        $null -eq $enclosure -or
+        $enclosure.GetAttribute('url') -cne $expectedUrl -or
+        $enclosure.GetAttribute('version', $namespace) -cne $frozenLegacyVersion -or
+        $enclosure.GetAttribute('shortVersionString', $namespace) -cne $frozenLegacyVersion -or
+        $enclosure.GetAttribute('os', $namespace) -cne 'windows-x64' -or
+        [string]::IsNullOrWhiteSpace($enclosure.GetAttribute('signature', $namespace)) -or
+        [uint64]$enclosure.GetAttribute('length') -ne [uint64]$msiAssets[0].size) {
+        throw 'The frozen legacy feed does not describe the byte-pinned v1.0.5 MSI.'
+    }
+    return [pscustomobject]@{
+        Version = $frozenLegacyVersion
+        AppCast = $appCast
+        AppCastSignature = $appCastSignature
+        AssetLabel = 'Frozen legacy feed v1.0.5'
+    }
+}
+
+function Get-PreviousSignedV2Feed {
+    if ([Version]$Version -eq $firstV2Version) {
+        return $null
+    }
+
     $previousVersion = Get-PreviousStableReleaseVersion
     $previousTag = "v$previousVersion"
     $previousRelease = Invoke-GhJson `
@@ -711,23 +1002,22 @@ function Get-PreviousSignedFallbackFeed {
             'release', 'view', $previousTag, '--repo', $repository,
             '--json', 'tagName,isDraft,isPrerelease,assets,url'
         ) `
-        -FailureMessage "Reading fallback release $previousTag failed."
+        -FailureMessage "Reading previous v2 feed release $previousTag failed."
     if ($previousRelease.tagName -cne $previousTag -or
         $previousRelease.isDraft -or $previousRelease.isPrerelease) {
-        throw "Fallback release $previousTag is not a published stable release."
+        throw "Previous v2 release $previousTag is not a published stable release."
     }
-
     $msiName = "resticpal-$previousVersion-x64.msi"
     $msiAssets = @($previousRelease.assets | Where-Object name -CEQ $msiName)
-    $appCastAssets = @($previousRelease.assets | Where-Object name -CEQ 'appcast.xml')
+    $appCastAssets = @($previousRelease.assets | Where-Object name -CEQ 'appcast-v2.xml')
     $signatureAssets = @(
-        $previousRelease.assets | Where-Object name -CEQ 'appcast.xml.signature')
+        $previousRelease.assets | Where-Object name -CEQ 'appcast-v2.xml.signature')
     if ($msiAssets.Count -ne 1 -or $appCastAssets.Count -ne 1 -or
         $signatureAssets.Count -ne 1) {
-        throw "Fallback release $previousTag does not contain one MSI and one signed appcast pair."
+        throw "$previousTag does not contain one MSI and one signed v2 appcast pair."
     }
 
-    $fallbackRoot = Join-Path $releaseRoot 'fallback-feed'
+    $fallbackRoot = Join-Path $releaseRoot 'previous-v2-feed'
     if (Test-Path -LiteralPath $fallbackRoot) {
         Remove-Item -LiteralPath $fallbackRoot -Recurse -Force
     }
@@ -735,14 +1025,14 @@ function Get-PreviousSignedFallbackFeed {
     Invoke-GhCommand `
         -Arguments @(
             'release', 'download', $previousTag, '--repo', $repository,
-            '--pattern', 'appcast.xml',
-            '--pattern', 'appcast.xml.signature',
+            '--pattern', 'appcast-v2.xml',
+            '--pattern', 'appcast-v2.xml.signature',
             '--dir', $fallbackRoot
         ) `
-        -FailureMessage "Downloading signed fallback feed from $previousTag failed"
-    $appCast = Get-Item -LiteralPath (Join-Path $fallbackRoot 'appcast.xml')
+        -FailureMessage "Downloading previous v2 feed from $previousTag failed"
+    $appCast = Get-Item -LiteralPath (Join-Path $fallbackRoot 'appcast-v2.xml')
     $appCastSignature = Get-Item -LiteralPath (
-        Join-Path $fallbackRoot 'appcast.xml.signature')
+        Join-Path $fallbackRoot 'appcast-v2.xml.signature')
     Assert-RemoteAssetMatches -Release $previousRelease -File $appCast
     Assert-RemoteAssetMatches -Release $previousRelease -File $appCastSignature
     Assert-AppCastSignature -AppCast $appCast -AppCastSignature $appCastSignature
@@ -751,206 +1041,41 @@ function Get-PreviousSignedFallbackFeed {
     $namespace = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
     $appCastLink = $document.SelectSingleNode('/rss/channel/link')
     $enclosures = @($document.SelectNodes('/rss/channel/item/enclosure'))
-    $expectedDirectUrl = (
-        "https://updates.resticpal.com/releases/$previousTag/$msiName")
-    $expectedGitHubUrl = (
-        "https://github.com/theatrus/resticpal/releases/download/$previousTag/$msiName")
     $enclosure = if ($enclosures.Count -eq 1) { $enclosures[0] } else { $null }
-    $invalid = (
-        $null -eq $appCastLink -or
-        $appCastLink.InnerText -cne 'https://updates.resticpal.com/appcast.xml' -or
+    $expectedUrl = "https://updates.resticpal.com/releases/$previousTag/$msiName"
+    if ($null -eq $appCastLink -or
+        $appCastLink.InnerText -cne 'https://updates.resticpal.com/appcast-v2.xml' -or
         $null -eq $enclosure -or
-        ($enclosure.GetAttribute('url') -cne $expectedDirectUrl -and
-         $enclosure.GetAttribute('url') -cne $expectedGitHubUrl) -or
+        $enclosure.GetAttribute('url') -cne $expectedUrl -or
         $enclosure.GetAttribute('version', $namespace) -cne $previousVersion -or
         $enclosure.GetAttribute('shortVersionString', $namespace) -cne $previousVersion -or
         $enclosure.GetAttribute('os', $namespace) -cne 'windows-x64' -or
         [string]::IsNullOrWhiteSpace($enclosure.GetAttribute('signature', $namespace)) -or
-        [uint64]$enclosure.GetAttribute('length') -ne [uint64]$msiAssets[0].size
-    )
-    if ($invalid) {
-        throw "Fallback appcast from $previousTag does not describe its exact published MSI."
+        [uint64]$enclosure.GetAttribute('length') -ne [uint64]$msiAssets[0].size) {
+        throw "Previous v2 appcast from $previousTag does not describe its exact published MSI."
     }
     return [pscustomobject]@{
         Version = $previousVersion
         AppCast = $appCast
         AppCastSignature = $appCastSignature
-        AssetLabel = "Previous signed fallback feed $previousTag"
+        AssetLabel = "Previous signed v2 feed $previousTag"
     }
 }
 
-function Assert-UpdateQualification {
-    param(
-        [Parameter(Mandatory)] $Evidence,
-        [Parameter(Mandatory)] [IO.FileInfo] $EvidenceFile,
-        [Parameter(Mandatory)] $Manifest
-    )
-
-    if ($Evidence.schema -ne 1 -or
-        $Evidence.qualification -cne 'previous-published-client-prompted-update' -or
-        $Evidence.installation_mode -cne 'prompted' -or
-        $Evidence.status -cne 'passed' -or
-        [int]$Evidence.exit_code -ne 0) {
-        throw 'Update qualification must be a successful schema-1 prompted previous-client result.'
-    }
-    if ($Evidence.candidate_version -cne $Version) {
-        throw "Update qualification candidate is $($Evidence.candidate_version), not $Version."
-    }
-    $expectedEnclosureUrl = "https://updates.resticpal.com/releases/$tag/$($Manifest.files.msi.name)"
-    if ($Evidence.enclosure_url -cne $expectedEnclosureUrl) {
-        throw 'Update qualification used a different enclosure URL than the prepared release.'
-    }
-
-    foreach ($hashField in @(
-        [pscustomobject]@{ Label = 'appcast'; Actual = $Evidence.appcast_sha256; Expected = $Manifest.files.appcast.sha256 },
-        [pscustomobject]@{ Label = 'appcast signature'; Actual = $Evidence.appcast_signature_sha256; Expected = $Manifest.files.appcast_signature.sha256 },
-        [pscustomobject]@{ Label = 'candidate MSI'; Actual = $Evidence.verification.candidate_sha256; Expected = $Manifest.files.msi.sha256 }
-    )) {
-        if ([string]$hashField.Actual -cnotmatch '^[0-9a-f]{64}$' -or
-            $hashField.Actual -cne $hashField.Expected) {
-            throw "Update qualification $($hashField.Label) hash does not match release-manifest.json."
-        }
-    }
-
-    $staged = $Evidence.staged_update
-    if ([string]::IsNullOrWhiteSpace([string]$staged.path) -or
-        [IO.Path]::GetExtension([string]$staged.path) -ine '.msi' -or
-        $staged.extension -ine '.msi' -or
-        $staged.file_name -cne [IO.Path]::GetFileName([string]$staged.path)) {
-        throw 'The actual NetSparkle staging path in the qualification result does not end in .msi.'
-    }
-    if ([uint64]$staged.length -ne [uint64]$Manifest.files.msi.length -or
-        $staged.sha256 -cne $Manifest.files.msi.sha256) {
-        throw 'The staged update bytes do not match the prepared signed MSI.'
-    }
-    if ([uint64]$staged.same_length_files_examined -lt 1 -or
-        [uint64]$staged.hash_matches -lt 1) {
-        throw 'The qualification did not record an exact staged-file hash match.'
-    }
-
-    $previousVersion = Get-PreviousStableReleaseVersion
-    if ($Evidence.published_version -cne $previousVersion -or
-        $Evidence.published_release.tag -cne "v$previousVersion") {
-        throw ("Update qualification used $($Evidence.published_version), not the immediately " +
-               "preceding stable release $previousVersion.")
-    }
-    $expectedPublishedAssetName = "resticpal-$previousVersion-x64.msi"
-    $expectedPublishedAssetUrl = (
-        "https://github.com/theatrus/resticpal/releases/download/v$previousVersion/" +
-        $expectedPublishedAssetName)
-    if ($Evidence.published_release.asset_name -cne $expectedPublishedAssetName -or
-        $Evidence.published_release.asset_url -cne $expectedPublishedAssetUrl -or
-        $Evidence.published_release.asset_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        $Evidence.verification.published_sha256 -cne $Evidence.published_release.asset_sha256) {
-        throw 'The qualification does not identify one exact official previous-client MSI.'
-    }
-    $publishedRelease = Invoke-GhJson `
-        -Arguments @(
-            'release', 'view', "v$previousVersion", '--repo', $repository,
-            '--json', 'tagName,isDraft,isPrerelease,assets,url'
-        ) `
-        -FailureMessage "Reading official release v$previousVersion failed."
-    if ($publishedRelease.tagName -cne "v$previousVersion" -or
-        $publishedRelease.isDraft -or $publishedRelease.isPrerelease) {
-        throw "GitHub release v$previousVersion is not the expected published stable client."
-    }
-    $publishedAssets = @(
-        $publishedRelease.assets | Where-Object name -CEQ $expectedPublishedAssetName)
-    if ($publishedAssets.Count -ne 1 -or
-        [uint64]$publishedAssets[0].size -ne [uint64]$Evidence.published_release.asset_length -or
-        $publishedAssets[0].digest -cne ('sha256:' + $Evidence.published_release.asset_sha256) -or
-        $publishedAssets[0].url -cne $expectedPublishedAssetUrl) {
-        throw 'The qualified previous-client MSI does not match the official GitHub release asset.'
-    }
-
-    $verification = $Evidence.verification
-    $expectedFileVersion = "$Version.0"
-    if ($verification.installed_version -cne $Version -or
-        $verification.installed_ui_file_version -cne $expectedFileVersion -or
-        $verification.installed_service_file_version -cne $expectedFileVersion -or
-        $verification.installed_tray_file_version -cne $expectedFileVersion) {
-        throw 'The qualification did not prove that every installed resticpal binary upgraded.'
-    }
-    $baselineServiceProcessId = [uint32]$verification.baseline_service_process_id
-    $upgradedServiceProcessId = [uint32]$verification.upgraded_service_process_id
-    $publishedTrayProcessId = [uint32]$verification.published_tray_process_id
-    $upgradedTrayProcessId = [uint32]$verification.upgraded_tray_process_id
-    if ($baselineServiceProcessId -eq 0 -or $upgradedServiceProcessId -eq 0 -or
-        $baselineServiceProcessId -eq $upgradedServiceProcessId) {
-        throw 'The qualification did not prove that the LocalSystem service restarted.'
-    }
-    if ($publishedTrayProcessId -eq 0 -or $upgradedTrayProcessId -eq 0 -or
-        $publishedTrayProcessId -eq $upgradedTrayProcessId -or
-        $verification.published_tray_exited -isnot [bool] -or
-        -not $verification.published_tray_exited -or
-        [uint32]$verification.tray_process_count -ne 1) {
-        throw 'The qualification did not prove a clean one-process tray restart.'
-    }
-    if ($verification.service_identity -cne 'LocalSystem' -or
-        $verification.service_state -cne 'Running') {
-        throw 'The qualified service is not running as LocalSystem after the update.'
-    }
-
-    $evidenceHash = (Get-FileHash -LiteralPath $EvidenceFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    return [ordered]@{
-        schema = 1
-        result_file = $EvidenceFile.Name
-        result_length = [uint64]$EvidenceFile.Length
-        result_sha256 = $evidenceHash
-        qualification = $Evidence.qualification
-        installation_mode = $Evidence.installation_mode
-        published_release = [ordered]@{
-            tag = $Evidence.published_release.tag
-            asset_name = $Evidence.published_release.asset_name
-            asset_length = [uint64]$Evidence.published_release.asset_length
-            asset_sha256 = $Evidence.published_release.asset_sha256
-            asset_url = $Evidence.published_release.asset_url
-        }
-        appcast_sha256 = $Evidence.appcast_sha256
-        appcast_signature_sha256 = $Evidence.appcast_signature_sha256
-        staged_update = [ordered]@{
-            path = $staged.path
-            extension = $staged.extension
-            length = [uint64]$staged.length
-            sha256 = $staged.sha256
-            same_length_files_examined = [uint64]$staged.same_length_files_examined
-            hash_matches = [uint64]$staged.hash_matches
-        }
-        verification = [ordered]@{
-            candidate_sha256 = $verification.candidate_sha256
-            baseline_service_process_id = $baselineServiceProcessId
-            upgraded_service_process_id = $upgradedServiceProcessId
-            published_tray_process_id = $publishedTrayProcessId
-            upgraded_tray_process_id = $upgradedTrayProcessId
-            published_tray_exited = [bool]$verification.published_tray_exited
-            tray_process_count = [uint32]$verification.tray_process_count
-            installed_version = $verification.installed_version
-            installed_ui_file_version = $verification.installed_ui_file_version
-            installed_service_file_version = $verification.installed_service_file_version
-            installed_tray_file_version = $verification.installed_tray_file_version
-            service_identity = $verification.service_identity
-            service_state = $verification.service_state
-        }
-    }
-}
-
-function Set-QualificationBinding {
+function Set-QualificationBindings {
     param(
         [Parameter(Mandatory)] $Manifest,
-        [Parameter(Mandatory)] $Binding
+        [Parameter(Mandatory)] $Bindings
     )
 
-    if ($null -ne $Manifest.qualification) {
-        $existing = $Manifest.qualification | ConvertTo-Json -Depth 8 -Compress
-        $requested = $Binding | ConvertTo-Json -Depth 8 -Compress
-        if ($existing -cne $requested) {
-            throw 'release-manifest.json is already bound to different update qualification evidence.'
-        }
+    if (Test-UpdateQualificationBindingState `
+            -Manifest $Manifest `
+            -RequestedBindings $Bindings) {
         return
     }
-    $Manifest.qualification = $Binding
+    $Manifest.qualifications = $Bindings
     $temporaryPath = "$preparedManifestPath.tmp"
-    $json = $Manifest | ConvertTo-Json -Depth 10
+    $json = $Manifest | ConvertTo-Json -Depth 14
     [IO.File]::WriteAllText($temporaryPath, $json, [Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath $temporaryPath -Destination $preparedManifestPath -Force
 }
@@ -968,23 +1093,36 @@ if ($Stage -or $Finalize) {
 
 $qualificationFile = $null
 $qualificationEvidence = $null
+$automaticQualificationFile = $null
+$automaticQualificationEvidence = $null
 if ($Finalize) {
     if ([string]::IsNullOrWhiteSpace($UpdateQualificationPath)) {
-        throw '-UpdateQualificationPath is required with -Finalize.'
+        throw '-UpdateQualificationPath (prompted mode) is required with -Finalize.'
+    }
+    if ([string]::IsNullOrWhiteSpace($AutomaticUpdateQualificationPath)) {
+        throw '-AutomaticUpdateQualificationPath is required with -Finalize.'
     }
     $qualificationFile = Get-Item -LiteralPath (
         Resolve-Path -LiteralPath $UpdateQualificationPath).Path
-    if ($qualificationFile.FullName.StartsWith(
-            $releaseRoot + '\',
+    $automaticQualificationFile = Get-Item -LiteralPath (
+        Resolve-Path -LiteralPath $AutomaticUpdateQualificationPath).Path
+    foreach ($evidenceFile in @($qualificationFile, $automaticQualificationFile)) {
+        if ($evidenceFile.FullName.StartsWith(
+                $releaseRoot + '\',
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Update qualification evidence must remain outside the replaceable release directory.'
+        }
+    }
+    if ([string]::Equals(
+            $qualificationFile.FullName,
+            $automaticQualificationFile.FullName,
             [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Update qualification evidence must remain outside the replaceable release directory.'
+        throw 'Prompted and automatic update qualification must be separate result files.'
     }
-    try {
-        $qualificationEvidence = Get-Content -LiteralPath $qualificationFile.FullName -Raw |
-            ConvertFrom-Json
-    } catch {
-        throw "Update qualification evidence is not valid JSON: $($_.Exception.Message)"
-    }
+    $qualificationEvidence = Read-UpdateQualificationEvidence `
+        -LiteralPath $qualificationFile.FullName
+    $automaticQualificationEvidence = Read-UpdateQualificationEvidence `
+        -LiteralPath $automaticQualificationFile.FullName
 }
 
 $preparedManifest = $null
@@ -993,7 +1131,7 @@ if ($Finalize) {
         throw "Prepared release manifest is missing: $preparedManifestPath. Run Publish-Release.ps1 without -Stage or -Finalize after the direct MSI mirror is live."
     }
     $preparedManifest = Get-Content -LiteralPath $preparedManifestPath -Raw | ConvertFrom-Json
-    if ($preparedManifest.schema -ne 2 -or
+    if ($preparedManifest.schema -ne 4 -or
         $preparedManifest.version -cne $Version -or
         $preparedManifest.tag -cne $tag -or
         $preparedManifest.head_sha -cne $head -or
@@ -1047,15 +1185,29 @@ Assert-SignedRun -Run $run
 if ($Stage -or $Finalize) {
     Assert-ReleaseSource
 }
+if ($Stage -or $Finalize) {
+    # This check runs before release creation, upload, or edit. The exact current
+    # tag remains eligible for interrupted-stage recovery, but no older checkout
+    # may make itself latest while a higher stable version already exists.
+    Assert-ReleaseVersionIsMonotonic
+}
 
 $license = Get-Item -LiteralPath (Join-Path $repositoryRoot 'LICENSE')
 $notices = Get-Item -LiteralPath (Join-Path $repositoryRoot 'THIRD-PARTY-NOTICES.md')
 $expectedMsiName = "resticpal-$Version-x64.msi"
 $stageCoreAssetNames = @($expectedMsiName, $license.Name, $notices.Name)
 $packageAssetNames = @($expectedMsiName, 'SHA256SUMS.txt', $license.Name, $notices.Name)
-$stageAssetNames = @($packageAssetNames + @('appcast.xml', 'appcast.xml.signature'))
-$finalAssetNames = @($stageAssetNames)
-$finalFeedLabel = "Signed update feed $Version"
+$legacyFeedAssetNames = @('appcast.xml', 'appcast.xml.signature')
+$v2FeedAssetNames = @('appcast-v2.xml', 'appcast-v2.xml.signature')
+$stageAssetNames = @($packageAssetNames + $legacyFeedAssetNames + $v2FeedAssetNames)
+$stageRequiredAssetNames = @($packageAssetNames + $legacyFeedAssetNames)
+if ([Version]$Version -gt $firstV2Version) {
+    $stageRequiredAssetNames += $v2FeedAssetNames
+}
+$finalAssetNames = @($packageAssetNames + $legacyFeedAssetNames + $v2FeedAssetNames)
+$finalizationBaseAssetNames = @($packageAssetNames + $legacyFeedAssetNames)
+$frozenLegacyFeedLabel = 'Frozen legacy feed v1.0.5'
+$finalFeedLabel = "Signed v2 update feed $Version"
 
 if ($Finalize) {
     $downloadRoot = Join-Path $releaseRoot 'ci-artifact'
@@ -1064,28 +1216,53 @@ if ($Finalize) {
         throw "Prepared release must contain exactly one CI MSI; found $($msiFiles.Count)."
     }
     $msi = $msiFiles[0]
-    $appCast = Get-Item -LiteralPath (Join-Path $releaseRoot 'feed\appcast.xml')
-    $appCastSignature = Get-Item -LiteralPath (Join-Path $releaseRoot 'feed\appcast.xml.signature')
+    $appCast = Get-Item -LiteralPath (Join-Path $releaseRoot 'feed\appcast-v2.xml')
+    $appCastSignature = Get-Item -LiteralPath (
+        Join-Path $releaseRoot 'feed\appcast-v2.xml.signature')
+    $frozenLegacyFeed = Get-FrozenLegacyFeed
+    $legacyAppCast = $frozenLegacyFeed.AppCast
+    $legacyAppCastSignature = $frozenLegacyFeed.AppCastSignature
     $checksumFile = Get-Item -LiteralPath (Join-Path $releaseRoot 'SHA256SUMS.txt')
 
     Assert-ReleaseMsi -Msi $msi
     Assert-PreparedFileRecord -Record $preparedManifest.files.msi -File $msi -Label 'MSI'
-    Assert-PreparedFileRecord -Record $preparedManifest.files.appcast -File $appCast -Label 'appcast'
-    Assert-PreparedFileRecord -Record $preparedManifest.files.appcast_signature -File $appCastSignature -Label 'appcast signature'
+    Assert-PreparedFileRecord -Record $preparedManifest.files.appcast_v2 -File $appCast -Label 'v2 appcast'
+    Assert-PreparedFileRecord -Record $preparedManifest.files.appcast_v2_signature -File $appCastSignature -Label 'v2 appcast signature'
+    Assert-PreparedFileRecord -Record $preparedManifest.files.legacy_appcast -File $legacyAppCast -Label 'frozen legacy appcast'
+    Assert-PreparedFileRecord -Record $preparedManifest.files.legacy_appcast_signature -File $legacyAppCastSignature -Label 'frozen legacy appcast signature'
     Assert-PreparedFileRecord -Record $preparedManifest.files.checksums -File $checksumFile -Label 'checksum file'
     Assert-PreparedAppCast -Msi $msi -AppCast $appCast -AppCastSignature $appCastSignature
-    $qualificationBinding = Assert-UpdateQualification `
-        -Evidence $qualificationEvidence `
-        -EvidenceFile $qualificationFile `
-        -Manifest $preparedManifest
+    $previousQualificationVersion = Get-PreviousStableReleaseVersion
+    $previousQualificationRelease = Invoke-GhJson `
+        -Arguments @(
+            'release', 'view', "v$previousQualificationVersion", '--repo', $repository,
+            '--json', 'tagName,isDraft,isPrerelease,assets,url'
+        ) `
+        -FailureMessage (
+            "Reading official release v$previousQualificationVersion failed.")
+    $qualificationBindings = Assert-UpdateQualificationPair `
+        -PromptedEvidence $qualificationEvidence `
+        -AutomaticEvidence $automaticQualificationEvidence `
+        -Manifest $preparedManifest `
+        -Version $Version `
+        -Tag $tag `
+        -PreviousVersion $previousQualificationVersion `
+        -PublishedRelease $previousQualificationRelease
 
     $expectedChecksumPath = Join-Path $releaseRoot 'SHA256SUMS.expected.txt'
-    Write-ChecksumFile -Files @($msi, $appCast, $appCastSignature) -Path $expectedChecksumPath
+    Write-ChecksumFile `
+        -Files @(
+            $msi,
+            $legacyAppCast,
+            $legacyAppCastSignature,
+            $appCast,
+            $appCastSignature) `
+        -Path $expectedChecksumPath
     try {
         $expectedChecksums = (Get-Content -LiteralPath $expectedChecksumPath -Raw).Trim()
         $actualChecksums = (Get-Content -LiteralPath $checksumFile.FullName -Raw).Trim()
         if ($actualChecksums -cne $expectedChecksums) {
-            throw 'Prepared SHA256SUMS.txt does not exactly match the MSI and appcast pair.'
+            throw 'Prepared SHA256SUMS.txt does not exactly match the MSI and frozen/v2 feed pairs.'
         }
     } finally {
         Remove-Item -LiteralPath $expectedChecksumPath -Force -ErrorAction SilentlyContinue
@@ -1097,38 +1274,73 @@ if ($Finalize) {
     }
     Assert-ReleaseIdentity -Release $release
     Assert-StagedRunIdentity -Release $release
-    Assert-AssetNames -Release $release -AllowedNames $finalAssetNames -RequiredNames $stageCoreAssetNames
+    Assert-AssetNames `
+        -Release $release `
+        -AllowedNames $finalAssetNames `
+        -RequiredNames $finalizationBaseAssetNames
     Assert-RemoteAssetMatches -Release $release -File $msi
     Assert-RemoteAssetMatches -Release $release -File $license
     Assert-RemoteAssetMatches -Release $release -File $notices
-    Set-QualificationBinding `
+    Assert-FeedAssetLabels `
+        -Release $release `
+        -Names $legacyFeedAssetNames `
+        -Label $frozenLegacyFeedLabel
+    Assert-RemoteAssetMatches -Release $release -File $legacyAppCast
+    Assert-RemoteAssetMatches -Release $release -File $legacyAppCastSignature
+    Set-QualificationBindings `
         -Manifest $preparedManifest `
-        -Binding $qualificationBinding
+        -Bindings $qualificationBindings
 
-    $fallbackFeedLabel = "Previous signed fallback feed v$(Get-PreviousStableReleaseVersion)"
-    $feedAssets = @(
+    $previousV2Feed = Get-PreviousSignedV2Feed
+    if ($null -ne $previousV2Feed -and
+        $previousV2Feed.Version -cne $previousQualificationVersion) {
+        throw 'The staged v2 carry-forward feed does not match the client used for update qualification.'
+    }
+    $v2Assets = @(
         $release.assets |
-            Where-Object { $_.name -ceq 'appcast.xml' -or $_.name -ceq 'appcast.xml.signature' })
-    foreach ($asset in $feedAssets) {
-        if ([string]$asset.label -cne $fallbackFeedLabel -and
+            Where-Object { $v2FeedAssetNames -ccontains $_.name })
+    foreach ($asset in $v2Assets) {
+        $previousLabelMatches = (
+            $null -ne $previousV2Feed -and
+            [string]$asset.label -ceq $previousV2Feed.AssetLabel)
+        if (-not $previousLabelMatches -and
             [string]$asset.label -cne $finalFeedLabel) {
             throw ("GitHub release $tag has an unrecognized $($asset.name) label. " +
                    'Refusing to overwrite update metadata with unknown provenance.')
         }
     }
     $finalLabeledCount = @(
-        $feedAssets | Where-Object { [string]$_.label -ceq $finalFeedLabel }).Count
-    if ($finalLabeledCount -eq 0 -and $feedAssets.Count -eq 2) {
-        $fallbackFeed = Get-PreviousSignedFallbackFeed
-        Assert-FeedAssetLabels -Release $release -Label $fallbackFeed.AssetLabel
-        Assert-RemoteAssetMatches -Release $release -File $fallbackFeed.AppCast
-        Assert-RemoteAssetMatches -Release $release -File $fallbackFeed.AppCastSignature
+        $v2Assets | Where-Object { [string]$_.label -ceq $finalFeedLabel }).Count
+    if ($finalLabeledCount -eq 0 -and $null -eq $previousV2Feed) {
+        if ($v2Assets.Count -ne 0) {
+            throw 'The v1.0.7 stage must not carry a legacy-readable or unrecognized v2 feed.'
+        }
+    } elseif ($finalLabeledCount -eq 0 -and $v2Assets.Count -eq 2) {
+        Assert-FeedAssetLabels `
+            -Release $release `
+            -Names $v2FeedAssetNames `
+            -Label $previousV2Feed.AssetLabel
+        Assert-RemoteAssetMatches -Release $release -File $previousV2Feed.AppCast
+        Assert-RemoteAssetMatches -Release $release -File $previousV2Feed.AppCastSignature
     } elseif ($finalLabeledCount -eq 0) {
         Write-Host ("Repairing incomplete known staged metadata for $tag from the exact " +
                     'prepared and qualification-bound candidate files.')
     }
 
-    $finalFiles = @($msi, $appCast, $appCastSignature, $checksumFile, $license, $notices)
+    # Close the release-list race immediately before changing the already-public
+    # GitHub fallback metadata. A newer stable release appearing during Sandbox
+    # qualification must leave this candidate staged rather than make it latest.
+    Assert-ReleaseVersionIsMonotonic `
+        -ExpectedPreviousVersion $previousQualificationVersion
+    $finalFiles = @(
+        $msi,
+        $legacyAppCast,
+        $legacyAppCastSignature,
+        $appCast,
+        $appCastSignature,
+        $checksumFile,
+        $license,
+        $notices)
     $alreadyFinal = $finalLabeledCount -eq 2
     if ($alreadyFinal) {
         foreach ($file in $finalFiles) {
@@ -1157,14 +1369,14 @@ if ($Finalize) {
         if (-not (Test-RemoteAssetMatches -Release $release -File $appCast) -or
             -not (Test-AssetLabel `
                 -Release $release `
-                -Name 'appcast.xml' `
+                -Name 'appcast-v2.xml' `
                 -Label $finalFeedLabel)) {
             $finalUploadItems += $labeledAppCast
         }
         if (-not (Test-RemoteAssetMatches -Release $release -File $appCastSignature) -or
             -not (Test-AssetLabel `
                 -Release $release `
-                -Name 'appcast.xml.signature' `
+                -Name 'appcast-v2.xml.signature' `
                 -Label $finalFeedLabel)) {
             $finalUploadItems += $labeledAppCastSignature
         }
@@ -1174,15 +1386,19 @@ if ($Finalize) {
         if ($finalUploadItems.Count -eq 0) {
             throw 'Finalized metadata was reported incomplete, but no exact repair operation was identified.'
         }
+        Assert-ReleaseVersionIsMonotonic `
+            -ExpectedPreviousVersion $previousQualificationVersion
         Invoke-GhCommand `
             -Arguments (@(
                 'release', 'upload', $tag, '--repo', $repository, '--clobber') +
                 $finalUploadItems) `
-            -FailureMessage "Uploading the signed appcast pair for $tag failed"
+            -FailureMessage "Uploading the signed v2 appcast pair for $tag failed"
     }
 
     # A release edit emits the webhook that reruns the mirror only after the
     # package, appcast, and detached signature all exist on GitHub.
+    Assert-ReleaseVersionIsMonotonic `
+        -ExpectedPreviousVersion $previousQualificationVersion
     Invoke-GhCommand `
         -Arguments @(
             'release', 'edit', $tag, '--repo', $repository,
@@ -1195,7 +1411,14 @@ if ($Finalize) {
     Assert-ReleaseIdentity -Release $release
     Assert-StagedRunIdentity -Release $release
     Assert-AssetNames -Release $release -AllowedNames $finalAssetNames -RequiredNames $finalAssetNames
-    Assert-FeedAssetLabels -Release $release -Label $finalFeedLabel
+    Assert-FeedAssetLabels `
+        -Release $release `
+        -Names $legacyFeedAssetNames `
+        -Label $frozenLegacyFeedLabel
+    Assert-FeedAssetLabels `
+        -Release $release `
+        -Names $v2FeedAssetNames `
+        -Label $finalFeedLabel
     foreach ($file in $finalFiles) {
         Assert-RemoteAssetMatches -Release $release -File $file
     }
@@ -1205,7 +1428,7 @@ if ($Finalize) {
         -License $license `
         -Notices $notices `
         -ExpectedAssetNames $finalAssetNames
-    Write-Host "Finalized resticpal $Version from signed CI run $RunId. The release webhook can now atomically advance the mirrored appcast pair."
+    Write-Host "Finalized resticpal $Version from signed CI run $RunId. The release webhook can now atomically advance only the mirrored v2 appcast pair."
     Get-Item -LiteralPath @(
         $msi.FullName,
         $appCast.FullName,
@@ -1257,13 +1480,13 @@ if ($Stage) {
         $finalLabeledAssets = @(
             $release.assets |
                 Where-Object {
-                    ($_.name -ceq 'appcast.xml' -or $_.name -ceq 'appcast.xml.signature') -and
+                    ($v2FeedAssetNames -ccontains $_.name) -and
                     [string]$_.label -ceq $finalFeedLabel
                 })
         if ($finalLabeledAssets.Count -gt 0) {
             if ($release.isDraft -or $finalLabeledAssets.Count -ne 2) {
                 throw ("GitHub release $tag contains an interrupted final appcast upload. " +
-                       'Re-run -Finalize with the prepared manifest and qualification evidence.')
+                       'Re-run -Finalize with the prepared manifest and both qualification results.')
             }
             Assert-FinalizedReleaseAssets `
                 -Release $release `
@@ -1277,18 +1500,45 @@ if ($Stage) {
         }
     }
 
-    $fallbackFeed = Get-PreviousSignedFallbackFeed
+    $frozenLegacyFeed = Get-FrozenLegacyFeed
+    $stagedPreviousVersion = Get-PreviousStableReleaseVersion
+    if ($Version -ceq '1.0.7' -and $stagedPreviousVersion -cne '1.0.6') {
+        throw 'The one-time v1.0.7 rescue stage requires v1.0.6 to be the immediately previous stable release.'
+    }
+    $previousV2Feed = Get-PreviousSignedV2Feed
+    if ($null -ne $previousV2Feed -and
+        $previousV2Feed.Version -cne $stagedPreviousVersion) {
+        throw 'The signed v2 carry-forward feed changed while selecting the immediately previous stable release.'
+    }
+    $stagedFeedFiles = @(
+        $frozenLegacyFeed.AppCast,
+        $frozenLegacyFeed.AppCastSignature)
+    if ($null -ne $previousV2Feed) {
+        $stagedFeedFiles += @(
+            $previousV2Feed.AppCast,
+            $previousV2Feed.AppCastSignature)
+    }
+    Write-ChecksumFile -Files (@($msi) + @($stagedFeedFiles)) -Path $checksumPath
+    $checksumFile = Get-Item -LiteralPath $checksumPath
     $stageFiles = @(
         $msi,
         $checksumFile,
         $license,
-        $notices,
-        $fallbackFeed.AppCast,
-        $fallbackFeed.AppCastSignature)
-    $labeledFallbackAppCast = "$($fallbackFeed.AppCast.FullName)#$($fallbackFeed.AssetLabel)"
-    $labeledFallbackSignature = "$($fallbackFeed.AppCastSignature.FullName)#$($fallbackFeed.AssetLabel)"
+        $notices) + $stagedFeedFiles
+    $labeledLegacyAppCast = (
+        "$($frozenLegacyFeed.AppCast.FullName)#$($frozenLegacyFeed.AssetLabel)")
+    $labeledLegacySignature = (
+        "$($frozenLegacyFeed.AppCastSignature.FullName)#$($frozenLegacyFeed.AssetLabel)")
+    $labeledPreviousV2AppCast = if ($null -ne $previousV2Feed) {
+        "$($previousV2Feed.AppCast.FullName)#$($previousV2Feed.AssetLabel)"
+    } else { $null }
+    $labeledPreviousV2Signature = if ($null -ne $previousV2Feed) {
+        "$($previousV2Feed.AppCastSignature.FullName)#$($previousV2Feed.AssetLabel)"
+    } else { $null }
 
     if ($null -eq $release) {
+        Assert-ReleaseVersionIsMonotonic `
+            -ExpectedPreviousVersion $stagedPreviousVersion
         Assert-RemoteTagTarget -AllowMissing
         # Release creation and asset upload are separate GitHub operations. Create
         # a provenance-bearing draft first so any interrupted upload is safely
@@ -1315,12 +1565,19 @@ if ($Stage) {
         throw ("GitHub release $tag contains unexpected assets and cannot be safely repaired: " +
                ($unexpectedAssets -join ', '))
     }
-    foreach ($asset in @(
-            $release.assets |
-                Where-Object { $_.name -ceq 'appcast.xml' -or $_.name -ceq 'appcast.xml.signature' })) {
-        if ([string]$asset.label -cne $fallbackFeed.AssetLabel) {
+    foreach ($asset in @($release.assets | Where-Object {
+            $legacyFeedAssetNames -ccontains $_.name })) {
+        if ([string]$asset.label -cne $frozenLegacyFeed.AssetLabel) {
             throw ("GitHub release $tag has an unrecognized $($asset.name) label. " +
-                   'Refusing to replace update metadata with unknown provenance.')
+                   'Refusing to change the frozen legacy feed.')
+        }
+    }
+    foreach ($asset in @($release.assets | Where-Object {
+            $v2FeedAssetNames -ccontains $_.name })) {
+        if ($null -eq $previousV2Feed -or
+            [string]$asset.label -cne $previousV2Feed.AssetLabel) {
+            throw ("GitHub release $tag has an unrecognized $($asset.name) label. " +
+                   'Refusing to replace v2 update metadata with unknown provenance.')
         }
     }
 
@@ -1340,21 +1597,39 @@ if ($Stage) {
             $stageUploadItems += $file.FullName
         }
     }
-    if (-not (Test-RemoteAssetMatches -Release $release -File $fallbackFeed.AppCast) -or
+    if (-not (Test-RemoteAssetMatches -Release $release -File $frozenLegacyFeed.AppCast) -or
         -not (Test-AssetLabel `
             -Release $release `
             -Name 'appcast.xml' `
-            -Label $fallbackFeed.AssetLabel)) {
-        $stageUploadItems += $labeledFallbackAppCast
+            -Label $frozenLegacyFeed.AssetLabel)) {
+        $stageUploadItems += $labeledLegacyAppCast
     }
-    if (-not (Test-RemoteAssetMatches -Release $release -File $fallbackFeed.AppCastSignature) -or
+    if (-not (Test-RemoteAssetMatches -Release $release -File $frozenLegacyFeed.AppCastSignature) -or
         -not (Test-AssetLabel `
             -Release $release `
             -Name 'appcast.xml.signature' `
-            -Label $fallbackFeed.AssetLabel)) {
-        $stageUploadItems += $labeledFallbackSignature
+            -Label $frozenLegacyFeed.AssetLabel)) {
+        $stageUploadItems += $labeledLegacySignature
+    }
+    if ($null -ne $previousV2Feed) {
+        if (-not (Test-RemoteAssetMatches -Release $release -File $previousV2Feed.AppCast) -or
+            -not (Test-AssetLabel `
+                -Release $release `
+                -Name 'appcast-v2.xml' `
+                -Label $previousV2Feed.AssetLabel)) {
+            $stageUploadItems += $labeledPreviousV2AppCast
+        }
+        if (-not (Test-RemoteAssetMatches -Release $release -File $previousV2Feed.AppCastSignature) -or
+            -not (Test-AssetLabel `
+                -Release $release `
+                -Name 'appcast-v2.xml.signature' `
+                -Label $previousV2Feed.AssetLabel)) {
+            $stageUploadItems += $labeledPreviousV2Signature
+        }
     }
     if ($stageUploadItems.Count -gt 0) {
+        Assert-ReleaseVersionIsMonotonic `
+            -ExpectedPreviousVersion $stagedPreviousVersion
         Invoke-GhCommand `
             -Arguments (@(
                 'release', 'upload', $tag, '--repo', $repository, '--clobber') +
@@ -1365,8 +1640,20 @@ if ($Stage) {
     $release = Get-Release
     Assert-ReleaseIdentity -Release $release -AllowDraft
     Assert-StagedRunIdentity -Release $release
-    Assert-AssetNames -Release $release -AllowedNames $stageAssetNames -RequiredNames $stageAssetNames
-    Assert-FeedAssetLabels -Release $release -Label $fallbackFeed.AssetLabel
+    Assert-AssetNames `
+        -Release $release `
+        -AllowedNames $stageAssetNames `
+        -RequiredNames $stageRequiredAssetNames
+    Assert-FeedAssetLabels `
+        -Release $release `
+        -Names $legacyFeedAssetNames `
+        -Label $frozenLegacyFeed.AssetLabel
+    if ($null -ne $previousV2Feed) {
+        Assert-FeedAssetLabels `
+            -Release $release `
+            -Names $v2FeedAssetNames `
+            -Label $previousV2Feed.AssetLabel
+    }
     foreach ($file in $stageFiles) {
         Assert-RemoteAssetMatches -Release $release -File $file
     }
@@ -1374,6 +1661,8 @@ if ($Stage) {
     # Publish only after the complete staged asset set has been re-read and
     # verified. The carried-forward signed feed keeps GitHub's latest fallback
     # valid while the candidate MSI is mirrored and qualified.
+    Assert-ReleaseVersionIsMonotonic `
+        -ExpectedPreviousVersion $stagedPreviousVersion
     Invoke-GhCommand `
         -Arguments @(
             'release', 'edit', $tag, '--repo', $repository,
@@ -1384,14 +1673,31 @@ if ($Stage) {
     $release = Get-Release
     Assert-ReleaseIdentity -Release $release
     Assert-StagedRunIdentity -Release $release
-    Assert-AssetNames -Release $release -AllowedNames $stageAssetNames -RequiredNames $stageAssetNames
-    Assert-FeedAssetLabels -Release $release -Label $fallbackFeed.AssetLabel
+    Assert-AssetNames `
+        -Release $release `
+        -AllowedNames $stageAssetNames `
+        -RequiredNames $stageRequiredAssetNames
+    Assert-FeedAssetLabels `
+        -Release $release `
+        -Names $legacyFeedAssetNames `
+        -Label $frozenLegacyFeed.AssetLabel
+    if ($null -ne $previousV2Feed) {
+        Assert-FeedAssetLabels `
+            -Release $release `
+            -Names $v2FeedAssetNames `
+            -Label $previousV2Feed.AssetLabel
+    }
     foreach ($file in $stageFiles) {
         Assert-RemoteAssetMatches -Release $release -File $file
     }
-    Write-Host ("Staged resticpal $Version from signed CI run $RunId with the previous signed " +
-                "v$($fallbackFeed.Version) fallback feed. Wait for and verify the direct MSI mirror " +
-                'before preparing the candidate feed.')
+    $v2StageDescription = if ($null -eq $previousV2Feed) {
+        'no v2 feed (the v1.0.7 rescue transition)'
+    } else {
+        "the previous signed v2 feed v$($previousV2Feed.Version)"
+    }
+    Write-Host ("Staged resticpal $Version from signed CI run $RunId with the byte-pinned " +
+                "legacy v1.0.5 feed and $v2StageDescription. Wait for and verify the direct " +
+                'MSI mirror before preparing the candidate v2 feed.')
     Get-Item -LiteralPath $stageFiles.FullName
     return
 }
@@ -1405,18 +1711,30 @@ Assert-StagedRunIdentity -Release $stagedRelease
 Assert-AssetNames `
     -Release $stagedRelease `
     -AllowedNames $stageAssetNames `
-    -RequiredNames $stageAssetNames
-$fallbackFeed = Get-PreviousSignedFallbackFeed
-Assert-FeedAssetLabels -Release $stagedRelease -Label $fallbackFeed.AssetLabel
-Write-ChecksumFile -Files @($msi) -Path $checksumPath
+    -RequiredNames $stageRequiredAssetNames
+$frozenLegacyFeed = Get-FrozenLegacyFeed
+$previousV2Feed = Get-PreviousSignedV2Feed
+Assert-FeedAssetLabels `
+    -Release $stagedRelease `
+    -Names $legacyFeedAssetNames `
+    -Label $frozenLegacyFeed.AssetLabel
+if ($null -ne $previousV2Feed) {
+    Assert-FeedAssetLabels `
+        -Release $stagedRelease `
+        -Names $v2FeedAssetNames `
+        -Label $previousV2Feed.AssetLabel
+}
+$stagedFeedFiles = @(
+    $frozenLegacyFeed.AppCast,
+    $frozenLegacyFeed.AppCastSignature)
+if ($null -ne $previousV2Feed) {
+    $stagedFeedFiles += @(
+        $previousV2Feed.AppCast,
+        $previousV2Feed.AppCastSignature)
+}
+Write-ChecksumFile -Files (@($msi) + @($stagedFeedFiles)) -Path $checksumPath
 $stagedChecksumFile = Get-Item -LiteralPath $checksumPath
-foreach ($file in @(
-        $msi,
-        $stagedChecksumFile,
-        $license,
-        $notices,
-        $fallbackFeed.AppCast,
-        $fallbackFeed.AppCastSignature)) {
+foreach ($file in @($msi, $stagedChecksumFile, $license, $notices) + $stagedFeedFiles) {
     Assert-RemoteAssetMatches -Release $stagedRelease -File $file
 }
 
@@ -1431,18 +1749,62 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Signed appcast preparation failed.'
 }
 
-$appCast = Get-Item -LiteralPath (Join-Path $feedRoot 'appcast.xml')
-$appCastSignature = Get-Item -LiteralPath (Join-Path $feedRoot 'appcast.xml.signature')
-Write-ChecksumFile -Files @($msi, $appCast, $appCastSignature) -Path $checksumPath
+$appCast = Get-Item -LiteralPath (Join-Path $feedRoot 'appcast-v2.xml')
+$appCastSignature = Get-Item -LiteralPath (Join-Path $feedRoot 'appcast-v2.xml.signature')
+Write-ChecksumFile `
+    -Files @(
+        $msi,
+        $frozenLegacyFeed.AppCast,
+        $frozenLegacyFeed.AppCastSignature,
+        $appCast,
+        $appCastSignature) `
+    -Path $checksumPath
 $checksumFile = Get-Item -LiteralPath $checksumPath
 Assert-PreparedAppCast -Msi $msi -AppCast $appCast -AppCastSignature $appCastSignature
+$previousQualificationVersion = Get-PreviousStableReleaseVersion
+if ($Version -ceq '1.0.7' -and $previousQualificationVersion -cne '1.0.6') {
+    throw 'The one-time v1.0.7 rescue release requires v1.0.6 to be the immediately previous stable release.'
+}
+$probeAppCast = $null
+$probeAppCastSignature = $null
+$probePayload = $null
+if ($previousQualificationVersion -ceq '1.0.6' -and $Version -ceq '1.0.7') {
+    $probeRoot = Join-Path $releaseRoot 'probe'
+    & (Join-Path $PSScriptRoot 'New-UpdateQualificationProbe.ps1') `
+        -CandidateVersion $Version `
+        -OutputDirectory $probeRoot `
+        -KeyPath $KeyPath
+    $probeAppCast = Get-Item -LiteralPath (
+        Join-Path $probeRoot 'appcast-v2-probe.xml')
+    $probeAppCastSignature = Get-Item -LiteralPath (
+        Join-Path $probeRoot 'appcast-v2-probe.xml.signature')
+    $parsedCandidateVersion = [Version]$Version
+    $probeVersion = '{0}.{1}.{2}' -f `
+        $parsedCandidateVersion.Major,
+        $parsedCandidateVersion.Minor,
+        ($parsedCandidateVersion.Build + 1)
+    $probePayload = Get-Item -LiteralPath (
+        Join-Path $probeRoot "resticpal-$probeVersion-x64.msi")
+    Assert-AppCastSignature `
+        -AppCast $probeAppCast `
+        -AppCastSignature $probeAppCastSignature
+}
 Write-PreparedManifest `
     -Msi $msi `
     -AppCast $appCast `
     -AppCastSignature $appCastSignature `
-    -Checksums $checksumFile
+    -LegacyAppCast $frozenLegacyFeed.AppCast `
+    -LegacyAppCastSignature $frozenLegacyFeed.AppCastSignature `
+    -Checksums $checksumFile `
+    -ProbeAppCast $probeAppCast `
+    -ProbeAppCastSignature $probeAppCastSignature `
+    -ProbePayload $probePayload `
+    -PreviousVersion $previousQualificationVersion
 
 $preparedFiles = @($msi, $appCast, $appCastSignature, $checksumFile)
+if ($null -ne $probeAppCast) {
+    $preparedFiles += @($probeAppCast, $probeAppCastSignature, $probePayload)
+}
 Write-Host "Prepared resticpal $Version release assets from signed CI run $RunId at $releaseRoot"
-Write-Host 'Review and exercise these exact files with the previously published client, then re-run with -Finalize and -ReleaseNotesPath.'
+Write-Host 'Review these exact files through both prompted and automatic previous-client Sandbox modes, then re-run with -Finalize, -ReleaseNotesPath, and both qualification paths.'
 Get-Item -LiteralPath @($preparedFiles.FullName + $preparedManifestPath)

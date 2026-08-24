@@ -1,3 +1,4 @@
+using Microsoft.UI.Xaml;
 using ResticPal.UI.Services;
 
 namespace ResticPal.UI;
@@ -7,6 +8,7 @@ public sealed class BackupRunListItem
 {
     internal BackupRunListItem(BackupRun run)
     {
+        Id = run.Id;
         Headline = run.Outcome switch
         {
             "succeeded" => "Backup completed",
@@ -37,7 +39,11 @@ public sealed class BackupRunListItem
             ? "No aggregate file statistics were reported."
             : string.Join(" · ", summary);
 
-        if (!string.IsNullOrWhiteSpace(run.ErrorCode))
+        if (run.FailedItemCount > 0)
+        {
+            Detail = BackupWarningPresentation.CountSummary(run.FailedItemCount);
+        }
+        else if (!string.IsNullOrWhiteSpace(run.ErrorCode))
         {
             Detail = $"Sanitized error code: {run.ErrorCode}";
         }
@@ -49,12 +55,22 @@ public sealed class BackupRunListItem
         {
             Detail = "No additional details.";
         }
+
+        bool isPartialSourceWarning = run.Outcome == "succeeded_with_warnings"
+            && run.ErrorCode == "restic_partial_source";
+        FailureDetailsVisibility = run.FailedItemCount > 0 || isPartialSourceWarning
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        FailureDetailsButtonText = BackupWarningPresentation.ViewButtonLabel(run.FailedItemCount);
     }
 
+    public ulong Id { get; }
     public string Headline { get; }
     public string CompletedAtText { get; }
     public string Summary { get; }
     public string Detail { get; }
+    public Visibility FailureDetailsVisibility { get; }
+    public string FailureDetailsButtonText { get; }
 
     private static string FormatDuration(TimeSpan duration)
     {

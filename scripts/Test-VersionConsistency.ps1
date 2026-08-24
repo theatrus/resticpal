@@ -88,6 +88,29 @@ if (-not $appCastScript.Contains("--file-version', `$Version")) {
 if (-not $appCastScript.Contains("[string] `$PackageHost = 'UpdatesHost'")) {
     throw 'New-UpdateAppcast.ps1 must default to the direct updates host.'
 }
+if (-not $appCastScript.Contains(
+        "`$appCastUrl = 'https://updates.resticpal.com/appcast-v2.xml'")) {
+    throw 'New-UpdateAppcast.ps1 must generate the version-2 update feed.'
+}
+if (-not $appCastScript.Contains("'--output-file-name', 'appcast-v2'")) {
+    throw 'New-UpdateAppcast.ps1 must emit appcast-v2.xml and its detached signature.'
+}
+
+$updateTrust = Get-Content -LiteralPath (
+    Join-Path $repositoryRoot 'apps\ResticPal.UI\Services\UpdateTrust.cs') -Raw
+foreach ($requiredFeed in @(
+    'https://updates.resticpal.com/appcast-v2.xml',
+    'https://github.com/theatrus/resticpal/releases/latest/download/appcast-v2.xml'
+)) {
+    if (-not $updateTrust.Contains($requiredFeed)) {
+        throw "The WinUI updater is missing the version-2 feed: $requiredFeed"
+    }
+}
+if ($updateTrust.Contains('https://updates.resticpal.com/appcast.xml') -or
+    $updateTrust.Contains(
+        'https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml')) {
+    throw 'The WinUI updater must not consume the frozen legacy update feed.'
+}
 
 $publishScript = Get-Content -LiteralPath (
     Join-Path $repositoryRoot 'scripts\Publish-Release.ps1') -Raw
@@ -96,16 +119,22 @@ foreach ($releaseSafetyInvariant in @(
     '[switch] $Stage',
     '[switch] $Finalize',
     '[string] $UpdateQualificationPath',
+    '[string] $AutomaticUpdateQualificationPath',
     '$Run.headSha -cne $head',
     "`$Run.status -cne 'completed' -or `$Run.conclusion -cne 'success'",
     "`$Run.event -ceq 'push' -and `$Run.headBranch -ceq `$tag",
     'release-manifest.json',
-    'schema = 2',
-    'previous-published-client-prompted-update',
+    'schema = 4',
+    'Assert-UpdateQualificationPair',
+    'Test-UpdateQualificationBindingState',
     'Assert-DirectPackageMirror -Msi $msi',
     'Assert-RemoteTagTarget',
     'Signed Windows CI run $RunId',
-    'Previous signed fallback feed $previousTag',
+    'Frozen legacy feed v1.0.5',
+    'appcast-v2.xml',
+    '$frozenLegacyAppCastSha256',
+    '$frozenLegacyAppCastSignatureSha256',
+    'New-UpdateQualificationProbe.ps1',
     "'--notes-file', `$stagedNotes.FullName, '--draft'",
     "'--draft=false', '--latest'",
     'Assert-FeedAssetLabels',
@@ -115,5 +144,31 @@ foreach ($releaseSafetyInvariant in @(
         throw "Publish-Release.ps1 is missing release safety invariant: $releaseSafetyInvariant"
     }
 }
+
+if (-not $publishScript.Contains(
+        ". (Join-Path `$PSScriptRoot 'ReleaseQualification.ps1')")) {
+    throw 'Publish-Release.ps1 must use the shared, executable qualification validator.'
+}
+$qualificationScript = Get-Content -LiteralPath (
+    Join-Path $repositoryRoot 'scripts\ReleaseQualification.ps1') -Raw
+foreach ($qualificationInvariant in @(
+    'Read-UpdateQualificationEvidence',
+    'Assert-UpdateQualificationPair',
+    'Test-UpdateQualificationBindingState',
+    'previous-published-client-prompted-update',
+    'previous-published-client-automatic-update',
+    'previous-published-service-automatic-update-bridge',
+    'qualification-harness-via-published-service-ipc',
+    'update_signature_invalid',
+    'candidate_tray_probe',
+    'candidate_installer_parent_process_id',
+    'no_user_confirmation_or_dialog_intervention'
+)) {
+    if (-not $qualificationScript.Contains($qualificationInvariant)) {
+        throw "ReleaseQualification.ps1 is missing safety invariant: $qualificationInvariant"
+    }
+}
+
+& (Join-Path $PSScriptRoot 'Test-ReleaseQualification.ps1')
 
 Write-Host "OK: Rust, WinUI, application manifest, installer input, and appcast source version are $version."

@@ -19,6 +19,7 @@ mod lifecycle;
 mod scheduler;
 mod state;
 
+pub(crate) use enrollment::ManagedPolicyApplyOutcome;
 pub use events::{RuntimeEvent, ScheduleAction};
 pub use state::ServiceRuntime;
 

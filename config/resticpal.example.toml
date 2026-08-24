@@ -43,7 +43,8 @@ prune_interval_days = 7
 
 # When enabled, the tray asks the LocalSystem service to download, verify, and
 # install newer resticpal MSIs silently. The pinned Ed25519 signature remains
-# mandatory and a running backup is never interrupted.
+# mandatory and a running backup is never interrupted. Omit this field to
+# inherit an unlocked managed-policy recommendation.
 [updates]
 automatic_install = false
 

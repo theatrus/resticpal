@@ -20,11 +20,15 @@
   <ItemGroup>
     <Compile Include="..\..\apps\ResticPal.UI\Services\ConfigurationReloadGate.cs"
              Link="Services\ConfigurationReloadGate.cs" />
+    <Compile Include="..\..\apps\ResticPal.UI\Services\BackupWarningPresentation.cs"
+             Link="Services\BackupWarningPresentation.cs" />
     <Compile Include="..\..\apps\ResticPal.UI\Services\ManagedConfigurationSynchronization.cs"
              Link="Services\ManagedConfigurationSynchronization.cs" />
     <Compile Include="..\..\apps\ResticPal.UI\Services\ManualBackupStatusTransition.cs"
              Link="Services\ManualBackupStatusTransition.cs" />
     <Compile Include="..\..\apps\ResticPal.UI\Services\UpdateFeedSelection.cs"
              Link="Services\UpdateFeedSelection.cs" />
+    <Compile Include="..\..\apps\ResticPal.UI\Services\UpdateInstallationDecision.cs"
+             Link="Services\UpdateInstallationDecision.cs" />
   </ItemGroup>
 </Project>

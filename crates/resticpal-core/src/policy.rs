@@ -7,9 +7,12 @@ use thiserror::Error;
 use crate::config::{
     BackupConfig, CONFIG_SCHEMA_VERSION, ConfigValidationError, EffectiveConfig, LocalConfig,
     RepositoryConfig, RepositoryMode, RetentionConfig, ScheduleConfig, SecretEnvironmentVariable,
+    UpdateConfig,
 };
 
 pub const MAX_POLICY_REVISION_CHARACTERS: usize = 256;
+pub const MANAGED_POLICY_SCHEMA_VERSION: u32 = 2;
+const LEGACY_MANAGED_POLICY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -20,17 +23,24 @@ pub struct ManagedPolicy {
     pub repository: ManagedRepositoryPolicy,
     pub schedule: ManagedSchedulePolicy,
     pub retention: ManagedRetentionPolicy,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_managed_update_policy"
+    )]
+    pub updates: Option<ManagedUpdatePolicy>,
 }
 
 impl Default for ManagedPolicy {
     fn default() -> Self {
         Self {
-            schema_version: CONFIG_SCHEMA_VERSION,
+            schema_version: MANAGED_POLICY_SCHEMA_VERSION,
             revision: String::new(),
             backup: ManagedBackupPolicy::default(),
             repository: ManagedRepositoryPolicy::default(),
             schedule: ManagedSchedulePolicy::default(),
             retention: ManagedRetentionPolicy::default(),
+            updates: None,
         }
     }
 }
@@ -72,6 +82,24 @@ pub struct ManagedRetentionPolicy {
     pub prune_interval_days: Option<Managed<u32>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManagedUpdatePolicy {
+    pub automatic_install: Option<Managed<bool>>,
+}
+
+fn deserialize_managed_update_policy<'de, D>(
+    deserializer: D,
+) -> Result<Option<ManagedUpdatePolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Unlike Option's default deserializer, this deliberately rejects an
+    // explicit null. That keeps every serialized `updates` member
+    // presence-aware so schema v1 cannot disguise the v2 field as null.
+    ManagedUpdatePolicy::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Managed<T> {
@@ -100,6 +128,7 @@ pub enum PolicyField {
     RetentionMonthly,
     RetentionYearly,
     RetentionPruneIntervalDays,
+    UpdateAutomaticInstall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,9 +173,18 @@ pub fn resolve_config(
     }
 
     if let Some(policy) = managed
-        && policy.schema_version != CONFIG_SCHEMA_VERSION
+        && !matches!(
+            policy.schema_version,
+            LEGACY_MANAGED_POLICY_SCHEMA_VERSION | MANAGED_POLICY_SCHEMA_VERSION
+        )
     {
         return Err(PolicyError::UnsupportedManagedSchema(policy.schema_version));
+    }
+    if let Some(policy) = managed
+        && policy.schema_version == LEGACY_MANAGED_POLICY_SCHEMA_VERSION
+        && policy.updates.is_some()
+    {
+        return Err(PolicyError::UpdatesRequireManagedSchemaV2);
     }
     if let Some(policy) = managed
         && (policy.revision.trim().is_empty()
@@ -161,10 +199,14 @@ pub fn resolve_config(
     let no_repository = ManagedRepositoryPolicy::default();
     let no_schedule = ManagedSchedulePolicy::default();
     let no_retention = ManagedRetentionPolicy::default();
+    let no_updates = ManagedUpdatePolicy::default();
     let managed_backup = managed.map_or(&no_backup, |policy| &policy.backup);
     let managed_repository = managed.map_or(&no_repository, |policy| &policy.repository);
     let managed_schedule = managed.map_or(&no_schedule, |policy| &policy.schedule);
     let managed_retention = managed.map_or(&no_retention, |policy| &policy.retention);
+    let managed_updates = managed
+        .and_then(|policy| policy.updates.as_ref())
+        .unwrap_or(&no_updates);
     let local_repository_display_name = local.repository.display_name.clone().map(Some);
     let local_repository_url = local.repository.url.clone().map(Some);
 
@@ -296,6 +338,15 @@ pub fn resolve_config(
                 &mut fields,
             ),
         },
+        updates: UpdateConfig {
+            automatic_install: choose(
+                PolicyField::UpdateAutomaticInstall,
+                &defaults.updates.automatic_install,
+                local.updates.automatic_install.as_ref(),
+                managed_updates.automatic_install.as_ref(),
+                &mut fields,
+            ),
+        },
     };
 
     effective.validate()?;
@@ -338,6 +389,8 @@ pub enum PolicyError {
     UnsupportedLocalSchema(u32),
     #[error("unsupported managed policy schema {0}")]
     UnsupportedManagedSchema(u32),
+    #[error("managed update policy requires schema {MANAGED_POLICY_SCHEMA_VERSION}")]
+    UpdatesRequireManagedSchemaV2,
     #[error("managed policy revision must be a non-empty single-line value within the size limit")]
     InvalidManagedRevision,
     #[error(transparent)]
@@ -347,7 +400,7 @@ pub enum PolicyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LocalRepositoryConfig, LocalScheduleConfig};
+    use crate::config::{LocalRepositoryConfig, LocalScheduleConfig, LocalUpdateConfig};
 
     fn managed<T>(value: T, locked: bool) -> Option<Managed<T>> {
         Some(Managed { value, locked })
@@ -473,5 +526,130 @@ mod tests {
             .expect("policy should resolve");
 
         assert_eq!(result.effective.repository.url, None);
+    }
+
+    #[test]
+    fn managed_update_recommendations_and_locks_follow_field_precedence() {
+        let recommendation = ManagedPolicy {
+            revision: "policy-update-recommendation".to_owned(),
+            updates: Some(ManagedUpdatePolicy {
+                automatic_install: managed(true, false),
+            }),
+            ..ManagedPolicy::default()
+        };
+        let recommended = resolve_config(
+            &EffectiveConfig::default(),
+            &LocalConfig::default(),
+            Some(&recommendation),
+        )
+        .expect("recommendation should resolve");
+        assert!(recommended.effective.updates.automatic_install);
+        assert_eq!(
+            recommended.fields[&PolicyField::UpdateAutomaticInstall],
+            FieldResolution {
+                source: ValueSource::ManagedRecommendation,
+                locked: false,
+            }
+        );
+
+        let local = LocalConfig {
+            updates: LocalUpdateConfig {
+                automatic_install: Some(false),
+            },
+            ..LocalConfig::default()
+        };
+        let local_override =
+            resolve_config(&EffectiveConfig::default(), &local, Some(&recommendation))
+                .expect("local override should resolve");
+        assert!(!local_override.effective.updates.automatic_install);
+        assert_eq!(
+            local_override.fields[&PolicyField::UpdateAutomaticInstall].source,
+            ValueSource::LocalAdministrator
+        );
+
+        let locked = ManagedPolicy {
+            revision: "policy-update-lock".to_owned(),
+            updates: Some(ManagedUpdatePolicy {
+                automatic_install: managed(true, true),
+            }),
+            ..ManagedPolicy::default()
+        };
+        let locked_result = resolve_config(&EffectiveConfig::default(), &local, Some(&locked))
+            .expect("locked policy should resolve");
+        assert!(locked_result.effective.updates.automatic_install);
+        assert!(
+            locked_result
+                .locked_fields()
+                .contains(&PolicyField::UpdateAutomaticInstall)
+        );
+    }
+
+    #[test]
+    fn legacy_managed_policy_is_accepted_only_without_update_fields() {
+        let legacy_json = r#"{
+            "schema_version": 1,
+            "revision": "legacy-policy",
+            "schedule": {
+                "allow_on_battery": { "value": false }
+            }
+        }"#;
+        let legacy: ManagedPolicy =
+            serde_json::from_str(legacy_json).expect("legacy policy should deserialize");
+        assert_eq!(legacy.schema_version, LEGACY_MANAGED_POLICY_SCHEMA_VERSION);
+        assert_eq!(legacy.updates, None);
+        let resolved = resolve_config(
+            &EffectiveConfig::default(),
+            &LocalConfig::default(),
+            Some(&legacy),
+        )
+        .expect("legacy policy should resolve");
+        assert!(!resolved.effective.schedule.allow_on_battery);
+        assert!(!resolved.effective.updates.automatic_install);
+
+        let invalid_legacy = ManagedPolicy {
+            revision: "legacy-with-updates".to_owned(),
+            schema_version: LEGACY_MANAGED_POLICY_SCHEMA_VERSION,
+            updates: Some(ManagedUpdatePolicy {
+                automatic_install: managed(true, false),
+            }),
+            ..ManagedPolicy::default()
+        };
+        assert_eq!(
+            resolve_config(
+                &EffectiveConfig::default(),
+                &LocalConfig::default(),
+                Some(&invalid_legacy),
+            ),
+            Err(PolicyError::UpdatesRequireManagedSchemaV2)
+        );
+
+        let empty_updates: ManagedPolicy = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "revision": "legacy-with-empty-updates",
+                "updates": {}
+            }"#,
+        )
+        .expect("known update policy field should deserialize before schema validation");
+        assert_eq!(
+            resolve_config(
+                &EffectiveConfig::default(),
+                &LocalConfig::default(),
+                Some(&empty_updates),
+            ),
+            Err(PolicyError::UpdatesRequireManagedSchemaV2)
+        );
+
+        assert!(
+            serde_json::from_str::<ManagedPolicy>(
+                r#"{
+                    "schema_version": 1,
+                    "revision": "legacy-with-null-updates",
+                    "updates": null
+                }"#,
+            )
+            .is_err(),
+            "an explicit updates member cannot deserialize as absence"
+        );
     }
 }

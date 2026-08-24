@@ -184,6 +184,12 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private void ViewWarningDetailsButton_Click(object sender, RoutedEventArgs e)
+    {
+        _historyLoaded = false;
+        NavigationRoot.SelectedItem = HistoryItem;
+    }
+
     /// <summary>
     /// Runs one page operation with an optional busy indicator, surfacing any
     /// failure in the shared message bar. Starting an operation that is already
@@ -296,6 +302,16 @@ public sealed partial class MainWindow : Window
                         await LoadRetentionAsync();
                         return _retentionLoaded;
                     });
+                await ReloadPendingConfigurationPageAsync(
+                    ConfigurationPageKind.Updates,
+                    hasUnsavedChanges: false,
+                    discardEdits: discardEdits,
+                    async () =>
+                    {
+                        _updateSettingsLoaded = false;
+                        await LoadUpdateSettingsAsync();
+                        return _updateSettingsLoaded;
+                    });
             }
             finally
             {
@@ -326,6 +342,10 @@ public sealed partial class MainWindow : Window
     private ConfigurationPageKind EligibleConfigurationPages()
     {
         ConfigurationPageKind pages = ConfigurationPageKind.None;
+        // Update policy controls whether an ordinary-user tray may authorize a
+        // LocalSystem MSI. Keep it synchronized even when Settings is not the
+        // currently visible page.
+        pages |= ConfigurationPageKind.Updates;
         if (_loadedBackupSources is not null || SourcesPanel.Visibility == Visibility.Visible)
         {
             pages |= ConfigurationPageKind.Sources;
@@ -363,6 +383,9 @@ public sealed partial class MainWindow : Window
         AddIfReloadable(
             ConfigurationPageKind.Retention,
             RetentionHasUnsavedChanges());
+        AddIfReloadable(
+            ConfigurationPageKind.Updates,
+            hasUnsavedChanges: false);
         return pages;
 
         void AddIfReloadable(ConfigurationPageKind page, bool hasUnsavedChanges)
@@ -397,7 +420,10 @@ public sealed partial class MainWindow : Window
         ConfigurationPageOperationActive("sources-")
         || ConfigurationPageOperationActive("repository-")
         || ConfigurationPageOperationActive("schedule-")
-        || ConfigurationPageOperationActive("retention-");
+        || ConfigurationPageOperationActive("retention-")
+        || ConfigurationPageOperationActive("update-settings-")
+        || _updateSettingsBusyScopeCount > 0
+        || _updateBusyScopeCount > 0;
 
     private bool ConfigurationPageOperationActive(string operationPrefix) =>
         _activeOperations.Any(operation =>
@@ -436,6 +462,7 @@ public sealed partial class MainWindow : Window
         SetRepositoryBusy(false);
         SetScheduleBusy(false);
         SetRetentionBusy(false);
+        RefreshUpdateControlState();
     }
 
     private async void DiscardConfigurationEditsButton_Click(object sender, RoutedEventArgs e)
@@ -520,6 +547,7 @@ public sealed partial class MainWindow : Window
             }
             if (transition.ShowRequested)
             {
+                ViewWarningDetailsButton.Visibility = Visibility.Collapsed;
                 ApplyStatus(
                     "Backup requested",
                     "The service accepted the request and is preparing to start the backup.",
@@ -528,6 +556,9 @@ public sealed partial class MainWindow : Window
             }
             else
             {
+                ViewWarningDetailsButton.Visibility = status.State == "succeeded_with_warnings"
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
                 ApplyStatus(
                     status.Headline,
                     status.Description,
@@ -544,6 +575,15 @@ public sealed partial class MainWindow : Window
             {
                 ClearConfigurationRefreshDeferred();
             }
+            if (UpdateInstallationDecision.ShouldRecoverSettings(
+                    _updateSettingsLoadAttempted,
+                    _updateSettingsLoaded,
+                    _updateSettingsBusyScopeCount > 0,
+                    _updateBusyScopeCount > 0,
+                    DateTimeOffset.UtcNow >= _nextUpdateSettingsRecoveryAttempt))
+            {
+                await LoadUpdateSettingsAsync();
+            }
             return status;
         }
         catch (Exception exception)
@@ -554,6 +594,7 @@ public sealed partial class MainWindow : Window
             StatusCardDescription.Text = "Start or repair the resticpal service, then reopen this window.";
             RunBackupButton.IsEnabled = false;
             CancelBackupButton.IsEnabled = false;
+            ViewWarningDetailsButton.Visibility = Visibility.Collapsed;
             ShowConnectionError(exception);
             return null;
         }

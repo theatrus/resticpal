@@ -12,6 +12,12 @@ param(
     [Parameter(Mandatory)]
     [string] $AppCastSignaturePath,
 
+    [string] $ProbeAppCastPath,
+
+    [string] $ProbeAppCastSignaturePath,
+
+    [string] $ProbePayloadPath,
+
     [Parameter(Mandatory)]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string] $ExpectedPublishedVersion,
@@ -27,10 +33,15 @@ param(
     [int] $TimeoutMinutes = 30,
 
     [ValidateRange(1, 15)]
-    [int] $InstallerLaunchTimeoutMinutes = 4,
+    [int] $InstallerLaunchTimeoutMinutes = 7,
 
     [ValidateRange(1, 20)]
     [int] $InstallerCompletionTimeoutMinutes = 8,
+
+    [ValidateSet('Prompted', 'Automatic')]
+    [string] $InstallationMode = 'Prompted',
+
+    [string] $KeyPath = (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Dropbox\resticpal\keys\updates'),
 
     [switch] $KeepOpen,
     [switch] $GenerateOnly,
@@ -176,6 +187,21 @@ $candidateTuple = [Version]$ExpectedCandidateVersion
 if ($candidateTuple -le $publishedTuple) {
     throw 'The candidate version must be newer than the published-client version.'
 }
+$bridgeTransition = (
+    $InstallationMode -ceq 'Automatic' -and
+    $ExpectedPublishedVersion -ceq '1.0.6' -and
+    $ExpectedCandidateVersion -ceq '1.0.7')
+$probeArguments = @(
+    $ProbeAppCastPath,
+    $ProbeAppCastSignaturePath,
+    $ProbePayloadPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+if ($bridgeTransition -and $probeArguments.Count -ne 3) {
+    throw ('The 1.0.6-to-1.0.7 automatic transition requires -ProbeAppCastPath, ' +
+           '-ProbeAppCastSignaturePath, and -ProbePayloadPath.')
+}
+if (-not $bridgeTransition -and $probeArguments.Count -ne 0) {
+    throw 'Candidate-tray probe inputs are valid only for the 1.0.6-to-1.0.7 automatic transition.'
+}
 
 Assert-SignedMsi $publishedClientMsi 'Published-client MSI'
 Assert-SignedMsi $candidateMsi 'Candidate MSI'
@@ -188,7 +214,7 @@ if ((Get-Item -LiteralPath $appCastSignature).Length -eq 0 `
 $sparkleNamespace = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
 $appCastLink = $appCastDocument.SelectSingleNode('/rss/channel/link')
 if ($null -eq $appCastLink `
-    -or $appCastLink.InnerText -cne 'https://updates.resticpal.com/appcast.xml') {
+    -or $appCastLink.InnerText -cne 'https://updates.resticpal.com/appcast-v2.xml') {
     throw 'The signed appcast does not identify the primary resticpal update feed.'
 }
 $enclosure = $appCastDocument.SelectSingleNode('/rss/channel/item/enclosure')
@@ -216,6 +242,112 @@ $candidateLength = (Get-Item -LiteralPath $candidateMsi).Length
 if ([uint64]$enclosure.GetAttribute('length') -ne $candidateLength) {
     throw 'The appcast enclosure length does not match the candidate MSI.'
 }
+$enclosureSignature = $enclosure.GetAttribute('signature', $sparkleNamespace)
+
+Push-Location $repositoryRoot
+try {
+    & dotnet tool restore
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Restoring the pinned NetSparkle tool failed.'
+    }
+    $appCastDetachedSignature = (
+        Get-Content -LiteralPath $appCastSignature -Raw).Trim()
+    $appCastVerification = @(& dotnet tool run netsparkle-generate-appcast -- `
+        --verify $appCast `
+        --signature $appCastDetachedSignature `
+        --key-path $KeyPath 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $appCastVerification -cnotcontains 'Signature valid') {
+        throw 'The candidate appcast is not signed by the production update key.'
+    }
+} finally {
+    Pop-Location
+}
+
+$probe = $null
+if ($bridgeTransition) {
+    $resolvedProbeAppCast = (Resolve-Path -LiteralPath $ProbeAppCastPath).Path
+    $resolvedProbeAppCastSignature = (
+        Resolve-Path -LiteralPath $ProbeAppCastSignaturePath).Path
+    $resolvedProbePayload = (Resolve-Path -LiteralPath $ProbePayloadPath).Path
+    [xml] $probeDocument = Get-Content -LiteralPath $resolvedProbeAppCast -Raw
+    $probeLink = $probeDocument.SelectSingleNode('/rss/channel/link')
+    $probeEnclosure = $probeDocument.SelectSingleNode('/rss/channel/item/enclosure')
+    if ($null -eq $probeLink -or
+        $probeLink.InnerText -cne 'https://updates.resticpal.com/appcast-v2.xml' -or
+        $null -eq $probeEnclosure) {
+        throw 'The candidate-tray probe does not identify the v2 update feed.'
+    }
+    $probeVersion = $probeEnclosure.GetAttribute('version', $sparkleNamespace)
+    $expectedProbeTuple = [Version]::new(
+        $candidateTuple.Major,
+        $candidateTuple.Minor,
+        $candidateTuple.Build + 1)
+    if ($probeVersion -cne $expectedProbeTuple.ToString(3) -or
+        $probeEnclosure.GetAttribute('shortVersionString', $sparkleNamespace) -cne $probeVersion -or
+        $probeEnclosure.GetAttribute('os', $sparkleNamespace) -cne 'windows-x64') {
+        throw 'The candidate-tray probe version or platform is not the exact next patch.'
+    }
+    $probePayload = Get-Item -LiteralPath $resolvedProbePayload
+    $expectedProbePayloadName = "resticpal-$probeVersion-x64.msi"
+    $expectedProbeUrl = (
+        "https://updates.resticpal.com/releases/v$probeVersion/$expectedProbePayloadName")
+    $probePackageSignature = $probeEnclosure.GetAttribute('signature', $sparkleNamespace)
+    if ($probePayload.Name -cne $expectedProbePayloadName -or
+        $probeEnclosure.GetAttribute('url') -cne $expectedProbeUrl -or
+        [uint64]$probeEnclosure.GetAttribute('length') -ne [uint64]$probePayload.Length -or
+        [string]::IsNullOrWhiteSpace($probePackageSignature)) {
+        throw 'The candidate-tray probe enclosure does not match its exact sentinel payload.'
+    }
+    $probeXml = Get-Content -LiteralPath $resolvedProbeAppCast -Raw
+    if ($probeXml -cnotmatch (
+            '<sparkle:version>' + [Regex]::Escape($probeVersion) + '</sparkle:version>')) {
+        throw 'The candidate-tray probe has no matching signed item version.'
+    }
+
+    Push-Location $repositoryRoot
+    try {
+        & dotnet tool restore
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Restoring the pinned NetSparkle tool failed.'
+        }
+        $probeDetachedSignature = (
+            Get-Content -LiteralPath $resolvedProbeAppCastSignature -Raw).Trim()
+        $probeVerification = @(& dotnet tool run netsparkle-generate-appcast -- `
+            --verify $resolvedProbeAppCast `
+            --signature $probeDetachedSignature `
+            --key-path $KeyPath 2>&1)
+        if ($LASTEXITCODE -ne 0 -or $probeVerification -cnotcontains 'Signature valid') {
+            throw 'The candidate-tray probe appcast is not signed by the production update key.'
+        }
+        $payloadVerification = @(& dotnet tool run netsparkle-generate-appcast -- `
+            --verify $resolvedProbePayload `
+            --signature $probePackageSignature `
+            --key-path $KeyPath 2>&1)
+        if ($payloadVerification -contains 'Signature valid' -or
+            $payloadVerification -cnotcontains 'Signature invalid') {
+            throw 'The candidate-tray probe payload signature is not deliberately invalid.'
+        }
+    } finally {
+        Pop-Location
+    }
+
+    $probe = [ordered]@{
+        version = $probeVersion
+        appcast_path = $resolvedProbeAppCast
+        appcast_sha256 = (
+            Get-FileHash -LiteralPath $resolvedProbeAppCast -Algorithm SHA256).Hash.ToLowerInvariant()
+        appcast_signature_path = $resolvedProbeAppCastSignature
+        appcast_signature_sha256 = (
+            Get-FileHash -LiteralPath $resolvedProbeAppCastSignature -Algorithm SHA256).Hash.ToLowerInvariant()
+        payload_path = $resolvedProbePayload
+        payload_name = $probePayload.Name
+        payload_url = $expectedProbeUrl
+        payload_length = [uint64]$probePayload.Length
+        payload_sha256 = (
+            Get-FileHash -LiteralPath $resolvedProbePayload -Algorithm SHA256).Hash.ToLowerInvariant()
+        expected_signature = $probePackageSignature
+    }
+}
 
 $runId = '{0}-{1}' -f (
     Get-Date -Format 'yyyyMMdd-HHmmss'), ([Guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -225,6 +357,13 @@ Copy-Item -LiteralPath $publishedClientMsi -Destination (Join-Path $runRoot 'pub
 Copy-Item -LiteralPath $candidateMsi -Destination (Join-Path $runRoot 'candidate.msi')
 Copy-Item -LiteralPath $appCast -Destination (Join-Path $runRoot 'appcast.xml')
 Copy-Item -LiteralPath $appCastSignature -Destination (Join-Path $runRoot 'appcast.xml.signature')
+if ($bridgeTransition) {
+    Copy-Item -LiteralPath $probe.appcast_path -Destination (Join-Path $runRoot 'probe-appcast.xml')
+    Copy-Item -LiteralPath $probe.appcast_signature_path `
+        -Destination (Join-Path $runRoot 'probe-appcast.xml.signature')
+    Copy-Item -LiteralPath $probe.payload_path `
+        -Destination (Join-Path $runRoot $probe.payload_name)
+}
 
 $networking = 'Disable'
 $runtimeConfiguration = @"
@@ -255,9 +394,25 @@ $guestArguments = (
     " -PublishedReleaseAssetLength $($publishedRelease.asset_length)" +
     " -PublishedReleaseAssetUrl $($publishedRelease.asset_url)" +
     " -EnclosureUrl $enclosureUrl" +
+    " -EnclosureSignature $enclosureSignature" +
     " -InstallerLaunchTimeoutMinutes $InstallerLaunchTimeoutMinutes" +
     " -InstallerCompletionTimeoutMinutes $InstallerCompletionTimeoutMinutes" +
+    " -InstallationMode $InstallationMode" +
     ' -ResultRoot C:\ResticPalRun')
+if ($bridgeTransition) {
+    $guestArguments += (
+        ' -BridgeTransition' +
+        ' -ProbeAppCastPath C:\ResticPalRun\probe-appcast.xml' +
+        ' -ProbeAppCastSignaturePath C:\ResticPalRun\probe-appcast.xml.signature' +
+        " -ProbePayloadPath C:\ResticPalRun\$($probe.payload_name)" +
+        " -ExpectedProbeVersion $($probe.version)" +
+        " -ExpectedProbeAppCastSha256 $($probe.appcast_sha256)" +
+        " -ExpectedProbeAppCastSignatureSha256 $($probe.appcast_signature_sha256)" +
+        " -ExpectedProbePayloadSha256 $($probe.payload_sha256)" +
+        " -ExpectedProbePayloadLength $($probe.payload_length)" +
+        " -ExpectedProbePayloadUrl $($probe.payload_url)" +
+        " -ExpectedProbePackageSignature $($probe.expected_signature)")
+}
 $guestLaunchCommand = (
     'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass' +
     ' -File C:\ResticPalSource\scripts\Invoke-WindowsSandboxUpdateTest.ps1' +
@@ -316,6 +471,10 @@ $qualification = [ordered]@{
     appcast_signature_path = $appCastSignature
     appcast_signature_sha256 = $appCastSignatureHash
     enclosure_url = $enclosureUrl
+    enclosure_signature = $enclosureSignature
+    bridge_transition = $bridgeTransition
+    candidate_tray_probe = $probe
+    installation_mode = $InstallationMode.ToLowerInvariant()
     installer_launch_timeout_minutes = $InstallerLaunchTimeoutMinutes
     installer_completion_timeout_minutes = $InstallerCompletionTimeoutMinutes
 }
@@ -347,7 +506,8 @@ if ($null -ne $sandboxCliCommand) {
 }
 
 Write-Host (
-    "Starting published-client update qualification $ExpectedPublishedVersion -> " +
+    "Starting $($InstallationMode.ToLowerInvariant()) published-client update qualification " +
+    "$ExpectedPublishedVersion -> " +
     "$ExpectedCandidateVersion. Installer launch/completion budgets: " +
     "$InstallerLaunchTimeoutMinutes/$InstallerCompletionTimeoutMinutes minutes. Results: $runRoot")
 $sandboxId = $null
@@ -492,8 +652,13 @@ $summary = [pscustomobject]@{
     WindowsBuild = $result.windows_build
     PublishedVersion = $result.published_version
     CandidateVersion = $result.candidate_version
+    InstallationMode = $result.installation_mode
     StagedPath = $result.staged_update.path
     StagedSha256 = $result.staged_update.sha256
+    InstallerSession = $result.verification.candidate_installer_session_id
+    InstallerOwner = $result.verification.candidate_installer_owner
+    InstallerSilent = $result.verification.candidate_installer_silent
+    UserInterventionFree = $result.verification.no_user_confirmation_or_dialog_intervention
     ServiceIdentity = $result.verification.service_identity
     ServiceState = $result.verification.service_state
     PublishedServicePid = $result.verification.baseline_service_process_id
