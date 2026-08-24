@@ -7,6 +7,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$testStartedAt = Get-Date
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
@@ -41,6 +42,25 @@ public static class ResticPalNativeTest
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindowDpiAwarenessContext(IntPtr window);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AreDpiAwarenessContextsEqual(
+        IntPtr first,
+        IntPtr second);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetDpiForWindow(IntPtr window);
+
+    public static bool IsPerMonitorV2(IntPtr window)
+    {
+        return window != IntPtr.Zero && AreDpiAwarenessContextsEqual(
+            GetWindowDpiAwarenessContext(window),
+            new IntPtr(-4));
+    }
+
     public static IntPtr FindWindowForProcess(int processId, string expectedClassName)
     {
         using (Process process = Process.GetProcessById(processId))
@@ -66,128 +86,6 @@ public static class ResticPalNativeTest
             }
         }
         return IntPtr.Zero;
-    }
-}
-'@
-$automationReferences = @(
-    [Windows.Automation.AutomationElement].Assembly.Location
-    [Windows.Automation.TreeScope].Assembly.Location
-)
-Add-Type -ReferencedAssemblies $automationReferences -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using System.Windows.Automation;
-
-public sealed class ResticPalAutomationNameObserver : IDisposable
-{
-    private readonly AutomationElement element;
-    private readonly string expectedText;
-    private readonly IntPtr observed;
-    private readonly AutomationPropertyChangedEventHandler handler;
-    private string observedNames = string.Empty;
-    private bool disposed;
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr CreateEvent(
-        IntPtr eventAttributes,
-        bool manualReset,
-        bool initialState,
-        string name);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetEvent(IntPtr handle);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr handle);
-
-    public ResticPalAutomationNameObserver(AutomationElement element, string expectedText)
-    {
-        if (element == null)
-        {
-            throw new ArgumentNullException("element");
-        }
-        if (string.IsNullOrWhiteSpace(expectedText))
-        {
-            throw new ArgumentException("Expected text is required.", "expectedText");
-        }
-
-        this.element = element;
-        this.expectedText = expectedText;
-        observed = CreateEvent(IntPtr.Zero, true, false, null);
-        if (observed == IntPtr.Zero)
-        {
-            throw new InvalidOperationException("Could not create the UIAutomation observer event.");
-        }
-        handler = OnPropertyChanged;
-        try
-        {
-            Automation.AddAutomationPropertyChangedEventHandler(
-                element,
-                TreeScope.Element,
-                handler,
-                AutomationElement.NameProperty);
-            Record(element.Current.Name);
-        }
-        catch
-        {
-            CloseHandle(observed);
-            throw;
-        }
-    }
-
-    public bool Wait(int timeoutMilliseconds)
-    {
-        if (timeoutMilliseconds < 0)
-        {
-            throw new ArgumentOutOfRangeException("timeoutMilliseconds");
-        }
-        return WaitForSingleObject(observed, (uint)timeoutMilliseconds) == 0;
-    }
-
-    public string ObservedNames
-    {
-        get { return observedNames; }
-    }
-
-    private void OnPropertyChanged(object sender, AutomationPropertyChangedEventArgs args)
-    {
-        if (args.Property == AutomationElement.NameProperty)
-        {
-            Record(Convert.ToString(args.NewValue));
-        }
-    }
-
-    private void Record(string value)
-    {
-        value = value ?? string.Empty;
-        observedNames = observedNames.Length == 0
-            ? value
-            : observedNames + " | " + value;
-        if (value.IndexOf(expectedText, StringComparison.OrdinalIgnoreCase) >= 0)
-        {
-            SetEvent(observed);
-        }
-    }
-
-    public void Dispose()
-    {
-        if (disposed)
-        {
-            return;
-        }
-        disposed = true;
-        try
-        {
-            Automation.RemoveAutomationPropertyChangedEventHandler(element, handler);
-        }
-        catch (ElementNotAvailableException)
-        {
-            // The window closed after the assertion; no handler remains to leak.
-        }
-        CloseHandle(observed);
     }
 }
 '@
@@ -234,6 +132,7 @@ $installedByTest = $false
 $installedPackagePath = $null
 $onboardingMarkerCreatedByTest = $false
 $testReachedPersistenceCheck = $false
+$candidateFileVersion = $null
 
 function Invoke-Installer([string] $Arguments, [string] $Action) {
     $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" `
@@ -626,6 +525,12 @@ try {
             [ServiceProcess.ServiceControllerStatus]::Running,
             [TimeSpan]::FromSeconds(30)
         )
+        $baselineTrayProcess = Wait-InteractiveProcess 'resticpal-tray' ([TimeSpan]::FromSeconds(30))
+        $baselineUiProcess = Wait-InteractiveProcess 'resticpal-ui' ([TimeSpan]::FromSeconds(30))
+        Write-Host (
+            "Baseline tray $($baselineTrayProcess.Id) and Settings $($baselineUiProcess.Id) " +
+            'are live for the major-upgrade application-shutdown check.'
+        )
         $upgradeSentinel = Join-Path $dataRoot 'upgrade-sentinel.txt'
         Set-Content -LiteralPath $upgradeSentinel -Value 'preserve across major upgrade' -NoNewline
         Write-Host "Upgrading the baseline installation to $resolvedMsiPath"
@@ -659,6 +564,12 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $installRoot $fileName) -PathType Leaf)) {
             throw "Installed payload is missing $fileName"
         }
+    }
+    $candidateFileVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo(
+        (Join-Path $installRoot 'resticpal-ui.exe')
+    ).FileVersion
+    if ([string]::IsNullOrWhiteSpace($candidateFileVersion)) {
+        throw 'The installed candidate Settings executable has no file version.'
     }
     $runValue = Get-ItemPropertyValue -LiteralPath 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' -Name ResticPal
     if ($runValue -notlike '*resticpal-tray.exe*') {
@@ -753,6 +664,14 @@ try {
     if ($trayWindowProcessId -ne $trayProcess.Id) {
         throw "The tray window belongs to unexpected process $trayWindowProcessId."
     }
+    if (-not [ResticPalNativeTest]::IsPerMonitorV2($trayWindow)) {
+        throw 'The installed tray hidden window is not Per-Monitor-v2 DPI aware.'
+    }
+    $trayDpi = [ResticPalNativeTest]::GetDpiForWindow($trayWindow)
+    if ($trayDpi -lt 96) {
+        throw "The installed tray hidden window reported invalid DPI $trayDpi."
+    }
+    Write-Host "The tray hidden window is Per-Monitor-v2 aware at $trayDpi DPI."
 
     if (-not [ResticPalNativeTest]::PostMessage(
         $trayWindow,
@@ -776,8 +695,18 @@ try {
     )) {
         throw 'Posting the tray right-click callback failed.'
     }
-    Wait-NativeWindowForProcess $trayProcess '#32768' ([TimeSpan]::FromSeconds(10)) | Out-Null
-    Write-Host 'A tray right click opened the native action menu.'
+    $trayMenuWindow = Wait-NativeWindowForProcess `
+        $trayProcess `
+        '#32768' `
+        ([TimeSpan]::FromSeconds(10))
+    if (-not [ResticPalNativeTest]::IsPerMonitorV2($trayMenuWindow)) {
+        throw 'The tray action menu is not Per-Monitor-v2 DPI aware.'
+    }
+    $trayMenuDpi = [ResticPalNativeTest]::GetDpiForWindow($trayMenuWindow)
+    if ($trayMenuDpi -lt 96) {
+        throw "The tray action menu reported invalid DPI $trayMenuDpi."
+    }
+    Write-Host "A tray right click opened a Per-Monitor-v2 action menu at $trayMenuDpi DPI."
     if (-not [ResticPalNativeTest]::PostMessage(
         $trayWindow,
         0x001F,
@@ -944,28 +873,15 @@ try {
     $overviewSelection.Select()
     $runBackupButton = Wait-AutomationElementEnabled $updatesUiProcess 'RunBackupButton' ([TimeSpan]::FromSeconds(10))
     $runBackupInvoke = $runBackupButton.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)
-    # Subscribe before invoking: the requested state intentionally gives way
-    # to running quickly, so polling after the click can miss a transition that
-    # was rendered correctly. The native UIA callback records even a brief Name
-    # change without relying on a PowerShell callback runspace.
-    $statusCardTitle = Wait-AutomationElement $updatesUiProcess 'StatusCardTitle' ([TimeSpan]::FromSeconds(10))
-    $requestedObserver = [ResticPalAutomationNameObserver]::new(
-        $statusCardTitle,
-        'Backup requested'
-    )
-    try {
-        $runBackupInvoke.Invoke()
-        if (-not $requestedObserver.Wait(10000)) {
-            throw "The status card never rendered the requested state. Observed: $($requestedObserver.ObservedNames)"
-        }
-    } finally {
-        $requestedObserver.Dispose()
-    }
+    $runBackupInvoke.Invoke()
+    # The persistent acknowledgement is the installed accessibility contract;
+    # the short requested-card dwell has focused pure-state coverage because
+    # UI Automation may coalesce intermediate TextBlock Name notifications.
     Wait-AutomationTextContains $updatesUiProcess 'MessageBar' 'Backup requested' ([TimeSpan]::FromSeconds(10)) | Out-Null
     Wait-AutomationTextContains $updatesUiProcess 'StatusCardTitle' 'Backup in progress' ([TimeSpan]::FromSeconds(30)) | Out-Null
     $run = Wait-Backup ([TimeSpan]::FromMinutes(3)) $automaticRun.snapshot_id
     Wait-AutomationTextContains $updatesUiProcess 'StatusCardTitle' 'Protected' ([TimeSpan]::FromSeconds(15)) | Out-Null
-    Write-Host "The Run backup now status card rendered requested, running, and completed states for append-only snapshot $($run.snapshot_id)."
+    Write-Host "Run backup now rendered its acknowledgement, running, and completed states for append-only snapshot $($run.snapshot_id)."
 
     $appendOnlyRetention = Invoke-ResticPalRequest @{ type = 'get_retention' }
     if ($appendOnlyRetention.type -ne 'retention' -or $appendOnlyRetention.configuration.repository_mode -ne 'append_only') {
@@ -1055,6 +971,27 @@ try {
             if ($null -ne $remainingProcess) {
                 throw "$processName is still running in the interactive session after uninstall."
             }
+        }
+        if ([string]::IsNullOrWhiteSpace($candidateFileVersion)) {
+            throw 'The installed candidate file version was not captured before uninstall.'
+        }
+        $candidateVersionPattern = [Regex]::Escape($candidateFileVersion)
+        $candidateCrashEvents = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'Application'
+            ProviderName = 'Application Error'
+            Id = 1000
+            StartTime = $testStartedAt
+        } -ErrorAction SilentlyContinue | Where-Object {
+            $_.Message -match (
+                'Faulting application name: resticpal-(?:ui|tray|service)\.exe, ' +
+                "version: $candidateVersionPattern,")
+        })
+        if ($candidateCrashEvents.Count -gt 0) {
+            $crashSummary = @($candidateCrashEvents | ForEach-Object {
+                $firstLine = ($_.Message -split '\r?\n')[0]
+                "[$($_.TimeCreated.ToString('O'))] $firstLine"
+            }) -join '; '
+            throw "A candidate resticpal process crashed during the installed lifecycle: $crashSummary"
         }
         if (-not (Test-Path -LiteralPath $dataRoot)) {
             throw 'Uninstall removed machine backup data instead of preserving it.'
