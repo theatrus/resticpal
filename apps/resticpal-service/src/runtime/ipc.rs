@@ -10,9 +10,9 @@ use resticpal_core::policy::PolicyField;
 use resticpal_core::restic::ResticOperation;
 use resticpal_core::status::{BackupState, WaitingReason};
 use resticpal_protocol::{
-    BackupSourcesView, RepositoryOperationKind, RepositoryOperationStatus, RepositorySecretUpdate,
-    RepositoryView, Request, RequestCommand, Response, ResponsePayload, RetentionView,
-    ScheduleView, UpdatePackage, UpdateSettingsView,
+    BackupRunFailureDetails, BackupSourcesView, RepositoryOperationKind, RepositoryOperationStatus,
+    RepositorySecretUpdate, RepositoryView, Request, RequestCommand, Response, ResponsePayload,
+    RetentionView, ScheduleView, UpdatePackage, UpdateSettingsView,
 };
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::ClientIdentity;
@@ -24,7 +24,7 @@ use crate::updater;
 
 const MAX_SECRET_UPDATES: usize = 16;
 const MIN_UPDATE_HOLD_SECONDS: u32 = 60;
-const MAX_UPDATE_HOLD_SECONDS: u32 = 30 * 60;
+const MAX_UPDATE_HOLD_SECONDS: u32 = updater::UPDATE_INSTALL_TIMEOUT_SECONDS;
 
 impl ServiceRuntime {
     pub fn handle_request(&self, request: Request, identity: ClientIdentity) -> Response {
@@ -61,6 +61,39 @@ impl ServiceRuntime {
                             rejected(
                                 "history_unavailable",
                                 "Backup history could not be read from local storage.",
+                            )
+                        }
+                    }
+                } else {
+                    rejected(
+                        "history_unavailable",
+                        "Backup history storage is not available.",
+                    )
+                }
+            }
+            RequestCommand::GetRunFailureDetails { run_id } => {
+                if !identity.is_elevated_administrator {
+                    administrator_required()
+                } else if let Some(store) = &self.history_store {
+                    match store.failure_details(run_id) {
+                        Ok(Some(details)) => ResponsePayload::RunFailureDetails {
+                            details: BackupRunFailureDetails {
+                                run_id,
+                                items: details.items,
+                                omitted: details.omitted,
+                            },
+                        },
+                        Ok(None) => rejected(
+                            "history_run_not_found",
+                            "The requested backup history entry does not exist.",
+                        ),
+                        Err(error) => {
+                            eprintln!(
+                                "could not read sensitive backup failure details for run {run_id}: {error}"
+                            );
+                            rejected(
+                                "history_unavailable",
+                                "Backup failure details could not be read from local storage.",
                             )
                         }
                     }
@@ -208,9 +241,10 @@ impl ServiceRuntime {
                     let mut state = self.state_guard();
                     if matches!(state.status.state, BackupState::Running { .. }) {
                         rejected("already_running", "A backup is already running.")
-                    } else if state
-                        .update_hold_until
-                        .is_some_and(|deadline| deadline > Utc::now())
+                    } else if state.update_install_active
+                        || state
+                            .update_hold_until
+                            .is_some_and(|deadline| deadline > Utc::now())
                     {
                         rejected(
                             "update_pending",
@@ -359,9 +393,10 @@ impl ServiceRuntime {
         }
 
         let mut state = self.state_guard();
-        if state
-            .update_hold_until
-            .is_some_and(|deadline| deadline > Utc::now())
+        if state.update_install_active
+            || state
+                .update_hold_until
+                .is_some_and(|deadline| deadline > Utc::now())
         {
             return rejected(
                 "update_pending",
@@ -440,6 +475,16 @@ impl ServiceRuntime {
         if !identity.is_elevated_administrator {
             return administrator_required();
         }
+        let _mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.config_read().updates.automatic_install {
+            return rejected(
+                "automatic_updates_enabled",
+                "This device's effective policy requires the protected service to install updates silently.",
+            );
+        }
         if !(MIN_UPDATE_HOLD_SECONDS..=MAX_UPDATE_HOLD_SECONDS).contains(&hold_seconds) {
             return rejected(
                 "invalid_update_hold",
@@ -449,6 +494,21 @@ impl ServiceRuntime {
 
         let now = Utc::now();
         let mut state = self.state_guard();
+        if state.update_install_active {
+            return rejected(
+                "update_already_running",
+                "The protected service is already installing an update.",
+            );
+        }
+        if state
+            .update_hold_until
+            .is_some_and(|existing_deadline| existing_deadline > now)
+        {
+            return rejected(
+                "update_pending",
+                "Another update request is already holding backup work.",
+            );
+        }
         if matches!(state.status.state, BackupState::Running { .. }) {
             return rejected(
                 "backup_running",
@@ -469,10 +529,7 @@ impl ServiceRuntime {
         let deadline = now
             .checked_add_signed(Duration::seconds(i64::from(hold_seconds)))
             .unwrap_or(now);
-        if state
-            .update_hold_until
-            .is_none_or(|existing_deadline| existing_deadline <= now)
-        {
+        if state.update_hold_previous_status.is_none() {
             state.update_hold_previous_status =
                 Some((state.status.state.clone(), state.status.next_deadline));
         }
@@ -494,9 +551,22 @@ impl ServiceRuntime {
     }
 
     fn update_settings_view(&self) -> UpdateSettingsView {
+        let _mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         UpdateSettingsView {
-            automatic_install: self.local_config_guard().updates.automatic_install,
+            automatic_install: self.config_read().updates.automatic_install,
+            automatic_install_locked: self.field_locked(PolicyField::UpdateAutomaticInstall),
         }
+    }
+
+    fn update_blocks_configuration_mutation(&self) -> bool {
+        let state = self.state_guard();
+        state.update_install_active
+            || state
+                .update_hold_until
+                .is_some_and(|deadline| deadline > Utc::now())
     }
 
     fn update_update_settings(
@@ -507,8 +577,31 @@ impl ServiceRuntime {
         if !identity.is_elevated_administrator {
             return administrator_required();
         }
+        let _mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.field_locked(PolicyField::UpdateAutomaticInstall) {
+            return rejected(
+                "managed_field_locked",
+                "Automatic update installation is locked by managed policy.",
+            );
+        }
+        {
+            let state = self.state_guard();
+            if state.update_install_active
+                || state
+                    .update_hold_until
+                    .is_some_and(|deadline| deadline > Utc::now())
+            {
+                return rejected(
+                    "update_pending",
+                    "Automatic-update mode cannot change while an update is in progress.",
+                );
+            }
+        }
         let mut candidate = self.local_config_guard().clone();
-        candidate.updates.automatic_install = automatic_install;
+        candidate.updates.automatic_install = Some(automatic_install);
         if let Some(store) = &self.config_store
             && let Err(error) = store.save(&candidate)
         {
@@ -522,6 +615,7 @@ impl ServiceRuntime {
             );
         }
         *self.local_config_guard() = candidate;
+        self.config_write().updates.automatic_install = automatic_install;
         ResponsePayload::Accepted {
             message: if automatic_install {
                 "Signed resticpal updates will install automatically in the background.".to_owned()
@@ -534,11 +628,18 @@ impl ServiceRuntime {
     fn begin_update_install(
         &self,
         package: UpdatePackage,
-        identity: ClientIdentity,
+        _identity: ClientIdentity,
     ) -> ResponsePayload {
-        let automatic_install = self.local_config_guard().updates.automatic_install;
-        if !identity.is_elevated_administrator && !automatic_install {
-            return administrator_required();
+        let _mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let automatic_install = self.config_read().updates.automatic_install;
+        if !automatic_install {
+            return rejected(
+                "automatic_updates_disabled",
+                "Automatic update installation is disabled by this device's effective policy.",
+            );
         }
         if let Err(error) = updater::validate_package(&package) {
             eprintln!("rejected update metadata for {}: {error}", package.version);
@@ -554,6 +655,15 @@ impl ServiceRuntime {
             return rejected(
                 "update_already_running",
                 "An update is already being installed.",
+            );
+        }
+        if state
+            .update_hold_until
+            .is_some_and(|existing_deadline| existing_deadline > now)
+        {
+            return rejected(
+                "update_pending",
+                "A prompted update is already holding backup work.",
             );
         }
         if matches!(state.status.state, BackupState::Running { .. }) {
@@ -678,6 +788,16 @@ impl ServiceRuntime {
         if !identity.is_elevated_administrator {
             return administrator_required();
         }
+        let _configuration_mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.update_blocks_configuration_mutation() {
+            return rejected(
+                "update_pending",
+                "Wait for the resticpal update to finish before changing configuration.",
+            );
+        }
         if self.config_read().repository.mode == RepositoryMode::AppendOnly {
             return rejected(
                 "retention_managed_by_server",
@@ -779,6 +899,16 @@ impl ServiceRuntime {
         if !identity.is_elevated_administrator {
             return administrator_required();
         }
+        let _configuration_mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.update_blocks_configuration_mutation() {
+            return rejected(
+                "update_pending",
+                "Wait for the resticpal update to finish before changing configuration.",
+            );
+        }
         if interval_hours.is_none()
             && wake_grace_seconds.is_none()
             && wake_lock_timeout_seconds.is_none()
@@ -879,6 +1009,16 @@ impl ServiceRuntime {
         if !identity.is_elevated_administrator {
             return administrator_required();
         }
+        let _configuration_mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.update_blocks_configuration_mutation() {
+            return rejected(
+                "update_pending",
+                "Wait for the resticpal update to finish before changing configuration.",
+            );
+        }
         if paths.is_none() && exclusions.is_none() {
             return rejected(
                 "no_configuration_changes",
@@ -951,6 +1091,16 @@ impl ServiceRuntime {
         let connection_changed = url.is_some() || options.is_some() || !secret_updates.is_empty();
         if !identity.is_elevated_administrator {
             return administrator_required();
+        }
+        let _configuration_mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.update_blocks_configuration_mutation() {
+            return rejected(
+                "update_pending",
+                "Wait for the resticpal update to finish before changing configuration.",
+            );
         }
         if display_name.is_none()
             && url.is_none()

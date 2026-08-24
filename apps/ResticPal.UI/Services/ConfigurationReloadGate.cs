@@ -8,7 +8,8 @@ internal enum ConfigurationPageKind
     Repository = 1 << 1,
     Schedule = 1 << 2,
     Retention = 1 << 3,
-    All = Sources | Repository | Schedule | Retention,
+    Updates = 1 << 4,
+    All = Sources | Repository | Schedule | Retention | Updates,
 }
 
 /// <summary>
@@ -119,7 +120,7 @@ internal static class ConfigurationFieldDiff
 
 /// <summary>
 /// Describes local edits that a managed-policy reload must not overwrite.
-/// Keeping the four configuration surfaces explicit makes adding a new page a
+/// Keeping the editable configuration surfaces explicit makes adding a new page a
 /// deliberate change to both the guard and its tests.
 /// </summary>
 internal readonly record struct ConfigurationPageEditState(

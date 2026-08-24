@@ -14,7 +14,8 @@ public sealed class ConfigurationReloadGateTests
         plan.Complete(
             ConfigurationPageKind.Sources
             | ConfigurationPageKind.Schedule
-            | ConfigurationPageKind.Retention);
+            | ConfigurationPageKind.Retention
+            | ConfigurationPageKind.Updates);
 
         Assert.Equal(ConfigurationPageKind.Repository, plan.PendingPages);
         Assert.True(plan.Needs(ConfigurationPageKind.Repository));
@@ -35,6 +36,7 @@ public sealed class ConfigurationReloadGateTests
         Assert.False(plan.Needs(ConfigurationPageKind.Schedule));
         Assert.True(plan.Needs(ConfigurationPageKind.Repository));
         Assert.True(plan.Needs(ConfigurationPageKind.Retention));
+        Assert.True(plan.Needs(ConfigurationPageKind.Updates));
     }
 
     [Fact]
@@ -70,6 +72,7 @@ public sealed class ConfigurationReloadGateTests
         Assert.True(plan.Needs(ConfigurationPageKind.Repository));
         Assert.True(plan.Needs(ConfigurationPageKind.Schedule));
         Assert.True(plan.Needs(ConfigurationPageKind.Retention));
+        Assert.True(plan.Needs(ConfigurationPageKind.Updates));
     }
 
     [Fact]

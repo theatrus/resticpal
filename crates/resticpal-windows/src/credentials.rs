@@ -58,7 +58,7 @@ impl DpapiSecretStore {
         let root = root.into();
         fs::create_dir_all(&root)?;
         validate_directory(&root)?;
-        protect_path(&root)?;
+        protect_service_data_path(&root)?;
 
         for entry in fs::read_dir(&root)? {
             let entry = entry?;
@@ -73,7 +73,7 @@ impl DpapiSecretStore {
             if is_reparse_point(&metadata) || !metadata.is_file() {
                 return Err(CredentialStoreError::UnexpectedStoreEntry);
             }
-            protect_path(&entry.path())?;
+            protect_service_data_path(&entry.path())?;
         }
 
         Ok(Self { root })
@@ -183,11 +183,11 @@ impl DpapiSecretStore {
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        protect_path(&temporary)?;
+        protect_service_data_path(&temporary)?;
 
         move_file_replacing(&temporary, &target)?;
         cleanup.disarm();
-        protect_path(&target)?;
+        protect_service_data_path(&target)?;
         Ok(())
     }
 }
@@ -316,7 +316,11 @@ impl Drop for LocalBlob {
     }
 }
 
-fn protect_path(path: &Path) -> Result<(), CredentialStoreError> {
+/// Replaces inheritance with a protected DACL granting full access only to
+/// LocalSystem, administrators, and the current process identity. The current
+/// identity keeps isolated development/test stores usable; in the installed
+/// service it is LocalSystem.
+pub fn protect_service_data_path(path: &Path) -> Result<(), CredentialStoreError> {
     let acl = CredentialAcl::for_current_identity()?;
     let mut path = wide_null(path.as_os_str());
     // SAFETY: path is writable and null terminated, the DACL remains live for

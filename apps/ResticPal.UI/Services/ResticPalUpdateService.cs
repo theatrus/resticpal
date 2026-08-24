@@ -256,9 +256,38 @@ internal sealed class AvailableUpdate
     internal AppCastItem Item { get; }
     internal string Version => Item.Version ?? "unknown";
     internal ulong? Size => Item.UpdateSize > 0 ? checked((ulong)Item.UpdateSize) : null;
+
+    internal SignedUpdatePackage SignedPackage
+    {
+        get
+        {
+            string version = Item.Version
+                ?? throw new InvalidOperationException("The signed update has no version.");
+            string url = Item.DownloadLink
+                ?? throw new InvalidOperationException("The signed update has no download URL.");
+            string signature = Item.DownloadSignature
+                ?? throw new InvalidOperationException("The signed update has no installer signature.");
+            if (Item.UpdateSize <= 0)
+            {
+                throw new InvalidOperationException("The signed update has no valid installer length.");
+            }
+
+            return new SignedUpdatePackage(
+                version,
+                url,
+                signature,
+                checked((ulong)Item.UpdateSize));
+        }
+    }
 }
 
 internal sealed record DownloadedUpdate(AvailableUpdate Update, string Path);
+
+internal sealed record SignedUpdatePackage(
+    string Version,
+    string Url,
+    string Signature,
+    ulong Length);
 
 internal sealed record UpdateCheckResult(UpdateCheckStatus Status, AvailableUpdate? Update)
 {

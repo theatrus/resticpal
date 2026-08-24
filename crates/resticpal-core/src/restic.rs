@@ -13,6 +13,7 @@ use crate::config::{
 #[serde(rename_all = "snake_case")]
 pub enum ResticOperation {
     Backup,
+    Unlock,
     Probe,
     Snapshots,
     Check,
@@ -33,7 +34,7 @@ impl ResticOperation {
             RepositoryMode::AppendOnly => {
                 matches!(
                     self,
-                    Self::Backup | Self::Probe | Self::Snapshots | Self::Check
+                    Self::Backup | Self::Unlock | Self::Probe | Self::Snapshots | Self::Check
                 )
             }
         }
@@ -94,6 +95,35 @@ impl ResticCommandBuilder {
 
         Ok(ResticInvocation {
             operation: ResticOperation::Backup,
+            executable: self.executable.clone(),
+            arguments,
+            environment: BTreeMap::from([(
+                OsString::from("RESTIC_REPOSITORY"),
+                OsString::from(repository),
+            )]),
+            secret_environment: config.repository.secret_refs.clone(),
+        })
+    }
+
+    /// Builds the narrow lock cleanup operation used before every backup.
+    ///
+    /// Restic's plain `unlock` command removes only locks it classifies as
+    /// stale. Deliberately omit `--remove-all`: an active lock owned by another
+    /// client must continue to block the subsequent backup.
+    pub fn unlock(&self, config: &EffectiveConfig) -> Result<ResticInvocation, InvocationError> {
+        authorize_operation(config.repository.mode, ResticOperation::Unlock)?;
+        config.validate()?;
+
+        let repository = config
+            .repository
+            .url
+            .as_ref()
+            .ok_or(InvocationError::MissingRepository)?;
+        let mut arguments = repository_options(config);
+        arguments.push("unlock".into());
+
+        Ok(ResticInvocation {
+            operation: ResticOperation::Unlock,
             executable: self.executable.clone(),
             arguments,
             environment: BTreeMap::from([(
@@ -342,9 +372,10 @@ mod tests {
     }
 
     #[test]
-    fn append_only_allows_backup_and_read_only_inspection() {
+    fn append_only_allows_backup_stale_lock_cleanup_and_read_only_inspection() {
         for operation in [
             ResticOperation::Backup,
+            ResticOperation::Unlock,
             ResticOperation::Probe,
             ResticOperation::Snapshots,
             ResticOperation::Check,
@@ -353,6 +384,29 @@ mod tests {
                 authorize_operation(RepositoryMode::AppendOnly, operation),
                 Ok(())
             );
+        }
+    }
+
+    #[test]
+    fn unlock_is_narrow_and_allowed_in_both_repository_modes() {
+        for mode in [RepositoryMode::Standard, RepositoryMode::AppendOnly] {
+            let config = configured(mode);
+            let invocation = ResticCommandBuilder::new("restic.exe")
+                .unlock(&config)
+                .expect("stale lock cleanup is allowed");
+
+            assert_eq!(invocation.operation, ResticOperation::Unlock);
+            assert_eq!(
+                invocation.arguments,
+                ["--option", "s3.region=us-west-2", "unlock"].map(OsString::from)
+            );
+            assert!(
+                !invocation
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "--remove-all")
+            );
+            assert_eq!(invocation.secret_environment, config.repository.secret_refs);
         }
     }
 

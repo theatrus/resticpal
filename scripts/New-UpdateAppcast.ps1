@@ -157,11 +157,12 @@ try {
         throw "Restoring the pinned NetSparkle tool failed with exit code $LASTEXITCODE."
     }
 
-    $appCastUrl = 'https://updates.resticpal.com/appcast.xml'
+    $appCastUrl = 'https://updates.resticpal.com/appcast-v2.xml'
     $arguments = @(
         '--single-file', $resolvedMsiPath,
         '--file-version', $Version,
         '--appcast-output-directory', $resolvedOutput,
+        '--output-file-name', 'appcast-v2',
         '--base-url', $releaseBaseUrl,
         '--link-tag', $appCastUrl,
         '--product-name', 'resticpal',
@@ -177,7 +178,7 @@ try {
     Pop-Location
 }
 
-$appCastPath = Join-Path $resolvedOutput 'appcast.xml'
+$appCastPath = Join-Path $resolvedOutput 'appcast-v2.xml'
 $appCastSignaturePath = "$appCastPath.signature"
 foreach ($outputFile in @($appCastPath, $appCastSignaturePath)) {
     if (-not (Test-Path -LiteralPath $outputFile -PathType Leaf)) {

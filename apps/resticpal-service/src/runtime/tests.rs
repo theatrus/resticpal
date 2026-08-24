@@ -20,8 +20,8 @@ use resticpal_windows::named_pipe::ClientIdentity;
 use crate::conditions::SystemConditions;
 use crate::config_store::LocalConfigStore;
 use crate::executor::{
-    BackupOutcome, BackupOutcomeKind, RepositoryOutcome, RepositoryOutcomeKind, RetentionOutcome,
-    RetentionOutcomeKind,
+    BackupFailureDetails, BackupOutcome, BackupOutcomeKind, RepositoryOutcome,
+    RepositoryOutcomeKind, RetentionOutcome, RetentionOutcomeKind,
 };
 use crate::management::PendingEnrollment;
 use crate::state::{ScheduleStateStore, ServiceStateSnapshot};
@@ -40,14 +40,14 @@ use std::thread;
 use std::time::Duration as StdDuration;
 
 use resticpal_core::config::{
-    BackupConfig, LocalBackupConfig, LocalRepositoryConfig, RepositoryConfig,
-    SecretEnvironmentVariable,
+    BackupConfig, LocalBackupConfig, LocalManagementConfig, LocalRepositoryConfig,
+    LocalUpdateConfig, RepositoryConfig, SecretEnvironmentVariable,
 };
 use resticpal_core::management::{
     EnrollmentMaterial, MANAGEMENT_SCHEMA_VERSION, ManifestPayload, SignedManifestEnvelope,
     VerifiedManifest,
 };
-use resticpal_core::policy::{Managed, ManagedSchedulePolicy};
+use resticpal_core::policy::{Managed, ManagedSchedulePolicy, ManagedUpdatePolicy};
 use resticpal_protocol::{PROTOCOL_VERSION, SecretValue};
 use resticpal_windows::credentials::CredentialStoreError;
 use resticpal_windows::named_pipe::{NamedPipeClient, NamedPipeServer};
@@ -275,6 +275,38 @@ fn update_preparation_is_admin_only_bounded_and_blocks_new_backup_work() {
         }
     ));
 
+    let enable_automatic = runtime.handle_request(
+        Request::new(
+            481,
+            RequestCommand::UpdateUpdateSettings {
+                automatic_install: true,
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(
+        enable_automatic.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "update_pending"
+    ));
+    let automatic_during_prompted_hold = runtime.handle_request(
+        Request::new(
+            482,
+            RequestCommand::InstallUpdate {
+                package: UpdatePackage {
+                    version: "99.0.0".to_owned(),
+                    url: "https://github.com/theatrus/resticpal/releases/download/v99.0.0/resticpal-99.0.0-x64.msi".to_owned(),
+                    signature: base64::engine::general_purpose::STANDARD.encode([0_u8; 64]),
+                    length: 83_329_024,
+                },
+            },
+        ),
+        USER,
+    );
+    assert!(matches!(
+        automatic_during_prompted_hold.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "automatic_updates_disabled"
+    ));
+
     let run_now = runtime.handle_request(Request::new(49, RequestCommand::RunBackupNow), USER);
     assert!(matches!(
         run_now.payload,
@@ -313,11 +345,27 @@ fn update_preparation_rejects_an_active_backup() {
 #[test]
 fn expired_update_preparation_restores_an_unconfigured_status() {
     let (runtime, _events) = runtime(false);
-    let response = runtime.handle_request(
+    let first_response = runtime.handle_request(
         Request::new(51, RequestCommand::PrepareForUpdate { hold_seconds: 60 }),
         ADMIN,
     );
-    assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+    assert!(matches!(
+        first_response.payload,
+        ResponsePayload::Accepted { .. }
+    ));
+
+    // A second request can arrive after the deadline but before the scheduler
+    // has restored the original state. Extending that stale hold must retain
+    // the original Unconfigured snapshot rather than capturing Waiting(Update).
+    runtime.state_guard().update_hold_until = Some(Utc::now() - Duration::seconds(1));
+    let second_response = runtime.handle_request(
+        Request::new(511, RequestCommand::PrepareForUpdate { hold_seconds: 60 }),
+        ADMIN,
+    );
+    assert!(matches!(
+        second_response.payload,
+        ResponsePayload::Accepted { .. }
+    ));
 
     let deadline = runtime.status().next_deadline.expect("update deadline");
     assert_eq!(
@@ -353,7 +401,20 @@ fn automatic_update_setting_is_admin_controlled_and_authorizes_the_tray() {
     );
     assert!(matches!(
         disabled.payload,
-        ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+        ResponsePayload::Rejected { ref code, .. } if code == "automatic_updates_disabled"
+    ));
+    let disabled_for_admin = runtime.handle_request(
+        Request::new(
+            521,
+            RequestCommand::InstallUpdate {
+                package: package.clone(),
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(
+        disabled_for_admin.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "automatic_updates_disabled"
     ));
 
     let user_change = runtime.handle_request(
@@ -386,9 +447,19 @@ fn automatic_update_setting_is_admin_controlled_and_authorizes_the_tray() {
             .payload,
         ResponsePayload::UpdateSettings {
             configuration: UpdateSettingsView {
-                automatic_install: true
+                automatic_install: true,
+                automatic_install_locked: false,
             }
         }
+    ));
+
+    let prompted_prepare = runtime.handle_request(
+        Request::new(551, RequestCommand::PrepareForUpdate { hold_seconds: 900 }),
+        ADMIN,
+    );
+    assert!(matches!(
+        prompted_prepare.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "automatic_updates_enabled"
     ));
 
     let install = runtime.handle_request(
@@ -412,10 +483,538 @@ fn automatic_update_setting_is_admin_controlled_and_authorizes_the_tray() {
         }
     ));
 
+    let disabled_while_installing = runtime.handle_request(
+        Request::new(
+            561,
+            RequestCommand::UpdateUpdateSettings {
+                automatic_install: false,
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(
+        disabled_while_installing.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "update_pending"
+    ));
+    let prompted_during_automatic_install = runtime.handle_request(
+        Request::new(562, RequestCommand::PrepareForUpdate { hold_seconds: 900 }),
+        ADMIN,
+    );
+    assert!(matches!(
+        prompted_during_automatic_install.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "automatic_updates_enabled"
+    ));
+
     runtime.finish_update_install(&UpdateInstallOutcome::Failed {
         code: "test_update_failed",
     });
     assert!(matches!(runtime.status().state, BackupState::Unconfigured));
+}
+
+#[test]
+fn indeterminate_installer_keeps_backups_and_new_updates_paused() {
+    let (runtime, events) = runtime(true);
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(
+                    563,
+                    RequestCommand::UpdateUpdateSettings {
+                        automatic_install: true,
+                    },
+                ),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::Accepted { .. }
+    ));
+    let package = UpdatePackage {
+        version: "99.0.0".to_owned(),
+        url: "https://github.com/theatrus/resticpal/releases/download/v99.0.0/resticpal-99.0.0-x64.msi".to_owned(),
+        signature: base64::engine::general_purpose::STANDARD.encode([0_u8; 64]),
+        length: 83_329_024,
+    };
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(
+                    564,
+                    RequestCommand::InstallUpdate {
+                        package: package.clone(),
+                    },
+                ),
+                USER,
+            )
+            .payload,
+        ResponsePayload::Accepted { .. }
+    ));
+    assert_eq!(
+        events.recv().expect("update event"),
+        RuntimeEvent::UpdateInstallRequested(package.clone())
+    );
+
+    runtime.finish_update_install(&UpdateInstallOutcome::Indeterminate {
+        code: "update_installer_indeterminate",
+    });
+    runtime.state_guard().update_hold_until = Some(Utc::now() - Duration::seconds(1));
+    runtime.config_write().repository.secret_refs.insert(
+        SecretEnvironmentVariable::ResticPassword,
+        "resticpal/repository/restic_password".to_owned(),
+    );
+
+    assert!(runtime.state_guard().update_install_active);
+    assert_eq!(
+        runtime.evaluate_schedule(Utc::now(), available_conditions()),
+        ScheduleAction::None
+    );
+    assert!(matches!(
+        runtime.status().state,
+        BackupState::Waiting {
+            reason: WaitingReason::Update
+        }
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(565, RequestCommand::RunBackupNow), USER)
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "update_pending"
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(566, RequestCommand::ValidateRepository), ADMIN)
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "update_pending"
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(
+                    567,
+                    RequestCommand::Enroll {
+                        bootstrap_url: SecretValue::new(
+                            "https://example.invalid/#token=not-consumed",
+                        ),
+                    },
+                ),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "operation_running"
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(568, RequestCommand::InstallUpdate { package }),
+                USER,
+            )
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "update_already_running"
+    ));
+}
+
+#[test]
+fn automatic_update_setting_persists_an_explicit_local_override() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config_path = directory.path().join("config.toml");
+    LocalConfigStore::new(&config_path)
+        .save(&LocalConfig::default())
+        .expect("initial config");
+    let (events, _receiver) = mpsc::channel();
+    let runtime = ServiceRuntime::load(&config_path, events).expect("runtime");
+
+    let response = runtime.handle_request(
+        Request::new(
+            57,
+            RequestCommand::UpdateUpdateSettings {
+                automatic_install: true,
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+    assert!(runtime.config().updates.automatic_install);
+
+    let persisted = LocalConfigStore::new(&config_path)
+        .load()
+        .expect("persisted config");
+    assert_eq!(persisted.updates.automatic_install, Some(true));
+
+    drop(runtime);
+    let (events, _receiver) = mpsc::channel();
+    let restarted = ServiceRuntime::load(&config_path, events).expect("restarted runtime");
+    assert!(matches!(
+        restarted
+            .handle_request(Request::new(58, RequestCommand::GetUpdateSettings), USER)
+            .payload,
+        ResponsePayload::UpdateSettings {
+            configuration: UpdateSettingsView {
+                automatic_install: true,
+                automatic_install_locked: false,
+            }
+        }
+    ));
+}
+
+#[test]
+fn locked_managed_update_policy_is_reported_enforced_and_authorizes_the_tray() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config_path = directory.path().join("config.toml");
+    LocalConfigStore::new(&config_path)
+        .save(&LocalConfig::default())
+        .expect("initial config");
+    let policy = ManagedPolicy {
+        revision: "managed-automatic-updates".to_owned(),
+        updates: Some(ManagedUpdatePolicy {
+            automatic_install: Some(Managed {
+                value: true,
+                locked: true,
+            }),
+        }),
+        ..ManagedPolicy::default()
+    };
+    let (events, receiver) = mpsc::channel();
+    let runtime =
+        ServiceRuntime::load_with_credentials_and_policy(&config_path, events, None, Some(&policy))
+            .expect("managed runtime");
+
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(59, RequestCommand::GetUpdateSettings), USER)
+            .payload,
+        ResponsePayload::UpdateSettings {
+            configuration: UpdateSettingsView {
+                automatic_install: true,
+                automatic_install_locked: true,
+            }
+        }
+    ));
+    let change = runtime.handle_request(
+        Request::new(
+            60,
+            RequestCommand::UpdateUpdateSettings {
+                automatic_install: false,
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(
+        change.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "managed_field_locked"
+    ));
+    assert_eq!(
+        LocalConfigStore::new(&config_path)
+            .load()
+            .expect("unchanged local config")
+            .updates
+            .automatic_install,
+        None
+    );
+
+    let version = "99.0.0";
+    let package = UpdatePackage {
+        version: version.to_owned(),
+        url: format!(
+            "https://github.com/theatrus/resticpal/releases/download/v{version}/resticpal-{version}-x64.msi"
+        ),
+        signature: base64::engine::general_purpose::STANDARD.encode([0_u8; 64]),
+        length: 83_329_024,
+    };
+    let install = runtime.handle_request(
+        Request::new(
+            61,
+            RequestCommand::InstallUpdate {
+                package: package.clone(),
+            },
+        ),
+        USER,
+    );
+    assert!(matches!(install.payload, ResponsePayload::Accepted { .. }));
+    assert_eq!(
+        receiver.recv().expect("update event"),
+        RuntimeEvent::UpdateInstallRequested(package)
+    );
+}
+
+#[test]
+fn locked_managed_update_disablement_overrides_local_opt_in_for_every_caller() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config_path = directory.path().join("config.toml");
+    LocalConfigStore::new(&config_path)
+        .save(&LocalConfig {
+            updates: LocalUpdateConfig {
+                automatic_install: Some(true),
+            },
+            ..LocalConfig::default()
+        })
+        .expect("initial config");
+    let policy = ManagedPolicy {
+        revision: "managed-disable-automatic-updates".to_owned(),
+        updates: Some(ManagedUpdatePolicy {
+            automatic_install: Some(Managed {
+                value: false,
+                locked: true,
+            }),
+        }),
+        ..ManagedPolicy::default()
+    };
+    let (events, _receiver) = mpsc::channel();
+    let runtime =
+        ServiceRuntime::load_with_credentials_and_policy(&config_path, events, None, Some(&policy))
+            .expect("managed runtime");
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(62, RequestCommand::GetUpdateSettings), USER)
+            .payload,
+        ResponsePayload::UpdateSettings {
+            configuration: UpdateSettingsView {
+                automatic_install: false,
+                automatic_install_locked: true,
+            }
+        }
+    ));
+
+    let version = "99.0.0";
+    let package = UpdatePackage {
+        version: version.to_owned(),
+        url: format!(
+            "https://github.com/theatrus/resticpal/releases/download/v{version}/resticpal-{version}-x64.msi"
+        ),
+        signature: base64::engine::general_purpose::STANDARD.encode([0_u8; 64]),
+        length: 83_329_024,
+    };
+    for identity in [USER, ADMIN] {
+        let response = runtime.handle_request(
+            Request::new(
+                63,
+                RequestCommand::InstallUpdate {
+                    package: package.clone(),
+                },
+            ),
+            identity,
+        );
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "automatic_updates_disabled"
+        ));
+    }
+    assert_eq!(
+        LocalConfigStore::new(&config_path)
+            .load()
+            .expect("local override remains persisted")
+            .updates
+            .automatic_install,
+        Some(true)
+    );
+}
+
+#[test]
+fn unrelated_configuration_saves_preserve_local_and_managed_update_state() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config_path = directory.path().join("config.toml");
+    LocalConfigStore::new(&config_path)
+        .save(&LocalConfig {
+            updates: LocalUpdateConfig {
+                automatic_install: Some(true),
+            },
+            ..LocalConfig::default()
+        })
+        .expect("initial config");
+    let policy = ManagedPolicy {
+        revision: "managed-update-state-preservation".to_owned(),
+        updates: Some(ManagedUpdatePolicy {
+            automatic_install: Some(Managed {
+                value: false,
+                locked: true,
+            }),
+        }),
+        ..ManagedPolicy::default()
+    };
+    let (events, _receiver) = mpsc::channel();
+    let runtime =
+        ServiceRuntime::load_with_credentials_and_policy(&config_path, events, None, Some(&policy))
+            .expect("managed runtime");
+
+    let unrelated_updates = [
+        RequestCommand::UpdateBackupSources {
+            paths: Some(vec![PathBuf::from(r"C:\Data")]),
+            exclusions: None,
+        },
+        RequestCommand::UpdateSchedule {
+            interval_hours: Some(12),
+            wake_grace_seconds: None,
+            wake_lock_timeout_seconds: None,
+            allow_on_battery: None,
+            allow_metered_network: None,
+        },
+        RequestCommand::UpdateRetention {
+            daily: Some(14),
+            weekly: None,
+            monthly: None,
+            yearly: None,
+            prune_interval_days: None,
+        },
+        RequestCommand::UpdateRepository {
+            display_name: Some("Preservation test".to_owned()),
+            url: None,
+            mode: None,
+            options: None,
+            secret_updates: Vec::new(),
+        },
+    ];
+
+    for (index, command) in unrelated_updates.into_iter().enumerate() {
+        let response = runtime.handle_request(Request::new(70 + index as u64, command), ADMIN);
+        assert!(
+            matches!(response.payload, ResponsePayload::Accepted { .. }),
+            "unrelated configuration save {index} was rejected: {:?}",
+            response.payload
+        );
+        assert!(!runtime.config().updates.automatic_install);
+        assert_eq!(
+            runtime.local_config_guard().updates.automatic_install,
+            Some(true)
+        );
+        assert!(runtime.field_locked(PolicyField::UpdateAutomaticInstall));
+    }
+
+    let persisted = LocalConfigStore::new(&config_path)
+        .load()
+        .expect("persisted config");
+    assert_eq!(persisted.updates.automatic_install, Some(true));
+}
+
+#[test]
+fn configuration_mutations_wait_for_an_active_update() {
+    let (runtime, events) = runtime(true);
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(
+                    80,
+                    RequestCommand::UpdateUpdateSettings {
+                        automatic_install: true,
+                    },
+                ),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::Accepted { .. }
+    ));
+    let package = UpdatePackage {
+        version: "99.0.0".to_owned(),
+        url: "https://github.com/theatrus/resticpal/releases/download/v99.0.0/resticpal-99.0.0-x64.msi".to_owned(),
+        signature: base64::engine::general_purpose::STANDARD.encode([0_u8; 64]),
+        length: 83_329_024,
+    };
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(
+                    81,
+                    RequestCommand::InstallUpdate {
+                        package: package.clone(),
+                    },
+                ),
+                USER,
+            )
+            .payload,
+        ResponsePayload::Accepted { .. }
+    ));
+    assert_eq!(
+        events.recv().expect("update event"),
+        RuntimeEvent::UpdateInstallRequested(package)
+    );
+
+    let mutations = [
+        RequestCommand::UpdateBackupSources {
+            paths: Some(vec![PathBuf::from(r"C:\Blocked")]),
+            exclusions: None,
+        },
+        RequestCommand::UpdateSchedule {
+            interval_hours: Some(7),
+            wake_grace_seconds: None,
+            wake_lock_timeout_seconds: None,
+            allow_on_battery: None,
+            allow_metered_network: None,
+        },
+        RequestCommand::UpdateRetention {
+            daily: Some(13),
+            weekly: None,
+            monthly: None,
+            yearly: None,
+            prune_interval_days: None,
+        },
+        RequestCommand::UpdateRepository {
+            display_name: Some("Blocked during update".to_owned()),
+            url: None,
+            mode: None,
+            options: None,
+            secret_updates: Vec::new(),
+        },
+    ];
+    for (index, command) in mutations.into_iter().enumerate() {
+        let response = runtime.handle_request(Request::new(82 + index as u64, command), ADMIN);
+        assert!(
+            matches!(
+                response.payload,
+                ResponsePayload::Rejected { ref code, .. } if code == "update_pending"
+            ),
+            "configuration mutation {index} was not held: {:?}",
+            response.payload
+        );
+    }
+    assert_ne!(
+        runtime.config().backup.paths,
+        vec![PathBuf::from(r"C:\Blocked")]
+    );
+    assert_ne!(runtime.config().schedule.interval_hours, 7);
+    assert_ne!(runtime.config().retention.daily, 13);
+    assert_ne!(
+        runtime.config().repository.display_name.as_deref(),
+        Some("Blocked during update")
+    );
+}
+
+#[test]
+fn unrelated_configuration_save_waits_for_the_global_mutation_lock() {
+    let (runtime, _events) = runtime(true);
+    let runtime = Arc::new(runtime);
+    let mutation = runtime
+        .configuration_mutation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let worker_runtime = Arc::clone(&runtime);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        started_tx.send(()).expect("start signal");
+        let response = worker_runtime.handle_request(
+            Request::new(
+                74,
+                RequestCommand::UpdateBackupSources {
+                    paths: Some(vec![PathBuf::from(r"C:\Serialized")]),
+                    exclusions: None,
+                },
+            ),
+            ADMIN,
+        );
+        finished_tx.send(response).expect("completion signal");
+    });
+
+    started_rx.recv().expect("worker started");
+    assert!(
+        finished_rx
+            .recv_timeout(StdDuration::from_millis(100))
+            .is_err(),
+        "the unrelated writer bypassed the configuration mutation lock"
+    );
+    drop(mutation);
+
+    let response = finished_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .expect("writer completed after mutation lock was released");
+    assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+    worker.join().expect("configuration writer");
 }
 
 #[test]
@@ -859,7 +1458,12 @@ fn managed_policy_is_applied_live_and_reports_its_lock() {
         ..ManagedPolicy::default()
     };
 
-    assert!(runtime.apply_managed_policy(&policy).expect("valid policy"));
+    assert_eq!(
+        runtime
+            .apply_managed_policy_if_current(&policy, &LocalManagementConfig::default())
+            .expect("valid policy"),
+        ManagedPolicyApplyOutcome::Applied
+    );
     assert_eq!(runtime.config().schedule.interval_hours, 8);
     assert_eq!(
         runtime.status().managed_revision.as_deref(),
@@ -890,10 +1494,65 @@ fn managed_policy_waits_until_an_active_backup_finishes() {
         ..ManagedPolicy::default()
     };
 
-    assert!(!runtime.apply_managed_policy(&policy).expect("valid policy"));
+    assert_eq!(
+        runtime
+            .apply_managed_policy_if_current(&policy, &LocalManagementConfig::default())
+            .expect("valid policy"),
+        ManagedPolicyApplyOutcome::RuntimeBusy
+    );
     assert_eq!(runtime.config().schedule.interval_hours, 24);
     assert!(runtime.status().managed_revision.is_none());
     assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn a_policy_fetched_for_an_old_management_source_cannot_apply_after_unenrollment() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config_path = directory.path().join("config.toml");
+    let local = LocalConfig {
+        management: LocalManagementConfig {
+            mode: ManagementMode::PlainManifest,
+            manifest_url: Some("http://127.0.0.1:9/old-policy.json".to_owned()),
+            refresh_interval_minutes: Some(15),
+            ..LocalManagementConfig::default()
+        },
+        ..LocalConfig::default()
+    };
+    LocalConfigStore::new(&config_path)
+        .save(&local)
+        .expect("managed config");
+    let expected_source = local.management.clone();
+    let (events, _receiver) = mpsc::channel();
+    let runtime = ServiceRuntime::load(&config_path, events).expect("runtime");
+    let stale_policy = ManagedPolicy {
+        revision: "stale-after-unenroll".to_owned(),
+        updates: Some(ManagedUpdatePolicy {
+            automatic_install: Some(Managed {
+                value: true,
+                locked: true,
+            }),
+        }),
+        ..ManagedPolicy::default()
+    };
+
+    assert!(matches!(
+        runtime.unenroll(ADMIN),
+        ResponsePayload::Accepted { .. }
+    ));
+    assert_eq!(
+        runtime
+            .apply_managed_policy_if_current(&stale_policy, &expected_source)
+            .expect("valid stale policy"),
+        ManagedPolicyApplyOutcome::SourceChanged
+    );
+
+    assert_eq!(
+        runtime.local_config_guard().management.mode,
+        ManagementMode::Disabled
+    );
+    assert!(runtime.status().managed_revision.is_none());
+    assert!(!runtime.config().updates.automatic_install);
+    assert!(!runtime.field_locked(PolicyField::UpdateAutomaticInstall));
 }
 
 #[test]
@@ -1680,7 +2339,7 @@ fn diagnostics_are_admin_only_and_never_return_raw_details() {
 }
 
 #[test]
-fn completed_backup_history_is_sanitized_persisted_and_user_readable() {
+fn backup_history_summaries_are_user_readable_but_source_failure_paths_are_admin_only() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let config_path = directory.path().join("config.toml");
     LocalConfigStore::new(&config_path)
@@ -1716,25 +2375,60 @@ fn completed_backup_history_is_sanitized_persisted_and_user_readable() {
         runtime.evaluate_schedule(Utc::now(), available_conditions()),
         ScheduleAction::Start { .. }
     ));
-    runtime.finish_backup(&BackupOutcome::succeeded(BackupSummary {
-        files_processed: 12,
-        bytes_processed: 1_024,
-        data_added: 256,
-        snapshot_id: Some("abc123".to_owned()),
-    }));
+    let private_path = r"C:\Users\Private\locked.txt";
+    runtime.finish_backup(&BackupOutcome::warnings(
+        BackupSummary {
+            files_processed: 12,
+            bytes_processed: 1_024,
+            data_added: 256,
+            snapshot_id: Some("abc123".to_owned()),
+        },
+        "restic_partial_source",
+        BackupFailureDetails::from_items(vec![private_path.to_owned()], 2),
+    ));
 
     let response = runtime.handle_request(
         Request::new(57, RequestCommand::GetRunHistory { limit: 50 }),
         USER,
     );
+    assert!(!format!("{response:?}").contains(private_path));
+    let run_id = match &response.payload {
+        ResponsePayload::RunHistory { runs } => runs[0].id,
+        _ => panic!("expected backup history"),
+    };
     assert!(matches!(
         response.payload,
         ResponsePayload::RunHistory { ref runs }
             if matches!(runs.as_slice(), [run]
-                if run.outcome == BackupRunOutcome::Succeeded
+                if run.outcome == BackupRunOutcome::SucceededWithWarnings
                     && run.files_processed == Some(12)
-                    && run.snapshot_id.as_deref() == Some("abc123"))
+                    && run.snapshot_id.as_deref() == Some("abc123")
+                    && run.failed_item_count == 3)
     ));
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(58, RequestCommand::GetRunFailureDetails { run_id }),
+                USER,
+            )
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(59, RequestCommand::GetRunFailureDetails { run_id }),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::RunFailureDetails { details }
+            if details.items == [private_path] && details.omitted == 2
+    ));
+    let diagnostics = runtime.handle_request(
+        Request::new(60, RequestCommand::GetDiagnostics { limit: 10 }),
+        ADMIN,
+    );
+    assert!(!format!("{diagnostics:?}").contains(private_path));
     drop(runtime);
 
     let (events, _receiver) = mpsc::channel();
@@ -1742,7 +2436,7 @@ fn completed_backup_history_is_sanitized_persisted_and_user_readable() {
     assert!(matches!(
         restarted
             .handle_request(
-                Request::new(58, RequestCommand::GetRunHistory { limit: 1 }),
+                Request::new(61, RequestCommand::GetRunHistory { limit: 1 }),
                 USER,
             )
             .payload,
@@ -1751,7 +2445,17 @@ fn completed_backup_history_is_sanitized_persisted_and_user_readable() {
     assert!(matches!(
         restarted
             .handle_request(
-                Request::new(59, RequestCommand::GetRunHistory { limit: 0 }),
+                Request::new(62, RequestCommand::GetRunFailureDetails { run_id }),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::RunFailureDetails { details }
+            if details.items == [private_path] && details.omitted == 2
+    ));
+    assert!(matches!(
+        restarted
+            .handle_request(
+                Request::new(63, RequestCommand::GetRunHistory { limit: 0 }),
                 USER,
             )
             .payload,

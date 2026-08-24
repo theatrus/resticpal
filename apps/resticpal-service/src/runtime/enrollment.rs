@@ -13,6 +13,13 @@ use crate::management::{
     ManagementClient, PendingEnrollment, remove_management_cache, save_enrollment_cache,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedPolicyApplyOutcome {
+    Applied,
+    RuntimeBusy,
+    SourceChanged,
+}
+
 impl ServiceRuntime {
     pub fn enroll_bootstrap(&self, bootstrap_url: &str) -> Result<(), String> {
         {
@@ -23,6 +30,10 @@ impl ServiceRuntime {
                     RepositoryOperationStatus::Running { .. }
                 )
                 || state.management_operation_active
+                || state.update_install_active
+                || state
+                    .update_hold_until
+                    .is_some_and(|deadline| deadline > Utc::now())
             {
                 return Err("another service operation is active".to_owned());
             }
@@ -63,6 +74,10 @@ impl ServiceRuntime {
                     RepositoryOperationStatus::Running { .. }
                 )
                 || state.management_operation_active
+                || state.update_install_active
+                || state
+                    .update_hold_until
+                    .is_some_and(|deadline| deadline > Utc::now())
             {
                 return rejected(
                     "operation_running",
@@ -95,6 +110,10 @@ impl ServiceRuntime {
     }
 
     pub(super) fn commit_enrollment(&self, pending: PendingEnrollment) -> Result<(), String> {
+        let _configuration_mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let credential_store = self
             .credential_store
             .as_ref()
@@ -238,6 +257,10 @@ impl ServiceRuntime {
         if !identity.is_elevated_administrator {
             return administrator_required();
         }
+        let _configuration_mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             let state = self.state_guard();
             if matches!(state.status.state, BackupState::Running { .. })
@@ -246,6 +269,10 @@ impl ServiceRuntime {
                     RepositoryOperationStatus::Running { .. }
                 )
                 || state.management_operation_active
+                || state.update_install_active
+                || state
+                    .update_hold_until
+                    .is_some_and(|deadline| deadline > Utc::now())
             {
                 return rejected(
                     "operation_running",
@@ -315,8 +342,27 @@ impl ServiceRuntime {
         }
     }
 
-    pub fn apply_managed_policy(&self, policy: &ManagedPolicy) -> Result<bool, PolicyError> {
+    pub(crate) fn apply_managed_policy_if_current(
+        &self,
+        policy: &ManagedPolicy,
+        expected_management: &LocalManagementConfig,
+    ) -> Result<ManagedPolicyApplyOutcome, PolicyError> {
+        self.apply_managed_policy_inner(policy, Some(expected_management))
+    }
+
+    fn apply_managed_policy_inner(
+        &self,
+        policy: &ManagedPolicy,
+        expected_management: Option<&LocalManagementConfig>,
+    ) -> Result<ManagedPolicyApplyOutcome, PolicyError> {
+        let _configuration_mutation = self
+            .configuration_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let local = self.local_config_guard().clone();
+        if expected_management.is_some_and(|expected| &local.management != expected) {
+            return Ok(ManagedPolicyApplyOutcome::SourceChanged);
+        }
         let resolved = resolve_config(&EffectiveConfig::default(), &local, Some(policy))?;
         let next_config = resolved.effective;
         let now = Utc::now();
@@ -326,8 +372,12 @@ impl ServiceRuntime {
                 state.repository_operation,
                 RepositoryOperationStatus::Running { .. }
             )
+            || state.update_install_active
+            || state
+                .update_hold_until
+                .is_some_and(|deadline| deadline > Utc::now())
         {
-            return Ok(false);
+            return Ok(ManagedPolicyApplyOutcome::RuntimeBusy);
         }
 
         if state
@@ -352,6 +402,6 @@ impl ServiceRuntime {
         Self::apply_configuration_status(&mut state, &next_config, now);
         drop(state);
         let _ = self.events.send(RuntimeEvent::ConfigurationChanged);
-        Ok(true)
+        Ok(ManagedPolicyApplyOutcome::Applied)
     }
 }

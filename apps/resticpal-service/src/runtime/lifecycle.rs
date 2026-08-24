@@ -21,14 +21,15 @@ impl ServiceRuntime {
     pub fn finish_update_install(&self, outcome: &UpdateInstallOutcome) {
         let now = Utc::now();
         let mut state = self.state_guard();
-        state.update_install_active = false;
         match outcome {
             UpdateInstallOutcome::Completed { .. } => {
+                state.update_install_active = false;
                 // A successful MSI stops this service as part of the upgrade.
                 // Keep the update hold until that happens so no backup starts
                 // during Windows Installer finalization.
             }
             UpdateInstallOutcome::Failed { .. } => {
+                state.update_install_active = false;
                 state.update_hold_until = None;
                 if let Some((previous, previous_deadline)) =
                     state.update_hold_previous_status.take()
@@ -37,6 +38,12 @@ impl ServiceRuntime {
                     state.status.state_since = now;
                     state.status.next_deadline = previous_deadline;
                 }
+            }
+            UpdateInstallOutcome::Indeterminate { .. } => {
+                // The installer could still own files or the Windows Installer
+                // transaction. Keep the hold fail-closed until service restart
+                // instead of starting a backup into an unknown upgrade state.
+                state.update_install_active = true;
             }
         }
         drop(state);
@@ -52,6 +59,12 @@ impl ServiceRuntime {
                 DiagnosticLevel::Error,
                 "update.failed",
                 "The signed resticpal update could not be installed.",
+                Some(code),
+            ),
+            UpdateInstallOutcome::Indeterminate { code } => self.record_diagnostic(
+                DiagnosticLevel::Error,
+                "update.installer_indeterminate",
+                "The update installer could not be confirmed stopped; backups remain paused.",
                 Some(code),
             ),
         }
@@ -220,6 +233,8 @@ impl ServiceRuntime {
                 bytes_processed: summary.map(|value| value.bytes_processed),
                 data_added: summary.map(|value| value.data_added),
                 snapshot_id: summary.and_then(|value| value.snapshot_id.clone()),
+                failed_items: outcome.failure_details.items().to_vec(),
+                failed_items_omitted: outcome.failure_details.omitted(),
             };
             if let Err(error) = store.append(run) {
                 eprintln!("could not persist backup history: {error}");

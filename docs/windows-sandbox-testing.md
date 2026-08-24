@@ -43,56 +43,95 @@ Only one automated Sandbox session may be active at a time. The launcher refuses
 
 The ordinary `-UpgradeFromMsiPath` lifecycle proves MSI major-upgrade behavior by invoking the new installer directly. It does not prove that an already-published NetSparkle client preserves the `.msi` extension after a redirected download. Use the dedicated update test for that release-blocking check.
 
-First download the old installer from its published GitHub release and obtain a manually dispatched, Authenticode-signed candidate. Stage the new release before preparing its appcast: the staged release carries the candidate package assets plus the exact previous signed appcast pair. This lets the deployment hook populate and verify the direct package mirror while GitHub fallback checks still receive trusted metadata for the previous release.
+First download the old installer from its published GitHub release and obtain a manually dispatched, Authenticode-signed candidate. Stage the new release before preparing its v2 appcast. Every stage carries the frozen v1.0.5 legacy pair; v1.0.7 deliberately carries no v2 pair, while later stages carry the previous signed v2 pair. This lets the deployment hook populate and verify the direct package mirror without exposing the candidate to either client generation.
 
 ```powershell
-New-Item -ItemType Directory -Path artifacts\published\v1.0.5 -Force | Out-Null
-gh release download v1.0.5 `
+New-Item -ItemType Directory -Path artifacts\published\v1.0.6 -Force | Out-Null
+gh release download v1.0.6 `
     --repo theatrus/resticpal `
-    --pattern resticpal-1.0.5-x64.msi `
-    --dir artifacts\published\v1.0.5
+    --pattern resticpal-1.0.6-x64.msi `
+    --dir artifacts\published\v1.0.6
 
 gh workflow run ci.yml --ref main
 # Wait for the manual run to pass, then stage its signed package assets together
-# with the previous release's exact signed appcast pair.
+# with the frozen legacy pair (and previous v2 pair after v1.0.7).
 .\scripts\Publish-Release.ps1 `
     -RunId <signed-run-id> `
     -ReleaseNotesPath C:\path\to\release-notes.md `
     -Stage
 
-# Wait for updates.resticpal.com/releases/v1.0.6/resticpal-1.0.6-x64.msi
+# Wait for updates.resticpal.com/releases/v1.0.7/resticpal-1.0.7-x64.msi
 # to return the staged MSI directly with the signed artifact's exact length
 # and SHA-256. Preparation repeats that check before signing the appcast.
 .\scripts\Publish-Release.ps1 -RunId <signed-run-id>
 ```
 
-Run the prompted update through the unmodified published client:
+Run the prompted update through the unmodified published client (prompted is the
+launcher default):
 
 ```powershell
 .\scripts\Start-WindowsSandboxUpdateTest.ps1 `
-    -PublishedClientMsiPath artifacts\published\v1.0.5\resticpal-1.0.5-x64.msi `
-    -ExpectedPublishedVersion 1.0.5 `
-    -CandidateMsiPath artifacts\release\v1.0.6\ci-artifact\artifacts\installer\output\resticpal-1.0.6-x64.msi `
-    -ExpectedCandidateVersion 1.0.6 `
-    -AppCastPath artifacts\release\v1.0.6\feed\appcast.xml `
-    -AppCastSignaturePath artifacts\release\v1.0.6\feed\appcast.xml.signature
+    -PublishedClientMsiPath artifacts\published\v1.0.6\resticpal-1.0.6-x64.msi `
+    -ExpectedPublishedVersion 1.0.6 `
+    -CandidateMsiPath artifacts\release\v1.0.7\ci-artifact\artifacts\installer\output\resticpal-1.0.7-x64.msi `
+    -ExpectedCandidateVersion 1.0.7 `
+    -AppCastPath artifacts\release\v1.0.7\feed\appcast-v2.xml `
+    -AppCastSignaturePath artifacts\release\v1.0.7\feed\appcast-v2.xml.signature
+```
+
+Every release now requires a complementary automatic qualification with the same
+official previous-client MSI and prepared candidate:
+
+```powershell
+.\scripts\Start-WindowsSandboxUpdateTest.ps1 `
+    -InstallationMode Automatic `
+    -PublishedClientMsiPath artifacts\published\v1.0.6\resticpal-1.0.6-x64.msi `
+    -ExpectedPublishedVersion 1.0.6 `
+    -CandidateMsiPath artifacts\release\v1.0.7\ci-artifact\artifacts\installer\output\resticpal-1.0.7-x64.msi `
+    -ExpectedCandidateVersion 1.0.7 `
+    -AppCastPath artifacts\release\v1.0.7\feed\appcast-v2.xml `
+    -AppCastSignaturePath artifacts\release\v1.0.7\feed\appcast-v2.xml.signature `
+    -ProbeAppCastPath artifacts\release\v1.0.7\probe\appcast-v2-probe.xml `
+    -ProbeAppCastSignaturePath artifacts\release\v1.0.7\probe\appcast-v2-probe.xml.signature `
+    -ProbePayloadPath artifacts\release\v1.0.7\probe\resticpal-1.0.8-x64.msi
 ```
 
 The launcher queries the official GitHub API for the stable `v<old-version>` release and requires the local old MSI to match that release's exact asset name, SHA-256 digest, length, and download URL. The guest redirects only its own update hostnames to a loopback HTTPS origin trusted by an ephemeral Sandbox-only certificate, then serves the exact prepared appcast and candidate. A GitHub test enclosure, when explicitly used for compatibility testing, is redirected to an extensionless object URL without `Content-Disposition`.
 
 The published client must validate the appcast, download and validate the MSI, and expose its prompted install flow. Before clicking Install, the harness enumerates every same-length file below the interactive user's temporary directory, identifies the actual staged file by the candidate SHA-256, records its path, and only then requires that path to end in `.msi`. If Windows Installer presents the signed package's native FilesInUse prompt, the harness verifies the exact dialog and candidate `msiexec` process, chooses automatic application close/restart, invokes OK, and records that prompted step. It then requires the old tray to exit, the LocalSystem service process ID to change, the service to return to `Running`, all three resticpal executable file versions to match the candidate, and exactly one replacement tray to remain in the interactive session.
 
-Results are written under `artifacts\windows-sandbox-update`. Keep the resulting `result.json`, `guest.log`, `test-artifacts\staged-update.json`, origin request log, and MSI log with the release evidence. Finalization requires the passing result and binds its hash plus normalized evidence into the prepared release manifest before uploading either candidate appcast file:
+The default installer-launch budget is seven minutes. On ordinary v2 transitions this spans the tray's five-minute retry after a transient service/pipe conflict. The one-time v1.0.6 bridge does not claim that the old tray retried; its evidence names the harness-to-published-service dispatcher explicitly.
+
+Automatic mode does not click Check, Download, Install, a FilesInUse dialog, or any UAC prompt. It opens the official previous client's Updates page and enables `automatic_install` with the real UI toggle. On ordinary transitions, the published tray must fetch the gated signed v2 appcast and hand its exact package metadata to the LocalSystem service without another user action.
+
+The v1.0.6→v1.0.7 transition is a one-time exception. Published v1.0.6 lacks the named-pipe busy retry, so the harness leaves the feed closed to that tray and dispatches the exact prepared enclosure through the published protocol-v3 service IPC. The service must return `accepted`, stage the exact MSI, and perform the same silent LocalSystem install. After upgrade, the candidate protocol-v4 tray must fetch the production-signed probe appcast and its sentinel payload using `resticpal/1.0.7`, then reject the deliberately invalid package signature. The harness requires `update.started` followed by `update.failed/update_signature_invalid`, an empty enumeration of every matching probe staging entry (including final and partial names), zero probe `msiexec` starts, and unchanged upgraded tray/service process IDs. No future transition may use this bridge.
+
+The service-owned path must be
+`C:\ProgramData\ResticPal\Updates\resticpal-<version>-x64.msi`. The harness hashes
+that actual file, requires the `.msi` extension, and binds the resulting Windows
+Installer transaction to the same path. It also requires the client `msiexec`
+process to run in session 0 as `NT AUTHORITY\SYSTEM`, be a direct child of the
+published service process, and include both `/qn` and `/norestart`. Any visible
+Download or Install confirmation, candidate FilesInUse dialog, UAC consent
+process, transient candidate UI process start, or harness dialog intervention
+fails the automatic qualification. A
+pass additionally proves that the old UI, tray, and service processes exit; all
+three installed executable versions change to the candidate; the service returns
+as LocalSystem; the automatic setting survives the upgrade; and exactly one
+replacement tray remains in the interactive session.
+
+Results are written under `artifacts\windows-sandbox-update`. Keep both resulting `result.json` files, their `guest.log` files, `test-artifacts\staged-update.json`, origin request logs, and MSI logs with the release evidence. Finalization requires both passing results and binds their hashes plus normalized evidence into the prepared release manifest before uploading either v2 metadata file:
 
 ```powershell
 .\scripts\Publish-Release.ps1 `
     -RunId <signed-run-id> `
     -ReleaseNotesPath C:\path\to\release-notes.md `
-    -UpdateQualificationPath artifacts\windows-sandbox-update\<run-id>\result.json `
+    -UpdateQualificationPath artifacts\windows-sandbox-update\<prompted-run-id>\result.json `
+    -AutomaticUpdateQualificationPath artifacts\windows-sandbox-update\<automatic-run-id>\result.json `
     -Finalize
 ```
 
-The Sandbox test does not mutate either public appcast. Until qualification-bound finalization succeeds, the staged GitHub release retains the previous release's exact signed appcast pair alongside the candidate package and supporting files; finalization replaces that fallback pair with the candidate metadata and advances the feed.
+The Sandbox test does not mutate either public appcast. Until qualification-bound finalization succeeds, the staged GitHub release retains the frozen legacy pair and, after v1.0.7, the previous v2 pair. Finalization adds or replaces only the candidate v2 pair; the legacy v1.0.5 pair is never advanced.
 
 ## Sandbox connection failures
 

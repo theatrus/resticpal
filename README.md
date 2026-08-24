@@ -57,8 +57,8 @@ All three policy transport paths now have an end-to-end implementation. A one-ti
 - Machine-wide Rust service with startup, resume, power, time-change, and shutdown handling
 - Daily/deadline scheduling, wake grace, battery/network gates, retries, and a two-hour wake-lock safety default
 - Native Rust/Win32 tray status with single-click settings, a right-click action menu, run-now and cancellation actions, launched immediately after install and at logon for every user
-- First-run and Start Menu WinUI 3 setup for bootstrap enrollment, sources, repository, schedule, retention, status, backup history, and redacted diagnostics
-- Typed, per-field managed policy resolution and UI lock enforcement
+- First-run and Start Menu WinUI 3 setup for bootstrap enrollment, sources, repository, schedule, retention, status, backup history with local unreadable-file detail, and redacted diagnostics
+- Typed, per-field managed policy resolution and UI lock enforcement, including server-managed silent signed updates
 - Plain HTTP/HTTPS manifests, signed Ed25519 manifests, rollback/freshness checks, and offline last-known-good policy
 - Authenticated, bounded device status reporting that cannot make a backup fail
 - Local, S3-compatible, REST, and advanced restic repository configuration
@@ -66,15 +66,16 @@ All three policy transport paths now have an end-to-end implementation. A one-ti
 - Standard-mode snapshot retention after successful backups, with a separate configurable prune cadence
 - DPAPI-encrypted, service-owned credential storage with protected ACLs and opaque references
 - Direct restic execution inside a kill-on-close Windows Job Object, bounded JSON progress, and sanitized outcomes
-- Durable repository validation, scheduler state, and privacy-bounded SQLite run history
+- Time-bounded stale-lock cleanup before every backup, without force-removing active restic locks
+- Durable repository validation, scheduler state, and privacy-bounded SQLite run history; exact partial-backup paths stay local and require the elevated UI
 - Per-machine x64 MSI with a LocalSystem backup service, recovery policy, all-users tray and Start Menu integration, bundled restic, and data-preserving uninstall
 - StackFoundry LLC Authenticode signing for release-tag and explicitly dispatched MSI builds
-- Native tray checks of the detached Ed25519-signed appcast at login and every six hours, using `updates.resticpal.com` first and GitHub Releases as a fallback; administrators can keep daily-bounded prompts or opt into service-installed, prompt-free signed MSI upgrades
+- Native tray and Settings checks of the detached Ed25519-signed appcast, using `updates.resticpal.com` first and GitHub Releases as a fallback; local or locked server policy can select service-installed, prompt-free signed MSI upgrades
 - Optional companion server for signed manifests, latest-device status, and server-only retention/prune jobs
 
 ## The append-only model
 
-An append-only client should be able to add a new backup without being able to erase yesterday's good copy. resticpal enforces that distinction in its command builder and expects the storage layer—IAM policy, rest-server, proxy, object lock, or equivalent—to enforce it too.
+An append-only client should be able to add a new backup without being able to erase yesterday's good copy. resticpal enforces that distinction in its command builder and expects the storage layer—IAM policy, rest-server, proxy, object lock, or equivalent—to enforce it too. Before each backup, both standard and append-only clients run restic's narrow `unlock` operation so stale process locks cannot strand protection. The storage policy must therefore permit clients to list and delete lock records while continuing to deny deletion or rewriting of snapshots, indexes, and pack data; resticpal never adds `--remove-all`, so a live lock remains protected.
 
 Retention for such repositories belongs on a separate, better-protected host. The companion server uses different full-access credentials to apply time-window-aware snapshot retention and prune unreferenced pack data. Those credentials are never delivered to enrolled backup clients.
 
@@ -127,7 +128,7 @@ The Sandbox launcher waits for a machine-readable result and returns the guest t
 
 GitHub Actions runs the same Rust and WinUI validation, then builds, validates, administratively extracts, and smoke-tests an x64 MSI. Ordinary `main` pushes, pull requests, and forks build unsigned; only version-tag pushes and intentional manual runs use Azure Trusted Signing for the executable payload and MSI. The neutral `resticpal-windows-x64` artifact includes SHA-256 checksums. The installed-service Windows Sandbox lifecycle remains a local test because GitHub-hosted runners do not expose the nested Sandbox environment used by the harness.
 
-Product releases start at `1.0.0`; the current source version is `1.0.6`. `Set-Version.ps1` moves the Rust, WinUI, manifest, MSI input, and appcast version together. NetSparkle release metadata is signed locally with the private key backed up outside GitHub, then published beside the signed MSI. See [the signed release guide](docs/releasing.md) for the key boundary and exact commands.
+Product releases start at `1.0.0`; the current source version is `1.0.7`. `Set-Version.ps1` moves the Rust, WinUI, manifest, MSI input, and appcast version together. NetSparkle release metadata is signed locally with the private key backed up outside GitHub, then published beside the signed MSI. See [the signed release guide](docs/releasing.md) for the key boundary and exact commands.
 
 ## For contributors
 

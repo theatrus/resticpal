@@ -49,6 +49,7 @@ try {
         'Name="BootstrapUrl"',
         'Value="[RESTICPAL_BOOTSTRAP_URL]"',
         'Property Id="ARPPRODUCTICON" Value="ResticPalIcon.ico"',
+        'Property Id="MSIDISABLERMRESTART" Value="1"',
         'Shortcut Id="ResticPalSettingsShortcut"',
         'Directory="ProgramMenuFolder"',
         'File Id="TrayExecutable"',
@@ -68,6 +69,43 @@ try {
         throw 'MSI database does not contain the LocalSystem application-data ACL entry.'
     }
 
+    # Keep RemoveExistingProducts after the candidate payload is installed.
+    # An early major-upgrade removal can delete a higher-patch self-contained
+    # .NET runtime after MSI has already declined to copy the candidate's lower
+    # versioned shared components, leaving resticpal-ui without hostfxr/coreclr.
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $null
+    $view = $null
+    $record = $null
+    try {
+        $database = $installer.GetType().InvokeMember(
+            'OpenDatabase', 'InvokeMethod', $null, $installer, @($resolvedMsiPath, 0))
+        $view = $database.GetType().InvokeMember(
+            'OpenView',
+            'InvokeMethod',
+            $null,
+            $database,
+            'SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action` = ''RemoveExistingProducts''')
+        $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+        $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+        if ($null -eq $record -or $record.IntegerData(1) -ne 6501) {
+            $observedSequence = if ($null -eq $record) { '<missing>' } else { $record.IntegerData(1) }
+            throw "RemoveExistingProducts must run immediately after InstallExecute (6501); got $observedSequence."
+        }
+    } finally {
+        if ($null -ne $record) {
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) | Out-Null
+        }
+        if ($null -ne $view) {
+            $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null
+        }
+        if ($null -ne $database) {
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) | Out-Null
+        }
+        [Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) | Out-Null
+    }
+
     $arguments = "/a `"$resolvedMsiPath`" TARGETDIR=`"$adminImageRoot`" /qn /norestart /l*v `"$logPath`""
     $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" `
         -ArgumentList $arguments `
@@ -83,6 +121,9 @@ try {
         'resticpal-service.exe',
         'resticpal-tray.exe',
         'resticpal-ui.exe',
+        'coreclr.dll',
+        'hostfxr.dll',
+        'hostpolicy.dll',
         'App.xbf',
         'MainWindow.xbf',
         'resources.pri',

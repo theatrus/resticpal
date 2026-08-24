@@ -55,6 +55,7 @@ const BACKUP_FAST_POLL_TICKS: u64 = 15;
 const BACKUP_MONITOR_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const UPDATE_CHECK_INTERVAL_MS: u32 = 6 * 60 * 60 * 1_000;
 const UPDATE_RETRY_INTERVAL_MS: u32 = 5 * 60 * 1_000;
+const UPDATE_ACCEPTED_FOLLOW_UP_INTERVAL_MS: u32 = UPDATE_CHECK_INTERVAL_MS;
 const UPDATE_AVAILABLE_MESSAGE: u32 = WM_APP + 2;
 const NIN_KEYSELECT_EVENT: u32 = NIN_SELECT | 1;
 const MAX_PENDING_BALLOON_ROUTES: usize = 16;
@@ -64,12 +65,12 @@ const MAX_UPDATE_APPCAST_BYTES: usize = 256 * 1024;
 const MAX_UPDATE_SIGNATURE_BYTES: usize = 1024;
 const UPDATE_APPCAST_SOURCES: &[UpdateSource] = &[
     UpdateSource {
-        appcast_url: "https://updates.resticpal.com/appcast.xml",
-        signature_url: "https://updates.resticpal.com/appcast.xml.signature",
+        appcast_url: "https://updates.resticpal.com/appcast-v2.xml",
+        signature_url: "https://updates.resticpal.com/appcast-v2.xml.signature",
     },
     UpdateSource {
-        appcast_url: "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml",
-        signature_url: "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml.signature",
+        appcast_url: "https://github.com/theatrus/resticpal/releases/latest/download/appcast-v2.xml",
+        signature_url: "https://github.com/theatrus/resticpal/releases/latest/download/appcast-v2.xml.signature",
     },
 ];
 const UPDATE_PUBLIC_KEY: &str = include_str!("../../../config/update-public-key.txt");
@@ -183,6 +184,58 @@ impl BackupAttemptBaseline {
 enum UpdateCheck {
     Current,
     Available(UpdatePackage),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomaticUpdateSetting {
+    Enabled,
+    Disabled,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AvailableUpdateAction {
+    RequestSilentInstall,
+    Prompt,
+    RetrySilently,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserUpdateAction {
+    OpenManualUi,
+    CheckSilently,
+    RetrySilently,
+}
+
+const fn available_update_action(setting: AutomaticUpdateSetting) -> AvailableUpdateAction {
+    match setting {
+        AutomaticUpdateSetting::Enabled => AvailableUpdateAction::RequestSilentInstall,
+        AutomaticUpdateSetting::Disabled => AvailableUpdateAction::Prompt,
+        AutomaticUpdateSetting::Unavailable => AvailableUpdateAction::RetrySilently,
+    }
+}
+
+const fn automatic_update_follow_up_interval(accepted: bool) -> u32 {
+    if accepted {
+        // Acceptance queues asynchronous work. If it later fails, retry at the
+        // normal six-hour cadence rather than redownloading a bad 512 MiB asset
+        // every five minutes. A successful upgrade exits this tray first.
+        UPDATE_ACCEPTED_FOLLOW_UP_INTERVAL_MS
+    } else {
+        UPDATE_RETRY_INTERVAL_MS
+    }
+}
+
+const fn silent_recheck_follow_up_required(_check_started: bool) -> bool {
+    true
+}
+
+const fn user_update_action(setting: AutomaticUpdateSetting) -> UserUpdateAction {
+    match setting {
+        AutomaticUpdateSetting::Disabled => UserUpdateAction::OpenManualUi,
+        AutomaticUpdateSetting::Enabled => UserUpdateAction::CheckSilently,
+        AutomaticUpdateSetting::Unavailable => UserUpdateAction::RetrySilently,
+    }
 }
 
 struct TrayIcon {
@@ -498,7 +551,7 @@ fn window_proc_inner(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                 }
                 Some(TrayIconAction::OpenUpdates) => {
-                    let _ = launch_ui(window, UiDestination::Updates);
+                    handle_user_update_request(window);
                 }
                 Some(TrayIconAction::ShowContextMenu) => {
                     if let Err(error) = show_context_menu(window) {
@@ -538,7 +591,18 @@ fn window_proc_inner(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM)
         }
         UPDATE_AVAILABLE_MESSAGE => {
             if wparam.0 != 0 {
-                let _ = show_update_notification(window);
+                match user_update_action(automatic_update_setting()) {
+                    UserUpdateAction::OpenManualUi => {
+                        let _ = show_update_notification(window);
+                    }
+                    UserUpdateAction::CheckSilently => {
+                        check_update_silently(window);
+                    }
+                    UserUpdateAction::RetrySilently => {
+                        UPDATE_AVAILABLE.store(false, Ordering::Relaxed);
+                        schedule_update_retry(window);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -578,9 +642,25 @@ fn show_context_menu(window: HWND) -> Result<()> {
     let result = (|| {
         let backup_running = backup_is_running().unwrap_or(false);
         // SAFETY: labels are static null-terminated strings and menu is valid.
+        let update_available = if UPDATE_AVAILABLE.load(Ordering::Relaxed) {
+            match user_update_action(automatic_update_setting()) {
+                UserUpdateAction::OpenManualUi => true,
+                UserUpdateAction::CheckSilently => {
+                    check_update_silently(window);
+                    false
+                }
+                UserUpdateAction::RetrySilently => {
+                    UPDATE_AVAILABLE.store(false, Ordering::Relaxed);
+                    schedule_update_retry(window);
+                    false
+                }
+            }
+        } else {
+            false
+        };
         unsafe {
             AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("Open resticpal"))?;
-            if UPDATE_AVAILABLE.load(Ordering::Relaxed) {
+            if update_available {
                 AppendMenuW(menu, MF_STRING, MENU_UPDATE, w!("Update available…"))?;
             }
             if backup_running {
@@ -616,7 +696,7 @@ fn show_context_menu(window: HWND) -> Result<()> {
                 let _ = launch_ui(window, UiDestination::Default);
             }
             MENU_UPDATE => {
-                let _ = launch_ui(window, UiDestination::Updates);
+                handle_user_update_request(window);
             }
             MENU_RUN_BACKUP => {
                 if backup_running {
@@ -637,6 +717,32 @@ fn show_context_menu(window: HWND) -> Result<()> {
     // SAFETY: menu was created in this function and is no longer displayed.
     let destroy_result = unsafe { DestroyMenu(menu) };
     result.and(destroy_result)
+}
+
+fn handle_user_update_request(window: HWND) {
+    match user_update_action(automatic_update_setting()) {
+        UserUpdateAction::OpenManualUi => {
+            let _ = launch_ui(window, UiDestination::Updates);
+        }
+        UserUpdateAction::CheckSilently => {
+            check_update_silently(window);
+        }
+        UserUpdateAction::RetrySilently => {
+            UPDATE_AVAILABLE.store(false, Ordering::Relaxed);
+            schedule_update_retry(window);
+        }
+    }
+}
+
+fn check_update_silently(window: HWND) {
+    UPDATE_AVAILABLE.store(false, Ordering::Relaxed);
+    let check_started = start_update_check(window);
+    // A policy revalidation can arrive while the prior check's worker still
+    // owns the single-flight flag. Coalesce a bounded retry either way so the
+    // silent handoff cannot be lost until the six-hour periodic timer.
+    if silent_recheck_follow_up_required(check_started) {
+        schedule_update_retry(window);
+    }
 }
 
 fn tray_left_click_is_distinct(
@@ -748,56 +854,72 @@ fn should_launch_onboarding(marker_exists: bool, state: &BackupState) -> bool {
     !marker_exists && matches!(state, BackupState::Unconfigured)
 }
 
-fn start_update_check(window: HWND) {
+fn start_update_check(window: HWND) -> bool {
     if UPDATE_CHECK_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
         .is_err()
     {
-        return;
+        return false;
     }
 
     let window_value = window.0 as isize;
     std::thread::spawn(move || {
         match check_for_update() {
             Some(UpdateCheck::Available(package)) => {
-                UPDATE_AVAILABLE.store(true, Ordering::Relaxed);
-                let automatic = automatic_updates_enabled();
-                let install_started = automatic && request_automatic_update(package);
-                if install_started {
-                    UPDATE_AVAILABLE.store(false, Ordering::Relaxed);
-                } else if automatic {
-                    // A backup or another service operation may be finishing.
-                    // Retry promptly without asking the user to intervene.
-                    let window = HWND(window_value as *mut core::ffi::c_void);
-                    // SAFETY: the integer originated from the live HWND and
-                    // the timer is removed on delivery or window destruction.
-                    unsafe {
-                        SetTimer(
-                            Some(window),
-                            UPDATE_RETRY_TIMER_ID,
-                            UPDATE_RETRY_INTERVAL_MS,
-                            None,
+                let window = HWND(window_value as *mut core::ffi::c_void);
+                match available_update_action(automatic_update_setting()) {
+                    AvailableUpdateAction::RequestSilentInstall => {
+                        // Automatic mode has no manual notification or menu
+                        // fallback, including while the service is busy. Keep a
+                        // bounded follow-up even after the service accepts: the
+                        // download, signature check, or MSI can still fail
+                        // asynchronously. A successful upgrade exits this tray.
+                        UPDATE_AVAILABLE.store(false, Ordering::Relaxed);
+                        let accepted = request_automatic_update(package);
+                        schedule_update_retry_after(
+                            window,
+                            automatic_update_follow_up_interval(accepted),
                         );
                     }
+                    AvailableUpdateAction::Prompt => {
+                        UPDATE_AVAILABLE.store(true, Ordering::Relaxed);
+                        if record_update_prompt_if_due(SystemTime::now()) {
+                            // SAFETY: the integer originated from the live HWND. A
+                            // posted message safely fails if the tray exits first.
+                            let _ = unsafe {
+                                PostMessageW(
+                                    Some(window),
+                                    UPDATE_AVAILABLE_MESSAGE,
+                                    WPARAM(1),
+                                    LPARAM(0),
+                                )
+                            };
+                        }
+                    }
+                    AvailableUpdateAction::RetrySilently => {
+                        UPDATE_AVAILABLE.store(false, Ordering::Relaxed);
+                        schedule_update_retry(window);
+                    }
                 }
-                let prompt = !automatic && record_update_prompt_if_due(SystemTime::now());
-                // SAFETY: the integer originated from the live HWND. A posted
-                // message safely fails if the tray exits before the check.
-                let window = HWND(window_value as *mut core::ffi::c_void);
-                let _ = unsafe {
-                    PostMessageW(
-                        Some(window),
-                        UPDATE_AVAILABLE_MESSAGE,
-                        WPARAM(usize::from(prompt)),
-                        LPARAM(0),
-                    )
-                };
             }
             Some(UpdateCheck::Current) => UPDATE_AVAILABLE.store(false, Ordering::Relaxed),
             None => {}
         }
         UPDATE_CHECK_RUNNING.store(false, Ordering::Release);
     });
+    true
+}
+
+fn schedule_update_retry(window: HWND) {
+    schedule_update_retry_after(window, UPDATE_RETRY_INTERVAL_MS);
+}
+
+fn schedule_update_retry_after(window: HWND, interval_ms: u32) {
+    // SAFETY: `window` originated from the live tray HWND. The timer is removed
+    // on delivery or window destruction, and using the same ID coalesces retries.
+    unsafe {
+        SetTimer(Some(window), UPDATE_RETRY_TIMER_ID, interval_ms, None);
+    }
 }
 
 fn check_for_update() -> Option<UpdateCheck> {
@@ -841,18 +963,20 @@ fn check_update_source(agent: &ureq::Agent, source: UpdateSource) -> Option<Upda
     })
 }
 
-fn automatic_updates_enabled() -> bool {
-    matches!(
-        send_request(RequestCommand::GetUpdateSettings),
+fn automatic_update_setting() -> AutomaticUpdateSetting {
+    match send_request(RequestCommand::GetUpdateSettings) {
         Ok(Response {
-            payload: ResponsePayload::UpdateSettings {
-                configuration: resticpal_protocol::UpdateSettingsView {
-                    automatic_install: true
-                }
-            },
+            payload: ResponsePayload::UpdateSettings { configuration },
             ..
-        })
-    )
+        }) => {
+            if configuration.automatic_install {
+                AutomaticUpdateSetting::Enabled
+            } else {
+                AutomaticUpdateSetting::Disabled
+            }
+        }
+        _ => AutomaticUpdateSetting::Unavailable,
+    }
 }
 
 fn request_automatic_update(package: UpdatePackage) -> bool {
@@ -1551,6 +1675,47 @@ mod tests {
     }
 
     #[test]
+    fn available_updates_follow_the_effective_automatic_update_setting() {
+        assert_eq!(
+            available_update_action(AutomaticUpdateSetting::Enabled),
+            AvailableUpdateAction::RequestSilentInstall,
+            "enabled policy must use the service-owned silent installer"
+        );
+        assert_eq!(
+            available_update_action(AutomaticUpdateSetting::Disabled),
+            AvailableUpdateAction::Prompt,
+            "only an explicit disabled setting may notify the user"
+        );
+        assert_eq!(
+            available_update_action(AutomaticUpdateSetting::Unavailable),
+            AvailableUpdateAction::RetrySilently,
+            "an unavailable service must not be mistaken for prompted mode"
+        );
+        assert_eq!(
+            automatic_update_follow_up_interval(true),
+            UPDATE_ACCEPTED_FOLLOW_UP_INTERVAL_MS
+        );
+        assert_eq!(
+            automatic_update_follow_up_interval(false),
+            UPDATE_RETRY_INTERVAL_MS
+        );
+        assert!(silent_recheck_follow_up_required(true));
+        assert!(silent_recheck_follow_up_required(false));
+        assert_eq!(
+            user_update_action(AutomaticUpdateSetting::Disabled),
+            UserUpdateAction::OpenManualUi
+        );
+        assert_eq!(
+            user_update_action(AutomaticUpdateSetting::Enabled),
+            UserUpdateAction::CheckSilently
+        );
+        assert_eq!(
+            user_update_action(AutomaticUpdateSetting::Unavailable),
+            UserUpdateAction::RetrySilently
+        );
+    }
+
+    #[test]
     fn appcast_versions_are_strictly_parsed_and_compared() {
         let appcast = "<rss><sparkle:version>1.2.30</sparkle:version></rss>";
         assert_eq!(extract_appcast_version(appcast), Some([1, 2, 30]));
@@ -1598,8 +1763,8 @@ mod tests {
         assert_eq!(
             checked,
             vec![
-                "https://updates.resticpal.com/appcast.xml",
-                "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml",
+                "https://updates.resticpal.com/appcast-v2.xml",
+                "https://github.com/theatrus/resticpal/releases/latest/download/appcast-v2.xml",
             ]
         );
 
@@ -1632,8 +1797,8 @@ mod tests {
         assert_eq!(
             checked,
             vec![
-                "https://updates.resticpal.com/appcast.xml",
-                "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml",
+                "https://updates.resticpal.com/appcast-v2.xml",
+                "https://github.com/theatrus/resticpal/releases/latest/download/appcast-v2.xml",
             ]
         );
     }

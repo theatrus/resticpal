@@ -8,7 +8,7 @@ namespace ResticPal.UI.Services;
 
 internal sealed class ResticPalServiceClient
 {
-    private const int ProtocolVersion = 3;
+    private const int ProtocolVersion = 4;
     private const int MaxFrameBytes = 1024 * 1024;
     private static long _nextRequestId;
 
@@ -173,8 +173,28 @@ internal sealed class ResticPalServiceClient
                 ReadOptionalUInt64(run, "files_processed"),
                 ReadOptionalUInt64(run, "bytes_processed"),
                 ReadOptionalUInt64(run, "data_added"),
-                ReadOptionalString(run, "snapshot_id")))
+                ReadOptionalString(run, "snapshot_id"),
+                ReadOptionalUInt64(run, "failed_item_count") ?? 0))
             .ToArray();
+    }
+
+    public async Task<BackupRunFailureDetails> GetRunFailureDetailsAsync(
+        ulong runId,
+        CancellationToken cancellationToken = default)
+    {
+        JsonElement payload = await SendAsync(
+            new { type = "get_run_failure_details", run_id = runId },
+            cancellationToken);
+        RequirePayloadType(payload, "run_failure_details");
+        JsonElement details = payload.GetProperty("details");
+        return new BackupRunFailureDetails(
+            details.GetProperty("run_id").GetUInt64(),
+            details.GetProperty("items")
+                .EnumerateArray()
+                .Select(item => item.GetString() ?? string.Empty)
+                .Where(item => item.Length > 0)
+                .ToArray(),
+            details.GetProperty("omitted").GetUInt64());
     }
 
     public async Task<CommandResult> RunBackupNowAsync(
@@ -207,7 +227,9 @@ internal sealed class ResticPalServiceClient
         RequirePayloadType(payload, "update_settings");
         JsonElement configuration = payload.GetProperty("configuration");
         return new UpdateSettingsConfiguration(
-            configuration.GetProperty("automatic_install").GetBoolean());
+            configuration.GetProperty("automatic_install").GetBoolean(),
+            configuration.TryGetProperty("automatic_install_locked", out JsonElement locked)
+                && locked.GetBoolean());
     }
 
     public async Task<CommandResult> UpdateUpdateSettingsAsync(
@@ -221,6 +243,27 @@ internal sealed class ResticPalServiceClient
                 automatic_install = automaticInstall,
             },
             cancellationToken);
+    }
+
+    public async Task<CommandResult> InstallUpdateAsync(
+        SignedUpdatePackage package,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(package);
+        return await SendCommandAsync(
+            new
+            {
+                type = "install_update",
+                package = new
+                {
+                    version = package.Version,
+                    url = package.Url,
+                    signature = package.Signature,
+                    length = package.Length,
+                },
+            },
+            cancellationToken,
+            TimeSpan.FromSeconds(10));
     }
 
     public async Task<BackupSourcesConfiguration> GetBackupSourcesAsync(
@@ -428,9 +471,10 @@ internal sealed class ResticPalServiceClient
 
     private static async Task<CommandResult> SendCommandAsync(
         object command,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? requestTimeout = null)
     {
-        JsonElement payload = await SendAsync(command, cancellationToken);
+        JsonElement payload = await SendAsync(command, cancellationToken, requestTimeout);
         return ReadCommandResult(payload);
     }
 
@@ -477,7 +521,7 @@ internal sealed class ResticPalServiceClient
         timeout.CancelAfter(requestTimeout ?? TimeSpan.FromSeconds(2));
         await using var pipe = new NamedPipeClientStream(
             ".",
-            "ResticPal.v3",
+            "ResticPal.v4",
             PipeDirection.InOut,
             PipeOptions.Asynchronous);
         await pipe.ConnectAsync(timeout.Token);
@@ -650,7 +694,9 @@ internal sealed record ServiceSnapshot(
 
 internal sealed record CommandResult(bool Accepted, string Message);
 
-internal sealed record UpdateSettingsConfiguration(bool AutomaticInstall);
+internal sealed record UpdateSettingsConfiguration(
+    bool AutomaticInstall,
+    bool AutomaticInstallLocked);
 
 internal sealed record ManagementConfiguration(
     string Mode,
@@ -667,7 +713,13 @@ internal sealed record BackupRun(
     ulong? FilesProcessed,
     ulong? BytesProcessed,
     ulong? DataAdded,
-    string? SnapshotId);
+    string? SnapshotId,
+    ulong FailedItemCount);
+
+internal sealed record BackupRunFailureDetails(
+    ulong RunId,
+    IReadOnlyList<string> Items,
+    ulong Omitted);
 
 internal sealed record BackupSourcesConfiguration(
     IReadOnlyList<string> Paths,

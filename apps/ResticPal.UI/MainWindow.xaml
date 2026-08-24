@@ -110,6 +110,11 @@
                         <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="12">
                             <Button x:Name="RunBackupButton" Click="RunBackupButton_Click" Content="Run backup now" IsEnabled="False" />
                             <Button x:Name="CancelBackupButton" Click="CancelBackupButton_Click" Content="Cancel backup" IsEnabled="False" />
+                            <Button
+                                x:Name="ViewWarningDetailsButton"
+                                Click="ViewWarningDetailsButton_Click"
+                                Content="Review backup warning"
+                                Visibility="Collapsed" />
                         </StackPanel>
                     </Grid>
                 </ScrollViewer>
@@ -543,7 +548,7 @@
                             <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Backup history" />
                             <TextBlock
                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="Recent outcomes are stored locally without source paths, filenames, credentials, or raw restic output."
+                                Text="Recent outcomes stay on this PC. For warning runs, unreadable paths are retained within a strict local limit and shown only to this elevated UI; they are never sent in server status or diagnostic logs."
                                 TextWrapping="Wrap" />
                         </StackPanel>
                         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
@@ -608,6 +613,12 @@
                                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                                 Text="{Binding Detail}"
                                                 TextWrapping="Wrap" />
+                                            <Button
+                                                HorizontalAlignment="Left"
+                                                Click="ShowRunFailureDetailsButton_Click"
+                                                Content="{Binding FailureDetailsButtonText}"
+                                                Tag="{Binding}"
+                                                Visibility="{Binding FailureDetailsVisibility}" />
                                         </StackPanel>
                                     </Border>
                                 </DataTemplate>
@@ -789,6 +800,11 @@
                                     OffContent="Ask before installing"
                                     OnContent="Install silently in the background"
                                     Toggled="AutomaticUpdatesToggle_Toggled" />
+                                <InfoBar
+                                    x:Name="UpdatePolicyMessage"
+                                    IsClosable="False"
+                                    IsOpen="False"
+                                    Severity="Informational" />
                                 <ProgressBar
                                     x:Name="UpdateDownloadProgress"
                                     Maximum="100"

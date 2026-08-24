@@ -6,8 +6,8 @@ internal static class UpdateTrust
 {
     internal static IReadOnlyList<string> AppCastUrls { get; } =
     [
-        "https://updates.resticpal.com/appcast.xml",
-        "https://github.com/theatrus/resticpal/releases/latest/download/appcast.xml",
+        "https://updates.resticpal.com/appcast-v2.xml",
+        "https://github.com/theatrus/resticpal/releases/latest/download/appcast-v2.xml",
     ];
 
     internal static string PublicKey { get; } = LoadPublicKey();

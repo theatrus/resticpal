@@ -12,7 +12,7 @@ mod updater;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,7 +36,7 @@ use resticpal_protocol::DiagnosticLevel;
 use resticpal_protocol::{RepositoryOperationKind, UpdatePackage};
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::{DEFAULT_PIPE_NAME, NamedPipeServer};
-use runtime::{RuntimeEvent, ScheduleAction, ServiceRuntime};
+use runtime::{ManagedPolicyApplyOutcome, RuntimeEvent, ScheduleAction, ServiceRuntime};
 use updater::UpdateInstallOutcome;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{
@@ -172,6 +172,9 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
         wait_hint: Duration::from_secs(45),
         process_id: None,
     })?;
+    let data_root = program_data_root();
+    let _data_root_guard = updater::prepare_service_data_root(&data_root)
+        .map_err(|error| windows_service::Error::Winapi(io::Error::other(error)))?;
     let config_path = config_path(arguments);
     let credential_store = credential_store();
     let local_for_management = LocalConfigStore::new(&config_path).load().ok();
@@ -315,12 +318,7 @@ fn start_management_worker(
                     thread::sleep(Duration::from_secs(30));
                     continue;
                 }
-                let current_identity = (
-                    local.management.mode,
-                    local.management.manifest_url.clone(),
-                    local.management.signing_public_key.clone(),
-                    local.management.device_id.clone(),
-                );
+                let current_identity = local.management.clone();
                 let now = Instant::now();
                 if source_identity.as_ref() != Some(&current_identity) {
                     refresh_failures = 0;
@@ -329,12 +327,19 @@ fn start_management_worker(
                         &local,
                         credential_store.as_ref(),
                     ) {
-                        Ok(Some(loaded)) => match runtime.apply_managed_policy(&loaded.policy) {
-                            Ok(true) => {
+                        Ok(Some(loaded)) => match runtime
+                            .apply_managed_policy_if_current(&loaded.policy, &local.management)
+                        {
+                            Ok(ManagedPolicyApplyOutcome::Applied) => {
                                 sequence = loaded.sequence;
                                 ManagementRefreshOutcome::Synchronized
                             }
-                            Ok(false) => ManagementRefreshOutcome::RuntimeBusy,
+                            Ok(ManagedPolicyApplyOutcome::RuntimeBusy) => {
+                                ManagementRefreshOutcome::RuntimeBusy
+                            }
+                            Ok(ManagedPolicyApplyOutcome::SourceChanged) => {
+                                ManagementRefreshOutcome::Synchronized
+                            }
                             Err(error) => {
                                 eprintln!("managed source activation failed: {error}");
                                 ManagementRefreshOutcome::Failed
@@ -375,12 +380,20 @@ fn start_management_worker(
                     ) {
                         Ok(loaded) => {
                             if loaded.sequence > sequence {
-                                match runtime.apply_managed_policy(&loaded.policy) {
-                                    Ok(true) => {
+                                match runtime.apply_managed_policy_if_current(
+                                    &loaded.policy,
+                                    &local.management,
+                                ) {
+                                    Ok(ManagedPolicyApplyOutcome::Applied) => {
                                         sequence = loaded.sequence;
                                         ManagementRefreshOutcome::Synchronized
                                     }
-                                    Ok(false) => ManagementRefreshOutcome::RuntimeBusy,
+                                    Ok(ManagedPolicyApplyOutcome::RuntimeBusy) => {
+                                        ManagementRefreshOutcome::RuntimeBusy
+                                    }
+                                    Ok(ManagedPolicyApplyOutcome::SourceChanged) => {
+                                        ManagementRefreshOutcome::Synchronized
+                                    }
                                     Err(error) => {
                                         eprintln!("managed policy could not be applied: {error}");
                                         ManagementRefreshOutcome::Failed
@@ -832,9 +845,9 @@ fn program_data_root() -> PathBuf {
 
 fn record_service_startup_error(message: &str) {
     let data_root = program_data_root();
-    if fs::create_dir_all(&data_root).is_err() {
+    let Ok(_data_root_guard) = updater::prepare_service_data_root(&data_root) else {
         return;
-    }
+    };
     let path = data_root.join("service-startup-errors.log");
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
