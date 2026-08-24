@@ -571,8 +571,17 @@ function Write-StagedReleaseNotes {
     if ($source.Contains('<!-- resticpal-signed-ci-run:')) {
         throw 'Release notes must not contain the internal staged-run provenance marker.'
     }
+    if ($source.Contains('<!-- resticpal-stage-deploy:')) {
+        throw 'Release notes must not contain the internal stage deployment marker.'
+    }
     $stagedNotesPath = Join-Path $releaseRoot 'staged-release-notes.md'
-    $content = $source.TrimEnd() + "`r`n`r`n<!-- resticpal-signed-ci-run: $RunId -->`r`n"
+    # A recovery edit may otherwise submit byte-identical notes and fail to
+    # emit another release-edited webhook. Give every Stage invocation a new
+    # hidden marker so the direct MSI mirror can always be retriggered.
+    $stageDeploymentId = [Guid]::NewGuid().ToString('N')
+    $content = $source.TrimEnd() +
+        "`r`n`r`n<!-- resticpal-signed-ci-run: $RunId -->" +
+        "`r`n<!-- resticpal-stage-deploy: $stageDeploymentId -->`r`n"
     [IO.File]::WriteAllText($stagedNotesPath, $content, [Text.UTF8Encoding]::new($false))
     return (Get-Item -LiteralPath $stagedNotesPath)
 }

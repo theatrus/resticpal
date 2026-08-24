@@ -167,6 +167,9 @@ foreach ($releaseSafetyInvariant in @(
     'Signed dual update feed $Version',
     "if (`$metadata.File.Name -ceq 'appcast.xml')",
     'This is the irreversible rollout boundary for legacy clients.',
+    'Write-StagedReleaseNotes',
+    '$stageDeploymentId = [Guid]::NewGuid().ToString(''N'')',
+    '<!-- resticpal-stage-deploy: $stageDeploymentId -->',
     'Write-FinalReleaseNotes',
     '<!-- resticpal-release-deploy:',
     'releases/download/$tag/SHA256SUMS.txt',
@@ -187,6 +190,22 @@ foreach ($releaseSafetyInvariant in @(
 )) {
     if (-not $publishScript.Contains($releaseSafetyInvariant)) {
         throw "Publish-Release.ps1 is missing release safety invariant: $releaseSafetyInvariant"
+    }
+}
+
+$stagedNotesWriter = [Regex]::Match(
+    $publishScript,
+    '(?s)function Write-StagedReleaseNotes \{(?<body>.*?)\r?\n\}\r?\n\r?\nfunction Write-FinalReleaseNotes \{')
+if (-not $stagedNotesWriter.Success) {
+    throw 'Publish-Release.ps1 must retain a distinct staged-release notes writer.'
+}
+foreach ($stageRecoveryInvariant in @(
+    "`$stageDeploymentId = [Guid]::NewGuid().ToString('N')",
+    '<!-- resticpal-signed-ci-run: $RunId -->',
+    '<!-- resticpal-stage-deploy: $stageDeploymentId -->'
+)) {
+    if (-not $stagedNotesWriter.Groups['body'].Value.Contains($stageRecoveryInvariant)) {
+        throw "Staged release notes are missing recovery invariant: $stageRecoveryInvariant"
     }
 }
 
