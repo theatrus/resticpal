@@ -32,12 +32,12 @@ public partial class App : Application
         bool showOnboarding = arguments.Contains("--setup", StringComparer.OrdinalIgnoreCase);
         bool showUpdates = arguments.Contains("--updates", StringComparer.OrdinalIgnoreCase);
         _window = new MainWindow(showOnboarding, showUpdates);
-        // The Settings process owns the mutex for its entire lifetime. WinUI,
-        // NetSparkle, or an in-flight async operation may otherwise keep the
-        // dispatcher alive after the last window closes and allow a second
-        // elevated process to become primary. Settings has no unsaved
-        // process-owned state, so closing its only window ends it immediately.
-        _window.Closed += (_, _) => Environment.Exit(0);
+        // The Settings process owns the mutex for its entire lifetime. Ask the
+        // XAML application to shut down after its only window closes so WinUI
+        // can unwind the dispatcher and native resources cleanly. Abruptly
+        // terminating the CLR from inside Closed can fault while Restart
+        // Manager is closing Settings during an MSI upgrade or uninstall.
+        _window.Closed += (_, _) => Exit();
         _window.Activate();
     }
 }

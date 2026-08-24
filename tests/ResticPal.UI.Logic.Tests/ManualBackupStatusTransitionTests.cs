@@ -5,6 +5,14 @@ namespace ResticPal.UI.Logic.Tests;
 
 public sealed class ManualBackupStatusTransitionTests
 {
+    [Fact]
+    public void RequestedAcknowledgementRemainsVisibleForTwoSeconds()
+    {
+        Assert.Equal(
+            TimeSpan.FromSeconds(2),
+            ManualBackupStatusTransition.MinimumAcknowledgementDisplay);
+    }
+
     [Theory]
     [InlineData("running", false)]
     [InlineData("idle", true)]
@@ -14,7 +22,8 @@ public sealed class ManualBackupStatusTransitionTests
     {
         ManualBackupStatusDecision decision = ManualBackupStatusTransition.Evaluate(
             requestPending: true,
-            requestElapsed: TimeSpan.FromMilliseconds(749),
+            requestElapsed: ManualBackupStatusTransition.MinimumAcknowledgementDisplay
+                - TimeSpan.FromMilliseconds(1),
             attemptChanged,
             serviceState);
 
@@ -53,7 +62,8 @@ public sealed class ManualBackupStatusTransitionTests
     {
         ManualBackupStatusDecision decision = ManualBackupStatusTransition.Evaluate(
             requestPending: true,
-            requestElapsed: TimeSpan.FromSeconds(1),
+            requestElapsed: ManualBackupStatusTransition.MinimumAcknowledgementDisplay
+                + TimeSpan.FromMilliseconds(1),
             attemptChanged: false,
             serviceState: "idle");
 
@@ -67,11 +77,13 @@ public sealed class ManualBackupStatusTransitionTests
         Assert.Equal(
             TimeSpan.FromMilliseconds(1),
             ManualBackupStatusTransition.RemainingMinimumDisplay(
-                TimeSpan.FromMilliseconds(749)));
+                ManualBackupStatusTransition.MinimumAcknowledgementDisplay
+                    - TimeSpan.FromMilliseconds(1)));
         Assert.Equal(
             TimeSpan.Zero,
             ManualBackupStatusTransition.RemainingMinimumDisplay(
-                TimeSpan.FromMilliseconds(751)));
+                ManualBackupStatusTransition.MinimumAcknowledgementDisplay
+                    + TimeSpan.FromMilliseconds(1)));
     }
 
     [Theory]

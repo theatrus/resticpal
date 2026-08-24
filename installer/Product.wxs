@@ -169,6 +169,13 @@
                   Execute="immediate"
                   Return="ignore" />
     <InstallExecuteSequence>
+      <!-- The util extension defaults CloseApplications immediately before
+           InstallFiles, after MSI has already queued RemoveFiles/RemoveFolders.
+           Schedule it at the start of the transaction so its deferred
+           termination runs before any installed payload is removed. -->
+      <Custom Action="override Wix4CloseApplications_$(sys.BUILDARCHSHORT)"
+              After="InstallInitialize"
+              Condition="VersionNT &gt; 400" />
       <Custom Action="LaunchTrayAfterInstall"
               After="InstallFinalize"
               Condition="NOT (REMOVE ~= &quot;ALL&quot;)" />

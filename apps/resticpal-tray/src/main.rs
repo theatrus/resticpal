@@ -17,6 +17,7 @@ use resticpal_windows::named_pipe::{NamedPipeClient, NamedPipeError};
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::{LIM_SMALL, LoadIconMetric};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -25,16 +26,15 @@ use windows::Win32::UI::Shell::{
     ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CW_USEDEFAULT, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
-    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
-    GetCursorPos, GetMessageTime, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, KillTimer,
-    LR_DEFAULTCOLOR, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK, MENU_ITEM_FLAGS, MSG,
-    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageTime,
+    GetMessageW, HICON, IDC_ARROW, KillTimer, LoadCursorW, MB_ICONERROR, MB_OK, MENU_ITEM_FLAGS,
+    MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
     SW_SHOWNORMAL, SetForegroundWindow, SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu,
     TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
-use windows::core::{Error, Result, w};
+use windows::core::{Error, PCWSTR, Result, w};
 
 const WINDOW_CLASS: windows::core::PCWSTR = w!("ResticPalTrayWindow");
 const TRAY_CALLBACK: u32 = WM_APP + 1;
@@ -75,8 +75,7 @@ const UPDATE_APPCAST_SOURCES: &[UpdateSource] = &[
 ];
 const UPDATE_PUBLIC_KEY: &str = include_str!("../../../config/update-public-key.txt");
 const MF_STRING: MENU_ITEM_FLAGS = MENU_ITEM_FLAGS(0);
-const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../../assets/resticpal.ico");
-const PREFERRED_TRAY_ICON_SIZE: u16 = 32;
+const TRAY_ICON_RESOURCE_ID: usize = 1;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static ONBOARDING_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static LAST_LEFT_CLICK_MESSAGE_TIME: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -240,7 +239,6 @@ const fn user_update_action(setting: AutomaticUpdateSetting) -> UserUpdateAction
 
 struct TrayIcon {
     handle: HICON,
-    owned: bool,
 }
 
 struct LaunchGuard<'a> {
@@ -262,36 +260,23 @@ impl Drop for LaunchGuard<'_> {
 }
 
 impl TrayIcon {
-    fn load() -> Result<Self> {
-        if let Some(image) = select_icon_image(TRAY_ICON_BYTES, PREFERRED_TRAY_ICON_SIZE) {
-            // SAFETY: `image` is a bounded image resource from the embedded ICO and
-            // remains live for the duration of this synchronous call.
-            if let Ok(handle) =
-                unsafe { CreateIconFromResourceEx(image, true, 0x0003_0000, 0, 0, LR_DEFAULTCOLOR) }
-            {
-                return Ok(Self {
-                    handle,
-                    owned: true,
-                });
-            }
-        }
-
-        // SAFETY: loading a predefined Windows resource returns a shared handle.
-        let handle = unsafe { LoadIconW(None, IDI_APPLICATION) }?;
-        Ok(Self {
-            handle,
-            owned: false,
-        })
+    fn load(instance: HINSTANCE) -> Result<Self> {
+        // MAKEINTRESOURCEW encodes a numeric resource identifier in a PCWSTR.
+        // LoadIconMetric selects an exact small-icon frame when available and
+        // otherwise downsamples the next larger frame for the active DPI.
+        let resource = PCWSTR(TRAY_ICON_RESOURCE_ID as *const u16);
+        // SAFETY: resource ID 1 is the ICO embedded by build.rs, and the v6
+        // common-controls dependency is activated by the required manifest.
+        let handle = unsafe { LoadIconMetric(Some(instance), resource, LIM_SMALL) }?;
+        Ok(Self { handle })
     }
 }
 
 impl Drop for TrayIcon {
     fn drop(&mut self) {
-        if self.owned {
-            // SAFETY: an owned handle is created exactly once above and remains live
-            // until this process has removed its notification-area icon.
-            let _ = unsafe { DestroyIcon(self.handle) };
-        }
+        // SAFETY: LoadIconMetric transfers an owned icon handle, created once
+        // above and kept live until the notification-area icon is removed.
+        let _ = unsafe { DestroyIcon(self.handle) };
     }
 }
 
@@ -324,7 +309,7 @@ fn run() -> Result<()> {
     let instance = HINSTANCE(module.0);
     // SAFETY: loading predefined Windows resources does not transfer ownership.
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }?;
-    let tray_icon = TrayIcon::load()?;
+    let tray_icon = TrayIcon::load(instance)?;
     // Explorer broadcasts this registered message after recreating its taskbar.
     // The notification icon otherwise disappears while this process keeps running.
     let taskbar_created_message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
@@ -418,59 +403,6 @@ fn add_tray_icon(window: HWND, icon: HICON) -> Result<()> {
         return Err(Error::from_thread());
     }
     Ok(())
-}
-
-fn select_icon_image(bytes: &[u8], preferred_size: u16) -> Option<&[u8]> {
-    if read_u16(bytes, 0)? != 0 || read_u16(bytes, 2)? != 1 {
-        return None;
-    }
-
-    let count = usize::from(read_u16(bytes, 4)?);
-    let directory_end = 6usize.checked_add(count.checked_mul(16)?)?;
-    if count == 0 || directory_end > bytes.len() {
-        return None;
-    }
-
-    let preferred_size = u32::from(preferred_size);
-    let mut selected: Option<(u32, &[u8])> = None;
-    for index in 0..count {
-        let entry_offset = 6 + index * 16;
-        let entry = bytes.get(entry_offset..entry_offset + 16)?;
-        let width = if entry[0] == 0 {
-            256
-        } else {
-            u32::from(entry[0])
-        };
-        let height = if entry[1] == 0 {
-            256
-        } else {
-            u32::from(entry[1])
-        };
-        let image_size = usize::try_from(read_u32(entry, 8)?).ok()?;
-        let image_offset = usize::try_from(read_u32(entry, 12)?).ok()?;
-        let image_end = image_offset.checked_add(image_size)?;
-        let image = bytes.get(image_offset..image_end)?;
-        let score = width.abs_diff(preferred_size) + height.abs_diff(preferred_size);
-
-        if selected
-            .as_ref()
-            .is_none_or(|(selected_score, _)| score < *selected_score)
-        {
-            selected = Some((score, image));
-        }
-    }
-
-    selected.map(|(_, image)| image)
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    let raw: [u8; 2] = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
-    Some(u16::from_le_bytes(raw))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    let raw: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
-    Some(u32::from_le_bytes(raw))
 }
 
 fn run_message_loop() -> Result<()> {
@@ -1524,6 +1456,10 @@ fn wide_null(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use windows::Win32::UI::HiDpi::{
+        AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        GetThreadDpiAwarenessContext,
+    };
 
     #[test]
     fn launch_guard_rejects_reentrant_launches_and_resets_on_drop() {
@@ -1606,31 +1542,27 @@ mod tests {
     }
 
     #[test]
-    fn embedded_tray_icon_contains_the_preferred_png_image() {
-        let image = select_icon_image(TRAY_ICON_BYTES, PREFERRED_TRAY_ICON_SIZE)
-            .expect("embedded tray icon should contain a valid image");
-
-        assert_eq!(image.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()));
+    fn embedded_manifest_sets_the_tray_process_to_per_monitor_v2() {
+        // SAFETY: this only queries the current test thread's inherited process
+        // default, which comes from the same build-script manifest as the tray.
+        let current = unsafe { GetThreadDpiAwarenessContext() };
+        // SAFETY: both values are predefined, valid awareness contexts.
+        assert!(
+            unsafe {
+                AreDpiAwarenessContextsEqual(current, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            }
+            .as_bool()
+        );
     }
 
     #[test]
-    fn windows_can_create_the_embedded_tray_icon() {
-        let image = select_icon_image(TRAY_ICON_BYTES, PREFERRED_TRAY_ICON_SIZE)
-            .expect("embedded tray icon should contain a valid image");
-        // SAFETY: `image` is a complete, bounded icon image owned by the static ICO.
-        let icon =
-            unsafe { CreateIconFromResourceEx(image, true, 0x0003_0000, 0, 0, LR_DEFAULTCOLOR) }
-                .expect("Windows should create an icon from the embedded image");
-
-        // SAFETY: the icon was created by this test and has not been destroyed yet.
-        unsafe { DestroyIcon(icon) }.expect("Windows should destroy the test icon");
-    }
-
-    #[test]
-    fn icon_selection_rejects_truncated_directories() {
-        let truncated = [0, 0, 1, 0, 1, 0, 32, 32];
-
-        assert!(select_icon_image(&truncated, 32).is_none());
+    fn windows_can_load_the_embedded_metric_tray_icon() {
+        // SAFETY: None asks Windows for the module containing this test binary,
+        // which receives the same resources from the package build script.
+        let module = unsafe { GetModuleHandleW(None) }.expect("test module should be available");
+        let icon = TrayIcon::load(HINSTANCE(module.0))
+            .expect("Windows should load resource 1 at the active small-icon metric");
+        drop(icon);
     }
 
     #[test]

@@ -4,6 +4,99 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not ('ResticPalPeResource' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class ResticPalPeResource
+{
+    private const uint LoadLibraryAsDataFile = 0x00000002;
+    private const uint LoadLibraryAsImageResource = 0x00000020;
+    private static readonly IntPtr ApplicationManifestResource = new IntPtr(1);
+    private static readonly IntPtr ManifestResourceType = new IntPtr(24);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadLibraryEx(
+        string fileName,
+        IntPtr file,
+        uint flags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr FindResource(
+        IntPtr module,
+        IntPtr name,
+        IntPtr type);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint SizeofResource(IntPtr module, IntPtr resource);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LoadResource(IntPtr module, IntPtr resource);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LockResource(IntPtr resourceData);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FreeLibrary(IntPtr module);
+
+    public static string ReadApplicationManifest(string path)
+    {
+        IntPtr module = LoadLibraryEx(
+            path,
+            IntPtr.Zero,
+            LoadLibraryAsDataFile | LoadLibraryAsImageResource);
+        if (module == IntPtr.Zero)
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "Could not load the packaged tray as a resource image.");
+        }
+
+        try
+        {
+            IntPtr resource = FindResource(
+                module,
+                ApplicationManifestResource,
+                ManifestResourceType);
+            if (resource == IntPtr.Zero)
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "The packaged tray has no RT_MANIFEST resource 1.");
+            }
+
+            uint size = SizeofResource(module, resource);
+            if (size == 0 || size > 1024 * 1024)
+            {
+                throw new InvalidOperationException(
+                    "The packaged tray application manifest has an invalid size.");
+            }
+
+            IntPtr loaded = LoadResource(module, resource);
+            IntPtr bytes = loaded == IntPtr.Zero ? IntPtr.Zero : LockResource(loaded);
+            if (bytes == IntPtr.Zero)
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "Could not read the packaged tray application manifest.");
+            }
+
+            var managed = new byte[size];
+            Marshal.Copy(bytes, managed, 0, managed.Length);
+            return Encoding.UTF8.GetString(managed).TrimEnd('\0');
+        }
+        finally
+        {
+            FreeLibrary(module);
+        }
+    }
+}
+'@
+}
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 if ([string]::IsNullOrWhiteSpace($MsiPath)) {
     $candidates = @(Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'artifacts\installer\output') -Filter 'resticpal-*-x64.msi' -File -ErrorAction SilentlyContinue)
@@ -92,6 +185,34 @@ try {
             $observedSequence = if ($null -eq $record) { '<missing>' } else { $record.IntegerData(1) }
             throw "RemoveExistingProducts must run immediately after InstallExecute (6501); got $observedSequence."
         }
+
+        [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) | Out-Null
+        $record = $null
+        $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
+        [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null
+        $view = $null
+
+        $view = $database.GetType().InvokeMember(
+            'OpenView',
+            'InvokeMethod',
+            $null,
+            $database,
+            'SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action` = ''Wix4CloseApplications_X64''')
+        $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+        $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+        $closeApplicationsSequence = if ($null -eq $record) { $null } else { $record.IntegerData(1) }
+        if (
+            $null -eq $closeApplicationsSequence -or
+            $closeApplicationsSequence -le 1500 -or
+            $closeApplicationsSequence -ge 3500
+        ) {
+            $observedSequence = if ($null -eq $closeApplicationsSequence) {
+                '<missing>'
+            } else {
+                $closeApplicationsSequence
+            }
+            throw "CloseApplications must run after InstallInitialize (1500) and before RemoveFiles (3500); got $observedSequence."
+        }
     } finally {
         if ($null -ne $record) {
             [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) | Out-Null
@@ -149,6 +270,33 @@ try {
             throw ("$fileName version mismatch: file=$($versionInfo.FileVersion), " +
                    "product=$($versionInfo.ProductVersion), expected=$productVersion")
         }
+    }
+
+    $trayPath = Join-Path $installImage 'resticpal-tray.exe'
+    $trayManifest = [ResticPalPeResource]::ReadApplicationManifest($trayPath)
+    $trayManifestDocument = [xml] $trayManifest
+    $trayAssemblyIdentity = $trayManifestDocument.SelectSingleNode(
+        "/*[local-name()='assembly']/*[local-name()='assemblyIdentity']")
+    if (
+        $null -eq $trayAssemblyIdentity -or
+        $trayAssemblyIdentity.GetAttribute('processorArchitecture') -cne 'amd64'
+    ) {
+        throw 'The packaged x64 tray manifest definition identity must use processorArchitecture="amd64".'
+    }
+    foreach ($requiredManifestEntry in @(
+        "version=`"$fileVersion`"",
+        '<requestedExecutionLevel level="asInvoker" uiAccess="false" />',
+        '>true/pm</dpiAware>',
+        '>PerMonitorV2, PerMonitor</dpiAwareness>',
+        'name="Microsoft.Windows.Common-Controls"',
+        'version="6.0.0.0"'
+    )) {
+        if (-not $trayManifest.Contains($requiredManifestEntry)) {
+            throw "The packaged tray manifest is missing: $requiredManifestEntry"
+        }
+    }
+    if ($trayManifest.Contains('level="requireAdministrator"')) {
+        throw 'The packaged tray must remain asInvoker so all-users login never prompts for elevation.'
     }
 
     $resticPath = Join-Path $installImage 'restic.exe'

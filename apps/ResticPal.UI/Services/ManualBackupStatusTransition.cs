@@ -8,7 +8,7 @@ namespace ResticPal.UI.Services;
 internal static class ManualBackupStatusTransition
 {
     internal static readonly TimeSpan MinimumAcknowledgementDisplay =
-        TimeSpan.FromMilliseconds(750);
+        TimeSpan.FromSeconds(2);
     internal static readonly TimeSpan AcknowledgementTimeout = TimeSpan.FromMinutes(2);
 
     internal static ManualBackupStatusDecision Evaluate(

@@ -21,6 +21,15 @@ fn compile_windows_resources(description: &str, original_filename: &str) {
         components.next().is_none(),
         "resticpal version must have three parts"
     );
+    let processor_architecture = match env::var("CARGO_CFG_TARGET_ARCH")
+        .expect("Cargo target architecture")
+        .as_str()
+    {
+        "x86_64" => "amd64",
+        "x86" => "x86",
+        "aarch64" => "arm64",
+        architecture => panic!("unsupported Windows manifest architecture: {architecture}"),
+    };
 
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
@@ -28,12 +37,19 @@ fn compile_windows_resources(description: &str, original_filename: &str) {
         .join("../../assets/resticpal.ico")
         .canonicalize()
         .expect("resticpal icon");
-    let output = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"))
-        .join("resticpal-version.rc");
+    let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
+    let manifest = output_dir.join("resticpal-tray.manifest");
+    fs::write(
+        &manifest,
+        application_manifest(&version, processor_architecture, major, minor, patch),
+    )
+    .expect("write generated tray application manifest");
+    let output = output_dir.join("resticpal-version.rc");
     fs::write(
         &output,
         version_resource(
             &icon,
+            &manifest,
             description,
             original_filename,
             &version,
@@ -45,13 +61,65 @@ fn compile_windows_resources(description: &str, original_filename: &str) {
     .expect("write generated Windows resources");
 
     embed_resource::compile(&output, embed_resource::NONE)
-        .manifest_optional()
-        .expect("resticpal tray resources should compile");
+        .manifest_required()
+        .expect("resticpal tray resources and DPI manifest should compile");
+}
+
+fn application_manifest(
+    version: &str,
+    processor_architecture: &str,
+    major: u16,
+    minor: u16,
+    patch: u16,
+) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+    <assemblyIdentity
+        type="win32"
+        name="resticpal.tray"
+        version="{major}.{minor}.{patch}.0"
+        processorArchitecture="{processor_architecture}" />
+    <description>resticpal tray application {version}</description>
+    <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+        <security>
+            <requestedPrivileges>
+                <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+            </requestedPrivileges>
+        </security>
+    </trustInfo>
+    <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+        <application>
+            <supportedOS Id="{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}" />
+        </application>
+    </compatibility>
+    <application xmlns="urn:schemas-microsoft-com:asm.v3">
+        <windowsSettings>
+            <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+            <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+            <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+        </windowsSettings>
+    </application>
+    <dependency>
+        <dependentAssembly>
+            <assemblyIdentity
+                type="win32"
+                name="Microsoft.Windows.Common-Controls"
+                version="6.0.0.0"
+                processorArchitecture="*"
+                publicKeyToken="6595b64144ccf1df"
+                language="*" />
+        </dependentAssembly>
+    </dependency>
+</assembly>
+"#,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn version_resource(
     icon: &Path,
+    manifest: &Path,
     description: &str,
     original_filename: &str,
     version: &str,
@@ -60,8 +128,10 @@ fn version_resource(
     patch: u16,
 ) -> String {
     let icon = icon.to_string_lossy().replace('\\', "/");
+    let manifest = manifest.to_string_lossy().replace('\\', "/");
     format!(
-        r#"1 ICON "{icon}"
+        r#"1 24 "{manifest}"
+1 ICON "{icon}"
 1 VERSIONINFO
 FILEVERSION {major},{minor},{patch},0
 PRODUCTVERSION {major},{minor},{patch},0

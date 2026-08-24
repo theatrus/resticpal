@@ -37,6 +37,27 @@ if ($null -eq $identity -or $identity.GetAttribute('version') -cne $fourPartVers
     throw "The WinUI application manifest identity must use version $fourPartVersion."
 }
 
+$trayBuildScript = Get-Content -LiteralPath (
+    Join-Path $repositoryRoot 'apps\resticpal-tray\build.rs') -Raw
+foreach ($trayManifestInvariant in @(
+    '1 24 "{manifest}"',
+    '.manifest_required()',
+    '"x86_64" => "amd64"',
+    'processorArchitecture="{processor_architecture}"',
+    'requestedExecutionLevel level="asInvoker" uiAccess="false"',
+    '>true/pm</dpiAware>',
+    '>PerMonitorV2, PerMonitor</dpiAwareness>',
+    'name="Microsoft.Windows.Common-Controls"',
+    'version="6.0.0.0"'
+)) {
+    if (-not $trayBuildScript.Contains($trayManifestInvariant)) {
+        throw "The tray build is missing DPI manifest invariant: $trayManifestInvariant"
+    }
+}
+if ($trayBuildScript.Contains('requestedExecutionLevel level="requireAdministrator"')) {
+    throw 'The tray application manifest must remain asInvoker.'
+}
+
 $lockText = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Cargo.lock') -Raw
 $workspacePackages = [Regex]::Matches(
     $lockText,
@@ -171,4 +192,4 @@ foreach ($qualificationInvariant in @(
 
 & (Join-Path $PSScriptRoot 'Test-ReleaseQualification.ps1')
 
-Write-Host "OK: Rust, WinUI, application manifest, installer input, and appcast source version are $version."
+Write-Host "OK: Rust, WinUI, tray/UI manifests, installer input, and appcast source version are $version."
