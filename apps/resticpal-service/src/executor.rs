@@ -1087,6 +1087,9 @@ mod tests {
     use resticpal_core::config::RepositoryMode;
     use resticpal_core::restic::ResticOperation;
     use resticpal_core::status::MAX_BACKUP_FAILED_ITEM_BYTES;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_READ_CONTROL, PROCESS_SYNCHRONIZE,
+    };
 
     use super::*;
 
@@ -1162,7 +1165,69 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn is_finalized_repository_lock_name(name: &OsStr) -> bool {
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        name.len() == 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn finalized_repository_lock_count(repository: &Path) -> usize {
+        fs::read_dir(repository.join("locks"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        let name = entry.file_name();
+                        is_finalized_repository_lock_name(name.as_os_str())
+                    })
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn recognizes_only_finalized_repository_lock_names() {
+        let valid = "0123456789abcdef".repeat(4);
+        assert!(is_finalized_repository_lock_name(OsStr::new(&valid)));
+        assert!(!is_finalized_repository_lock_name(OsStr::new(&format!(
+            "{valid}-tmp-1234"
+        ))));
+        assert!(!is_finalized_repository_lock_name(OsStr::new(
+            &"0123456789ABCDEF".repeat(4)
+        )));
+        assert!(!is_finalized_repository_lock_name(OsStr::new(
+            "not-a-restic-lock"
+        )));
+    }
+
+    fn wait_until_process_is_unobservable(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let access = PROCESS_READ_CONTROL | PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE;
+            let process = unsafe { OpenProcess(access, false, pid) };
+            let Ok(process) = process else {
+                return;
+            };
+            let _ = unsafe { CloseHandle(process) };
+
+            assert!(
+                Instant::now() < deadline,
+                "terminated stale-lock process {pid} remained observable"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn leave_stale_restic_lock(restic: &Path, repository: &Path, password: &str) {
+        assert_eq!(
+            repository_lock_count(repository),
+            0,
+            "stale-lock fixture requires an initially unlocked repository"
+        );
         let mut command = Command::new(restic);
         command
             .args(["backup", "--stdin", "--stdin-filename", "stale-lock-probe"])
@@ -1181,7 +1246,10 @@ mod tests {
         let mut child = command.spawn().expect("start stale-lock restic process");
         let stdin = child.stdin.take().expect("hold restic stdin open");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while repository_lock_count(repository) == 0 {
+        // The local backend writes a `<lock-id>-tmp-*` file before atomically
+        // renaming it. Killing on the first directory entry would leave an
+        // incomplete temporary file, not the stale lock this fixture needs.
+        while finalized_repository_lock_count(repository) == 0 {
             assert!(
                 child
                     .try_wait()
@@ -1195,10 +1263,18 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(50));
         }
+        assert_eq!(
+            repository_lock_count(repository),
+            1,
+            "fixture must observe one finalized lock and no temporary files"
+        );
 
+        let stale_pid = child.id();
         child.kill().expect("terminate restic without lock cleanup");
         child.wait().expect("reap terminated restic process");
         drop(stdin);
+        drop(child);
+        wait_until_process_is_unobservable(stale_pid);
         assert_eq!(
             repository_lock_count(repository),
             1,
