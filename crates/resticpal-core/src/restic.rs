@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf, Prefix};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{
     ConfigValidationError, EffectiveConfig, RepositoryMode, SecretEnvironmentVariable,
+    repository_option_disables_source_snapshots,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,7 +65,22 @@ impl ResticCommandBuilder {
     }
 
     pub fn backup(&self, config: &EffectiveConfig) -> Result<ResticInvocation, InvocationError> {
+        self.backup_with_required_exclusions(config, &[])
+    }
+
+    /// Builds a backup invocation with exclusions enforced by the caller.
+    ///
+    /// Required exclusions are appended after the configurable exclusions and
+    /// before every backup source. Keeping them outside [`EffectiveConfig`]
+    /// prevents local or managed configuration from removing service-owned
+    /// safety exclusions such as the application's internal data directory.
+    pub fn backup_with_required_exclusions(
+        &self,
+        config: &EffectiveConfig,
+        exclusions: &[PathBuf],
+    ) -> Result<ResticInvocation, InvocationError> {
         authorize_operation(config.repository.mode, ResticOperation::Backup)?;
+        reject_snapshot_disabling_options(config)?;
         config.validate()?;
 
         let repository = config
@@ -75,8 +91,23 @@ impl ResticCommandBuilder {
         if config.backup.paths.is_empty() {
             return Err(InvocationError::NoBackupPaths);
         }
+        if config.backup.paths.iter().any(|source| {
+            exclusions
+                .iter()
+                .any(|protected| windows_path_is_same_or_descendant(source, protected))
+        }) {
+            // Restic deliberately does not apply exclude patterns to an
+            // explicitly named source leaf. Rejecting protected sources here
+            // keeps a direct Credentials\<blob> source from bypassing the
+            // mandatory directory exclusion.
+            return Err(InvocationError::ProtectedBackupSource);
+        }
 
         let mut arguments = repository_options(config);
+        // Restic caches data per repository. Clean only obsolete local cache
+        // namespaces as part of a backup so repositories removed from policy do
+        // not leave unbounded service-owned state behind.
+        arguments.push("--cleanup-cache".into());
         arguments.push("backup".into());
         arguments.push("--json".into());
         arguments.push("--use-fs-snapshot".into());
@@ -84,6 +115,14 @@ impl ResticCommandBuilder {
         for exclusion in &config.backup.exclusions {
             arguments.push("--exclude".into());
             arguments.push(exclusion.into());
+        }
+        for exclusion in exclusions {
+            // Windows paths are case-insensitive even when the source spelling
+            // differs from the canonical ProgramData casing. A case-sensitive
+            // rule can therefore be bypassed by selecting the same directory
+            // through a differently cased parent path.
+            arguments.push("--iexclude".into());
+            arguments.push(exclusion.as_os_str().to_os_string());
         }
         arguments.extend(
             config
@@ -287,6 +326,91 @@ fn repository_options(config: &EffectiveConfig) -> Vec<OsString> {
     arguments
 }
 
+fn reject_snapshot_disabling_options(config: &EffectiveConfig) -> Result<(), InvocationError> {
+    if let Some(option) = config
+        .repository
+        .options
+        .keys()
+        .find(|option| repository_option_disables_source_snapshots(option))
+    {
+        return Err(InvocationError::SnapshotDisablingRepositoryOption(
+            option.clone(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Compares absolute Windows paths lexically using Windows-style casing and
+/// prefix equivalence, resolving `.` and `..` components without touching the
+/// filesystem. The service adds a canonical filesystem check for aliases and
+/// reparse points before constructing a backup.
+#[must_use]
+pub fn windows_path_is_same_or_descendant(path: &Path, directory: &Path) -> bool {
+    let Some(path) = normalized_windows_path(path) else {
+        return false;
+    };
+    let Some(directory) = normalized_windows_path(directory) else {
+        return false;
+    };
+    path.len() >= directory.len()
+        && path
+            .iter()
+            .zip(directory.iter())
+            .all(|(path, directory)| path == directory)
+}
+
+fn normalized_windows_path(path: &Path) -> Option<Vec<String>> {
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let mut normalized = Vec::new();
+    let mut floor = 0;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                normalized.push(normalized_windows_prefix(prefix.kind()));
+                floor = normalized.len();
+            }
+            Component::RootDir => {
+                normalized.push("root".to_owned());
+                floor = normalized.len();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.len() <= floor {
+                    return None;
+                }
+                normalized.pop();
+            }
+            Component::Normal(value) => {
+                normalized.push(format!("name:{}", value.to_string_lossy().to_lowercase()));
+            }
+        }
+    }
+    Some(normalized)
+}
+
+fn normalized_windows_prefix(prefix: Prefix<'_>) -> String {
+    match prefix {
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+            format!("disk:{}", char::from(drive).to_ascii_lowercase())
+        }
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
+            "unc:{}/{}",
+            server.to_string_lossy().to_lowercase(),
+            share.to_string_lossy().to_lowercase()
+        ),
+        Prefix::DeviceNS(device) => {
+            format!("device:{}", device.to_string_lossy().to_lowercase())
+        }
+        Prefix::Verbatim(value) => {
+            format!("verbatim:{}", value.to_string_lossy().to_lowercase())
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum InvocationError {
     #[error(transparent)]
@@ -295,6 +419,16 @@ pub enum InvocationError {
     MissingRepository,
     #[error("at least one backup path is required")]
     NoBackupPaths,
+    #[error(
+        "repository option {0:?} is forbidden for backups because it can disable filesystem snapshots"
+    )]
+    SnapshotDisablingRepositoryOption(String),
+    #[error("a backup source is inside the protected resticpal data directory")]
+    ProtectedBackupSource,
+    #[error("a backup source uses an unsupported local device namespace")]
+    UnsupportedBackupSourceNamespace,
+    #[error("network backup sources are not supported")]
+    UnsupportedNetworkBackupSource,
     #[error("{operation:?} is forbidden in repository mode {mode:?}")]
     ForbiddenByRepositoryMode {
         mode: RepositoryMode,
@@ -352,6 +486,7 @@ mod tests {
             vec![
                 "--option",
                 "s3.region=us-west-2",
+                "--cleanup-cache",
                 "backup",
                 "--json",
                 "--use-fs-snapshot",
@@ -369,6 +504,106 @@ mod tests {
             "s3-secret-key"
         );
         assert!(!args.iter().any(|argument| argument == "s3-secret-key"));
+    }
+
+    #[test]
+    fn backup_places_required_path_exclusions_after_config_and_before_sources() {
+        let config = configured(RepositoryMode::AppendOnly);
+        let internal_data = PathBuf::from(r"C:\ProgramData\Restic Pal\Internal Data");
+
+        let invocation = ResticCommandBuilder::new("restic.exe")
+            .backup_with_required_exclusions(&config, std::slice::from_ref(&internal_data))
+            .expect("backup should include the required exclusion");
+
+        assert_eq!(
+            invocation.arguments,
+            [
+                OsString::from("--option"),
+                OsString::from("s3.region=us-west-2"),
+                OsString::from("--cleanup-cache"),
+                OsString::from("backup"),
+                OsString::from("--json"),
+                OsString::from("--use-fs-snapshot"),
+                OsString::from("--exclude"),
+                OsString::from("*.tmp"),
+                OsString::from("--iexclude"),
+                internal_data.into_os_string(),
+                OsString::from(r"C:\Users\Yann\Documents"),
+            ]
+        );
+    }
+
+    #[test]
+    fn configured_exclusions_cannot_remove_a_required_exclusion() {
+        let mut config = configured(RepositoryMode::AppendOnly);
+        config.backup.exclusions.clear();
+        let internal_data = PathBuf::from(r"C:\ProgramData\ResticPal");
+
+        let invocation = ResticCommandBuilder::new("restic.exe")
+            .backup_with_required_exclusions(&config, std::slice::from_ref(&internal_data))
+            .expect("backup should include the required exclusion");
+
+        let required_pair = [OsString::from("--iexclude"), internal_data.into_os_string()];
+        assert!(
+            invocation
+                .arguments
+                .windows(required_pair.len())
+                .any(|arguments| arguments == required_pair),
+            "the service-owned exclusion must be present even when config has none"
+        );
+    }
+
+    #[test]
+    fn explicit_protected_sources_are_rejected_before_restic_can_bypass_excludes() {
+        let protected = PathBuf::from(r"C:\ProgramData\ResticPal");
+        for source in [
+            PathBuf::from(r"C:\ProgramData\ResticPal"),
+            PathBuf::from(r"c:\PROGRAMDATA\RESTICPAL\Credentials\secret.bin"),
+            PathBuf::from(r"C:\ProgramData\ResticPal\Cache\..\config.toml"),
+            PathBuf::from(r"\\?\C:\ProgramData\ResticPal\state.db"),
+        ] {
+            let mut config = configured(RepositoryMode::AppendOnly);
+            config.backup.paths = vec![source];
+            assert_eq!(
+                ResticCommandBuilder::new("restic.exe")
+                    .backup_with_required_exclusions(&config, std::slice::from_ref(&protected)),
+                Err(InvocationError::ProtectedBackupSource)
+            );
+        }
+
+        let mut config = configured(RepositoryMode::AppendOnly);
+        config.backup.paths = vec![PathBuf::from(r"C:\")];
+        assert!(
+            ResticCommandBuilder::new("restic.exe")
+                .backup_with_required_exclusions(&config, &[protected])
+                .is_ok(),
+            "a protected descendant must not reject its legitimate parent source"
+        );
+    }
+
+    #[test]
+    fn backup_rejects_repository_options_that_can_disable_vss() {
+        for option in [
+            "vss.exclude-volumes",
+            "vss.exclude-all-mount-points",
+            "VsS.ExClUdE-VoLuMeS",
+            "VSS.EXCLUDE-ALL-MOUNT-POINTS",
+        ] {
+            let mut config = configured(RepositoryMode::Standard);
+            config
+                .repository
+                .options
+                .insert(option.to_owned(), "C:".to_owned());
+
+            assert_eq!(
+                ResticCommandBuilder::new("restic.exe")
+                    .backup_with_required_exclusions(&config, &[]),
+                Err(InvocationError::SnapshotDisablingRepositoryOption(
+                    option.to_owned()
+                )),
+                "{option} must not be accepted for a backup"
+            );
+        }
     }
 
     #[test]

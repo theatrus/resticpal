@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf, Prefix};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -26,6 +26,16 @@ pub const MAX_MANAGEMENT_REFRESH_MINUTES: u32 = 24 * 60;
 const DEFAULT_INTERVAL_HOURS: u32 = 24;
 const DEFAULT_WAKE_GRACE_SECONDS: u64 = 5 * 60;
 const DEFAULT_WAKE_LOCK_TIMEOUT_SECONDS: u64 = 2 * 60 * 60;
+
+const SNAPSHOT_DISABLING_REPOSITORY_OPTIONS: [&str; 2] =
+    ["vss.exclude-volumes", "vss.exclude-all-mount-points"];
+
+#[must_use]
+pub fn repository_option_disables_source_snapshots(option: &str) -> bool {
+    SNAPSHOT_DISABLING_REPOSITORY_OPTIONS
+        .iter()
+        .any(|reserved| option.eq_ignore_ascii_case(reserved))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -379,6 +389,21 @@ impl EffectiveConfig {
             {
                 return Err(ConfigValidationError::InvalidBackupPath(path.clone()));
             }
+            if let Some(Component::Prefix(prefix)) = path.components().next() {
+                match prefix.kind() {
+                    Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => {
+                        return Err(ConfigValidationError::UnsupportedNetworkBackupPath(
+                            path.clone(),
+                        ));
+                    }
+                    Prefix::DeviceNS(_) | Prefix::Verbatim(_) => {
+                        return Err(ConfigValidationError::UnsupportedBackupPathNamespace(
+                            path.clone(),
+                        ));
+                    }
+                    Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
+                }
+            }
         }
         if self.backup.exclusions.len() > MAX_EXCLUSIONS {
             return Err(ConfigValidationError::TooManyExclusions);
@@ -396,6 +421,11 @@ impl EffectiveConfig {
             return Err(ConfigValidationError::TooManyRepositoryOptions);
         }
         for (key, value) in &self.repository.options {
+            if repository_option_disables_source_snapshots(key) {
+                return Err(ConfigValidationError::SnapshotDisablingRepositoryOption(
+                    key.clone(),
+                ));
+            }
             if !is_valid_option_name(key) {
                 return Err(ConfigValidationError::InvalidRepositoryOption(key.clone()));
             }
@@ -589,12 +619,20 @@ pub enum ConfigValidationError {
     TooManyBackupPaths,
     #[error("backup path must be an absolute path within the Windows path-length limit: {0}")]
     InvalidBackupPath(PathBuf),
+    #[error("network folders are not supported as backup sources: {0}")]
+    UnsupportedNetworkBackupPath(PathBuf),
+    #[error("backup source uses an unsupported Windows device namespace: {0}")]
+    UnsupportedBackupPathNamespace(PathBuf),
     #[error("backup configuration exceeds the maximum of {MAX_EXCLUSIONS} exclusions")]
     TooManyExclusions,
     #[error("backup exclusions must be non-empty, single-line patterns within the size limit")]
     InvalidExclusion,
     #[error("invalid repository option name: {0}")]
     InvalidRepositoryOption(String),
+    #[error(
+        "repository option {0:?} is reserved because backups must use Windows filesystem snapshots"
+    )]
+    SnapshotDisablingRepositoryOption(String),
     #[error("repository option value must be a single-line value within the size limit: {0}")]
     InvalidRepositoryOptionValue(String),
     #[error("repository configuration exceeds the maximum of {MAX_REPOSITORY_OPTIONS} options")]
@@ -927,5 +965,52 @@ mod tests {
             config.validate(),
             Err(ConfigValidationError::InvalidExclusion)
         );
+    }
+
+    #[test]
+    fn effective_configuration_rejects_network_and_device_source_namespaces() {
+        for (path, expected) in [
+            (
+                PathBuf::from(r"\\server\share\Data"),
+                ConfigValidationError::UnsupportedNetworkBackupPath(PathBuf::from(
+                    r"\\server\share\Data",
+                )),
+            ),
+            (
+                PathBuf::from(r"\\?\UNC\server\share\Data"),
+                ConfigValidationError::UnsupportedNetworkBackupPath(PathBuf::from(
+                    r"\\?\UNC\server\share\Data",
+                )),
+            ),
+            (
+                PathBuf::from(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Data"),
+                ConfigValidationError::UnsupportedBackupPathNamespace(PathBuf::from(
+                    r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Data",
+                )),
+            ),
+        ] {
+            let mut config = EffectiveConfig::default();
+            config.backup.paths = vec![path];
+
+            assert_eq!(config.validate(), Err(expected));
+        }
+    }
+
+    #[test]
+    fn effective_configuration_rejects_snapshot_disabling_repository_options() {
+        for option in ["vss.exclude-volumes", "VSS.EXCLUDE-ALL-MOUNT-POINTS"] {
+            let mut config = EffectiveConfig::default();
+            config
+                .repository
+                .options
+                .insert(option.to_owned(), "C:".to_owned());
+
+            assert_eq!(
+                config.validate(),
+                Err(ConfigValidationError::SnapshotDisablingRepositoryOption(
+                    option.to_owned()
+                ))
+            );
+        }
     }
 }

@@ -53,6 +53,8 @@ const BACKUP_STATUS_INTERVAL_MS: u32 = 1_000;
 const BACKUP_WAITING_INTERVAL_MS: u32 = 30_000;
 const BACKUP_FAST_POLL_TICKS: u64 = 15;
 const BACKUP_MONITOR_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const BACKUP_WARNING_NOTIFICATION: &str =
+    "The backup finished with a warning. Open resticpal to review what needs attention.";
 const UPDATE_CHECK_INTERVAL_MS: u32 = 6 * 60 * 60 * 1_000;
 const UPDATE_RETRY_INTERVAL_MS: u32 = 5 * 60 * 1_000;
 const UPDATE_ACCEPTED_FOLLOW_UP_INTERVAL_MS: u32 = UPDATE_CHECK_INTERVAL_MS;
@@ -1339,7 +1341,7 @@ fn poll_backup_status(window: HWND) {
             finish_backup_status_monitor(
                 window,
                 "Backup completed with warnings",
-                "The backup finished, but some files need attention. Open resticpal for details.",
+                BACKUP_WARNING_NOTIFICATION,
             );
         }
         BackupState::Failed { .. } if observed_running || attempt_changed => {
@@ -1586,6 +1588,13 @@ mod tests {
         ));
         assert!(backup_monitor_timed_out(started + BACKUP_MONITOR_TIMEOUT));
         with_backup_monitor_started(|value| *value = None);
+    }
+
+    #[test]
+    fn warning_notification_does_not_assume_files_failed() {
+        assert!(BACKUP_WARNING_NOTIFICATION.contains("with a warning"));
+        assert!(BACKUP_WARNING_NOTIFICATION.contains("review"));
+        assert!(!BACKUP_WARNING_NOTIFICATION.contains("some files"));
     }
 
     #[test]

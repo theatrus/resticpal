@@ -548,7 +548,7 @@
                             <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Backup history" />
                             <TextBlock
                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="Recent outcomes stay on this PC. For warning runs, unreadable paths are retained within a strict local limit and shown only to this elevated UI; they are never sent in server status or diagnostic logs."
+                                Text="Recent outcomes stay on this PC. Warnings can identify a filesystem-consistency issue or unreadable source items. Any retained paths are bounded, visible only in this elevated UI, and never sent in server status or diagnostic logs."
                                 TextWrapping="Wrap" />
                         </StackPanel>
                         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">

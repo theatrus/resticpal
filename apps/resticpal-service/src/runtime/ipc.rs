@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use chrono::{Duration, Utc};
 use resticpal_core::config::{RepositoryMode, SecretEnvironmentVariable};
 use resticpal_core::policy::PolicyField;
-use resticpal_core::restic::ResticOperation;
+use resticpal_core::restic::{InvocationError, ResticOperation};
 use resticpal_core::status::{BackupState, WaitingReason};
 use resticpal_protocol::{
     BackupRunFailureDetails, BackupSourcesView, RepositoryOperationKind, RepositoryOperationStatus,
@@ -19,6 +19,7 @@ use resticpal_windows::named_pipe::ClientIdentity;
 use resticpal_windows::user_profiles::discover_backup_sources;
 
 use crate::diagnostics::MAX_DIAGNOSTIC_RESULTS;
+use crate::executor::validate_backup_source_paths;
 use crate::history::MAX_HISTORY_RESULTS;
 use crate::updater;
 
@@ -1044,6 +1045,27 @@ impl ServiceRuntime {
             let exclusions = deduplicate_exclusions(exclusions);
             candidate.backup.exclusions = Some(exclusions.clone());
             effective.backup.exclusions = exclusions;
+        }
+        let data_directory = self
+            .config_store
+            .as_ref()
+            .and_then(|store| store.path().parent());
+        if let Err(error) = validate_backup_source_paths(&effective.backup.paths, data_directory) {
+            return match error {
+                InvocationError::UnsupportedNetworkBackupSource => rejected(
+                    "unsupported_network_backup_source",
+                    "Network folders cannot be used as backup sources yet. Choose a folder on a local Windows drive.",
+                ),
+                InvocationError::UnsupportedBackupSourceNamespace => rejected(
+                    "unsupported_backup_source_namespace",
+                    "Backup sources must use an ordinary local Windows drive path, without junction or device aliases.",
+                ),
+                InvocationError::ProtectedBackupSource => rejected(
+                    "protected_backup_source",
+                    "The resticpal service-data folder cannot be selected as a backup source.",
+                ),
+                _ => rejected("invalid_backup_sources", &error.to_string()),
+            };
         }
         if let Err(error) = effective.validate() {
             return rejected("invalid_backup_sources", &error.to_string());
