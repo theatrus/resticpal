@@ -65,9 +65,9 @@ pub(crate) fn prepare_service_data_root(
 ) -> Result<ServiceDataRootGuard, UpdateError> {
     let directory_security = SecureDirectorySecurity::system_and_administrators()?;
     let file_security = SecureDirectorySecurity::system_and_administrators_file()?;
-    let mut directories = Vec::with_capacity(4);
+    let mut directories = Vec::with_capacity(5);
     directories.push(prepare_secure_directory(data_root, &directory_security)?);
-    for name in ["Credentials", "Logs", "Updates"] {
+    for name in ["Cache", "Credentials", "Logs", "Updates"] {
         directories.push(prepare_secure_directory(
             &data_root.join(name),
             &directory_security,

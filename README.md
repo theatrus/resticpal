@@ -66,6 +66,9 @@ All three policy transport paths now have an end-to-end implementation. A one-ti
 - Standard-mode snapshot retention after successful backups, with a separate configurable prune cadence
 - DPAPI-encrypted, service-owned credential storage with protected ACLs and opaque references
 - Direct restic execution inside a kill-on-close Windows Job Object, bounded JSON progress, and sanitized outcomes
+- VSS-backed local source reads, with visible warnings for restic-reported live-file fallback distinct from post-backup VSS cleanup trouble; network source roots are rejected until they can be bound to a safe local filesystem identity
+- A persistent repository-metadata cache at `%ProgramData%\ResticPal\Cache`, explicitly reused across service restarts and cleaned of obsolete repository namespaces during backups
+- An unconditional exclusion for `%ProgramData%\ResticPal`, plus rejection of explicit sources inside it, so broad, differently cased, or direct paths never back up resticpal's cache, credentials, logs, or other internal state
 - Time-bounded stale-lock cleanup before every backup, without force-removing active restic locks
 - Durable repository validation, scheduler state, and privacy-bounded SQLite run history; exact partial-backup paths stay local and require the elevated UI
 - Per-machine x64 MSI with a LocalSystem backup service, recovery policy, all-users tray and Start Menu integration, bundled restic, and data-preserving uninstall

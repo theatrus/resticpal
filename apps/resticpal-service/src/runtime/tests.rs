@@ -1412,7 +1412,55 @@ fn invalid_source_update_does_not_replace_configuration() {
         response.payload,
         ResponsePayload::Rejected { ref code, .. } if code == "invalid_backup_sources"
     ));
-    assert_eq!(std::fs::read(config_path).expect("config remains"), before);
+    assert_eq!(std::fs::read(&config_path).expect("config remains"), before);
+}
+
+#[test]
+fn unsafe_source_updates_are_rejected_with_actionable_copy() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config_path = directory.path().join("config.toml");
+    let store = LocalConfigStore::new(&config_path);
+    store.save(&LocalConfig::default()).expect("initial config");
+    let before = std::fs::read(&config_path).expect("initial bytes");
+    let (events, _receiver) = mpsc::channel();
+    let runtime = ServiceRuntime::load(&config_path, events).expect("runtime should load");
+
+    let response = runtime.handle_request(
+        Request::new(
+            23,
+            RequestCommand::UpdateBackupSources {
+                paths: Some(vec![PathBuf::from(r"\\server\share\Data")]),
+                exclusions: Some(Vec::new()),
+            },
+        ),
+        ADMIN,
+    );
+
+    assert!(matches!(
+        response.payload,
+        ResponsePayload::Rejected { ref code, ref message }
+            if code == "unsupported_network_backup_source"
+                && message.contains("local Windows drive")
+    ));
+    assert_eq!(std::fs::read(&config_path).expect("config remains"), before);
+
+    let protected_response = runtime.handle_request(
+        Request::new(
+            24,
+            RequestCommand::UpdateBackupSources {
+                paths: Some(vec![directory.path().to_path_buf()]),
+                exclusions: Some(Vec::new()),
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(
+        protected_response.payload,
+        ResponsePayload::Rejected { ref code, ref message }
+            if code == "protected_backup_source"
+                && message.contains("service-data folder")
+    ));
+    assert_eq!(std::fs::read(&config_path).expect("config remains"), before);
 }
 
 #[test]
@@ -1612,6 +1660,35 @@ fn repository_configuration_requires_an_elevated_administrator() {
             ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
         ));
     }
+}
+
+#[test]
+fn repository_update_rejects_options_that_disable_source_snapshots() {
+    let (runtime, _events) = runtime(true);
+    let response = runtime.handle_request(
+        Request::new(
+            31,
+            RequestCommand::UpdateRepository {
+                display_name: None,
+                url: None,
+                mode: None,
+                options: Some(BTreeMap::from([(
+                    "vss.exclude-volumes".to_owned(),
+                    "C:".to_owned(),
+                )])),
+                secret_updates: Vec::new(),
+            },
+        ),
+        ADMIN,
+    );
+
+    assert!(matches!(
+        response.payload,
+        ResponsePayload::Rejected { ref code, ref message }
+            if code == "invalid_repository"
+                && message.contains("must use Windows filesystem snapshots")
+    ));
+    assert!(runtime.config().repository.options.is_empty());
 }
 
 #[test]
@@ -2299,6 +2376,21 @@ fn standard_retention_transitions_phase_and_preserves_backup_success_as_warning(
     assert_eq!(
         outcome.warning_code.as_deref(),
         Some("retention_prune_failed")
+    );
+
+    let backup_warning = BackupOutcome::succeeded(BackupSummary {
+        files_processed: 1,
+        bytes_processed: 2,
+        data_added: 3,
+        snapshot_id: Some("warning-snapshot".to_owned()),
+    })
+    .with_warning("restic_vss_fallback");
+    let outcome = runtime.finish_retention(backup_warning, &retention, now);
+    assert_eq!(outcome.kind, BackupOutcomeKind::SucceededWithWarnings);
+    assert_eq!(
+        outcome.warning_code.as_deref(),
+        Some("restic_vss_fallback"),
+        "retention state and diagnostics must not hide the primary backup warning"
     );
 }
 

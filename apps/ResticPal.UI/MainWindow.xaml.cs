@@ -130,10 +130,11 @@ public sealed partial class MainWindow : Window
         {
             DateTimeOffset? baselineAttempt = _lastServiceSnapshot?.LastAttempt;
             CommandResult result = await _service.RunBackupNowAsync();
-            ShowMessage(
-                result.Accepted ? InfoBarSeverity.Success : InfoBarSeverity.Warning,
-                result.Message);
-            if (result.Accepted)
+            if (!result.Accepted)
+            {
+                ShowMessage(InfoBarSeverity.Warning, result.Message);
+            }
+            else
             {
                 _manualBackupPending = true;
                 _manualBackupRequestedTimestamp = Stopwatch.GetTimestamp();

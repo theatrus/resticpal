@@ -4,8 +4,10 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,17 +18,20 @@ use std::time::{Duration, Instant};
 use resticpal_core::config::{EffectiveConfig, SecretEnvironmentVariable};
 use resticpal_core::restic::{
     InvocationError, ResticCommandBuilder, ResticInvocation, ResticOperation,
+    windows_path_is_same_or_descendant,
 };
 use resticpal_core::status::{BackupProgress, MAX_BACKUP_FAILED_ITEMS, is_safe_backup_failed_item};
 use resticpal_windows::credentials::DpapiSecretStore;
 use serde::Deserialize;
 use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE};
+use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 use windows::core::PCWSTR;
 use zeroize::Zeroizing;
 
@@ -126,6 +131,8 @@ pub struct WakeLockAcquireError;
 #[derive(Clone)]
 pub struct ResticExecutor {
     executable: Arc<OsString>,
+    data_directory: Arc<PathBuf>,
+    cache_directory: Arc<PathBuf>,
     secrets: Arc<dyn SecretResolver>,
     wake_locks: Arc<dyn WakeLockProvider>,
 }
@@ -133,11 +140,16 @@ pub struct ResticExecutor {
 impl ResticExecutor {
     pub fn new(
         executable: impl Into<OsString>,
+        data_directory: impl Into<PathBuf>,
         secrets: Arc<dyn SecretResolver>,
         wake_locks: Arc<dyn WakeLockProvider>,
     ) -> Self {
+        let data_directory = data_directory.into();
+        let cache_directory = data_directory.join("Cache");
         Self {
             executable: Arc::new(executable.into()),
+            data_directory: Arc::new(data_directory),
+            cache_directory: Arc::new(cache_directory),
             secrets,
             wake_locks,
         }
@@ -149,11 +161,14 @@ impl ResticExecutor {
         cancellation: &CancellationToken,
         on_progress: impl FnMut(BackupProgress),
     ) -> BackupOutcome {
-        let (unlock, backup) =
-            match build_backup_invocations(self.executable.as_ref().as_os_str(), config) {
-                Ok(invocations) => invocations,
-                Err(_) => return BackupOutcome::failed("invalid_configuration"),
-            };
+        let (unlock, _) = match build_backup_invocations(
+            self.executable.as_ref().as_os_str(),
+            self.data_directory.as_ref(),
+            config,
+        ) {
+            Ok(invocations) => invocations,
+            Err(error) => return BackupOutcome::failed(backup_invocation_error_code(&error)),
+        };
 
         let cleanup =
             self.execute_repository_invocation(&unlock, STALE_LOCK_CLEANUP_TIMEOUT, cancellation);
@@ -161,10 +176,25 @@ impl ResticExecutor {
             return outcome;
         }
 
+        // Source paths live outside the protected service directory and can
+        // change while restic performs stale-lock cleanup. Resolve and validate
+        // them again after that operation so a junction or namespace alias
+        // introduced during cleanup cannot reuse a plan built against the old
+        // filesystem layout.
+        let (_, backup) = match build_backup_invocations(
+            self.executable.as_ref().as_os_str(),
+            self.data_directory.as_ref(),
+            config,
+        ) {
+            Ok(invocations) => invocations,
+            Err(error) => return BackupOutcome::failed(backup_invocation_error_code(&error)),
+        };
+
         self.execute_invocation(
             &backup,
             Duration::from_secs(config.schedule.wake_lock_timeout_seconds),
             cancellation,
+            false,
             on_progress,
         )
     }
@@ -257,7 +287,11 @@ impl ResticExecutor {
             Ok(job) => job,
             Err(_) => return RepositoryOutcome::failed("process_isolation_failed"),
         };
-        let mut command = command_for(invocation, &secret_environment);
+        let mut command = command_for(
+            invocation,
+            &secret_environment,
+            self.cache_directory.as_ref(),
+        );
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(_) => return RepositoryOutcome::failed("restic_start_failed"),
@@ -353,6 +387,7 @@ impl ResticExecutor {
         invocation: &ResticInvocation,
         wake_lock_timeout: Duration,
         cancellation: &CancellationToken,
+        known_vss_fallback: bool,
         mut on_progress: impl FnMut(BackupProgress),
     ) -> BackupOutcome {
         let secret_environment = match self.resolve_secrets(&invocation.secret_environment) {
@@ -371,7 +406,11 @@ impl ResticExecutor {
             Ok(job) => job,
             Err(_) => return BackupOutcome::failed("process_isolation_failed"),
         };
-        let mut command = command_for(invocation, &secret_environment);
+        let mut command = command_for(
+            invocation,
+            &secret_environment,
+            self.cache_directory.as_ref(),
+        );
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(_) => return BackupOutcome::failed("restic_start_failed"),
@@ -443,7 +482,13 @@ impl ResticExecutor {
             Ok(status) => status,
             Err(()) => return BackupOutcome::failed("restic_wait_failed"),
         };
-        finish_outcome(status, output_result, stderr_output, &stderr)
+        finish_outcome(
+            status,
+            output_result,
+            stderr_output,
+            &stderr,
+            known_vss_fallback,
+        )
     }
 
     fn resolve_secrets(
@@ -466,12 +511,137 @@ impl ResticExecutor {
 /// perform even the narrow lock cleanup mutation.
 fn build_backup_invocations(
     executable: &std::ffi::OsStr,
+    data_directory: &Path,
     config: &EffectiveConfig,
 ) -> Result<(ResticInvocation, ResticInvocation), InvocationError> {
     let builder = ResticCommandBuilder::new(executable);
-    let backup = builder.backup(config)?;
+    validate_backup_source_paths(&config.backup.paths, Some(data_directory))?;
+
+    let mut required_exclusions = vec![data_directory.to_path_buf()];
+    if let Ok(canonical_data_directory) = std::fs::canonicalize(data_directory) {
+        let canonical_data_directory = ordinary_windows_path(&canonical_data_directory);
+        // Match the namespace used for resolved local sources. Keeping the
+        // original spelling as well protects broad non-existent DOS sources
+        // when they later become available under their configured path.
+        if !required_exclusions
+            .iter()
+            .any(|exclusion| exclusion == &canonical_data_directory)
+        {
+            required_exclusions.push(canonical_data_directory);
+        }
+    }
+    let backup = builder.backup_with_required_exclusions(config, &required_exclusions)?;
     let unlock = builder.unlock(config)?;
     Ok((unlock, backup))
+}
+
+pub(crate) fn validate_backup_source_paths(
+    sources: &[PathBuf],
+    data_directory: Option<&Path>,
+) -> Result<(), InvocationError> {
+    for source in sources {
+        if source_is_network_path(source) {
+            // A UNC path can refer back to this machine through an administrative
+            // share while retaining a namespace that does not match the
+            // mandatory local-data exclusion. Mapped remote drives have the
+            // same problem. Reject network source roots until the wrapper can
+            // bind them to a stable filesystem identity without weakening its
+            // internal-data boundary.
+            return Err(InvocationError::UnsupportedNetworkBackupSource);
+        }
+        if source_uses_unsupported_local_namespace(source) {
+            return Err(InvocationError::UnsupportedBackupSourceNamespace);
+        }
+        if let Ok(canonical_source) = std::fs::canonicalize(source) {
+            let canonical_source = ordinary_windows_path(&canonical_source);
+            let equivalent = windows_path_is_same_or_descendant(source, &canonical_source)
+                && windows_path_is_same_or_descendant(&canonical_source, source);
+            if !equivalent {
+                // Rewriting a junction, SUBST, short-name, or volume-GUID
+                // source would also invalidate configured absolute exclude
+                // patterns. Reject the alias instead of creating a path
+                // namespace in which either user or mandatory exclusions
+                // can be bypassed.
+                return Err(InvocationError::UnsupportedBackupSourceNamespace);
+            }
+        }
+    }
+    if let Some(data_directory) = data_directory {
+        let mut protected_paths = vec![data_directory.to_path_buf()];
+        if let Ok(canonical_data_directory) = std::fs::canonicalize(data_directory) {
+            protected_paths.push(ordinary_windows_path(&canonical_data_directory));
+        }
+        if sources.iter().any(|source| {
+            protected_paths
+                .iter()
+                .any(|protected| windows_path_is_same_or_descendant(source, protected))
+        }) {
+            return Err(InvocationError::ProtectedBackupSource);
+        }
+    }
+    Ok(())
+}
+
+fn backup_invocation_error_code(error: &InvocationError) -> &'static str {
+    match error {
+        InvocationError::UnsupportedNetworkBackupSource => "network_backup_source_unsupported",
+        InvocationError::UnsupportedBackupSourceNamespace => "backup_source_namespace_unsupported",
+        InvocationError::ProtectedBackupSource => "protected_backup_source",
+        _ => "invalid_configuration",
+    }
+}
+
+fn source_uses_unsupported_local_namespace(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::DeviceNS(_))
+                || matches!(prefix.kind(), Prefix::Verbatim(_))
+    )
+}
+
+fn source_is_network_path(path: &Path) -> bool {
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    match prefix.kind() {
+        Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => true,
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+            let root = OsString::from(format!("{}:\\", char::from(drive)));
+            let wide = root
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            // SAFETY: wide is an immutable, terminated drive-root string for
+            // the duration of this call.
+            unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) == DRIVE_REMOTE }
+        }
+        Prefix::DeviceNS(_) | Prefix::Verbatim(_) => false,
+    }
+}
+
+fn ordinary_windows_path(path: &Path) -> PathBuf {
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return path.to_path_buf();
+    };
+    let mut ordinary = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut unc = PathBuf::from(r"\\");
+            unc.push(server);
+            unc.push(share);
+            unc
+        }
+        _ => return path.to_path_buf(),
+    };
+    for component in path.components().skip(1) {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => ordinary.push(".."),
+            Component::Normal(value) => ordinary.push(value),
+        }
+    }
+    ordinary
 }
 
 fn backup_outcome_for_lock_cleanup(cleanup: &RepositoryOutcome) -> Option<BackupOutcome> {
@@ -492,6 +662,7 @@ fn backup_outcome_for_lock_cleanup(cleanup: &RepositoryOutcome) -> Option<Backup
 fn command_for(
     invocation: &ResticInvocation,
     secrets: &[(SecretEnvironmentVariable, Zeroizing<String>)],
+    cache_directory: &Path,
 ) -> Command {
     let mut command = Command::new(&invocation.executable);
     command
@@ -512,6 +683,11 @@ fn command_for(
     for (variable, value) in secrets {
         command.env(variable.as_str(), value.as_str());
     }
+    // Pin restic's repository metadata cache to the protected machine-wide
+    // service directory. This assignment deliberately follows every other
+    // environment injection so no local or managed value can redirect
+    // LocalSystem writes elsewhere.
+    command.env("RESTIC_CACHE_DIR", cache_directory);
     command
 }
 
@@ -578,7 +754,13 @@ impl BackupOutcome {
             BackupOutcomeKind::Succeeded | BackupOutcomeKind::SucceededWithWarnings
         ) {
             self.kind = BackupOutcomeKind::SucceededWithWarnings;
-            self.warning_code = Some(code.into());
+            // Backup-source and consistency warnings are the only warning
+            // details stored with the run. Retention has its own durable state
+            // and diagnostic event, so a later retention warning must not hide
+            // a warning that explains incomplete or live-source backup data.
+            if self.warning_code.is_none() {
+                self.warning_code = Some(code.into());
+            }
         }
         self
     }
@@ -724,6 +906,7 @@ fn finish_outcome(
     output_result: Result<ParsedOutput, OutputReadError>,
     stderr_output_result: Result<ParsedOutput, OutputReadError>,
     stderr: &[u8],
+    known_vss_fallback: bool,
 ) -> BackupOutcome {
     if status.code() == Some(130) {
         return BackupOutcome::cancelled();
@@ -750,11 +933,41 @@ fn finish_outcome(
         };
     };
     let mut failure_details = parsed.failure_details;
+    let mut vss_fallback = parsed.vss_fallback || known_vss_fallback;
+    let mut vss_cleanup_failed = parsed.vss_cleanup_failed;
     if let Ok(stderr_output) = stderr_output_result {
         failure_details.merge(stderr_output.failure_details);
+        vss_fallback |= stderr_output.vss_fallback;
+        vss_cleanup_failed |= stderr_output.vss_cleanup_failed;
     }
     match status.code() {
+        Some(0) if vss_fallback && vss_cleanup_failed => BackupOutcome::warnings(
+            summary,
+            "restic_vss_fallback_and_cleanup_failed",
+            failure_details,
+        ),
+        Some(0) if vss_fallback => {
+            BackupOutcome::warnings(summary, "restic_vss_fallback", failure_details)
+        }
+        Some(0) if vss_cleanup_failed => {
+            BackupOutcome::warnings(summary, "restic_vss_cleanup_failed", failure_details)
+        }
         Some(0) => BackupOutcome::succeeded(summary),
+        Some(3) if vss_fallback && vss_cleanup_failed => BackupOutcome::warnings(
+            summary,
+            "restic_vss_fallback_partial_source_and_cleanup_failed",
+            failure_details,
+        ),
+        Some(3) if vss_fallback => BackupOutcome::warnings(
+            summary,
+            "restic_vss_fallback_and_partial_source",
+            failure_details,
+        ),
+        Some(3) if vss_cleanup_failed => BackupOutcome::warnings(
+            summary,
+            "restic_partial_source_and_vss_cleanup_failed",
+            failure_details,
+        ),
         Some(3) => BackupOutcome::warnings(summary, "restic_partial_source", failure_details),
         Some(code) => BackupOutcome::failed(
             classify_stderr(stderr)
@@ -777,16 +990,18 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> Vec<u8> {
 
 fn classify_stderr(stderr: &[u8]) -> Option<&'static str> {
     let message = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    if message.contains("access denied")
+    if message.contains("vss error:")
+        || message.contains("failed to create snapshot for [")
+        || message.contains("failed to delete vss snapshot")
+        || message.contains("volume shadow copy service")
+        || message.contains("shadow copy provider")
+    {
+        Some("restic_vss_unavailable")
+    } else if message.contains("access denied")
         || message.contains("permission denied")
         || message.contains("insufficient privilege")
     {
         Some("restic_permission_denied")
-    } else if message.contains("shadow copy")
-        || message.contains("volume shadow")
-        || message.contains("vss")
-    {
-        Some("restic_vss_unavailable")
     } else if message.contains("already locked")
         || message.contains("repository is locked")
         || message.contains("unable to create lock")
@@ -822,6 +1037,8 @@ enum OutputEvent {
     Summary(BackupSummary),
     FailureItem(String),
     FailureItemOmitted,
+    VssFallback,
+    VssCleanupFailed,
 }
 
 #[derive(Debug, Default)]
@@ -829,6 +1046,8 @@ struct ParsedOutput {
     summary: Option<BackupSummary>,
     invalid_message: bool,
     failure_details: BackupFailureDetails,
+    vss_fallback: bool,
+    vss_cleanup_failed: bool,
 }
 
 fn collect_progress_events(
@@ -863,6 +1082,8 @@ fn read_json_output(
             Ok(Some(OutputEvent::FailureItemOmitted)) => {
                 parsed.failure_details.omitted = parsed.failure_details.omitted.saturating_add(1);
             }
+            Ok(Some(OutputEvent::VssFallback)) => parsed.vss_fallback = true,
+            Ok(Some(OutputEvent::VssCleanupFailed)) => parsed.vss_cleanup_failed = true,
             Ok(None) => {}
             Err(()) => parsed.invalid_message = true,
         }
@@ -961,6 +1182,14 @@ struct WireMessage {
     snapshot_id: Option<String>,
     #[serde(default)]
     item: Option<String>,
+    #[serde(default)]
+    error: Option<WireError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireError {
+    #[serde(default)]
+    message: String,
 }
 
 fn parse_output_event(line: &[u8]) -> Result<Option<OutputEvent>, ()> {
@@ -986,12 +1215,37 @@ fn parse_output_event(line: &[u8]) -> Result<Option<OutputEvent>, ()> {
             data_added: message.data_added,
             snapshot_id: message.snapshot_id,
         }))),
-        "error" => Ok(Some(match message.item {
-            Some(item) => OutputEvent::FailureItem(item),
-            None => OutputEvent::FailureItemOmitted,
-        })),
+        "error" => {
+            let error_message = message
+                .error
+                .as_ref()
+                .map_or("", |error| error.message.as_str());
+            if is_vss_fallback_error(error_message) {
+                Ok(Some(OutputEvent::VssFallback))
+            } else if is_vss_cleanup_error(error_message) {
+                Ok(Some(OutputEvent::VssCleanupFailed))
+            } else {
+                Ok(Some(match message.item {
+                    Some(item) => OutputEvent::FailureItem(item),
+                    None => OutputEvent::FailureItemOmitted,
+                }))
+            }
+        }
         _ => Ok(None),
     }
+}
+
+fn is_vss_fallback_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("failed to create snapshot for [")
+        || (message.starts_with("vss error: getsnapshotproperties()")
+            && message.contains("mount point"))
+}
+
+fn is_vss_cleanup_error(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("failed to delete vss snapshot")
 }
 
 fn parse_plain_missing_item(line: &[u8]) -> Option<String> {
@@ -1121,6 +1375,7 @@ mod tests {
     fn executor(secrets: BTreeMap<String, String>) -> ResticExecutor {
         ResticExecutor::new(
             "unused.exe",
+            PathBuf::from(r"C:\ProgramData\ResticPal-Test"),
             Arc::new(MapSecretResolver(secrets)),
             Arc::new(NoopWakeLockProvider),
         )
@@ -1135,9 +1390,14 @@ mod tests {
         path
     }
 
-    fn real_restic_executor(executable: &Path, password: &str) -> ResticExecutor {
+    fn real_restic_executor(
+        executable: &Path,
+        data_directory: &Path,
+        password: &str,
+    ) -> ResticExecutor {
         ResticExecutor::new(
             executable.as_os_str().to_os_string(),
+            data_directory.to_path_buf(),
             Arc::new(MapSecretResolver(BTreeMap::from([(
                 "integration-password".to_owned(),
                 password.to_owned(),
@@ -1187,6 +1447,116 @@ mod tests {
                     .count()
             })
             .unwrap_or_default()
+    }
+
+    fn repository_cache_directories(cache: &Path) -> Vec<OsString> {
+        let mut directories = fs::read_dir(cache)
+            .expect("read explicit restic cache")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        directories.sort();
+        directories
+    }
+
+    fn age_cache_directory_for_cleanup(directory: &Path) {
+        let powershell = PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows integration test requires SystemRoot"),
+        )
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+        let status = Command::new(powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-Item -LiteralPath $env:RESTICPAL_TEST_CACHE_DIRECTORY).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-31)",
+            ])
+            .env("RESTICPAL_TEST_CACHE_DIRECTORY", directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .status()
+            .expect("age stale cache directory");
+        assert!(status.success(), "aging stale cache directory failed");
+    }
+
+    fn restic_snapshot_listing(
+        restic: &Path,
+        repository: &Path,
+        cache: &Path,
+        password: &str,
+        snapshot_id: &str,
+    ) -> Vec<u8> {
+        let mut command = Command::new(restic);
+        command
+            .args(["ls", "--json", snapshot_id])
+            .env_clear()
+            .env("RESTIC_REPOSITORY", repository)
+            .env("RESTIC_PASSWORD", password)
+            .env("RESTIC_CACHE_DIR", cache)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW.0);
+        for name in INHERITED_ENVIRONMENT {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let output = command.output().expect("list real restic snapshot");
+        assert!(
+            output.status.success(),
+            "restic snapshot listing failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn volume_guid_alias(path: &Path) -> PathBuf {
+        let drive = match path.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+                _ => panic!("volume GUID fixture requires a drive-letter path"),
+            },
+            _ => panic!("volume GUID fixture requires an absolute Windows path"),
+        };
+        let drive_root = PathBuf::from(format!("{}:\\", char::from(drive)));
+        let relative = path
+            .strip_prefix(&drive_root)
+            .expect("source path is below its drive root");
+        let mountvol = PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows integration test requires SystemRoot"),
+        )
+        .join("System32")
+        .join("mountvol.exe");
+        let output = Command::new(mountvol)
+            .arg(&drive_root)
+            .arg("/L")
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .output()
+            .expect("query source volume GUID");
+        assert!(
+            output.status.success(),
+            "mountvol volume GUID query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let volume_root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        assert!(
+            volume_root.starts_with(r"\\?\Volume{") && volume_root.ends_with('\\'),
+            "mountvol returned an unexpected volume root"
+        );
+        let mut alias = PathBuf::from(volume_root);
+        alias.push(relative);
+        alias
     }
 
     #[test]
@@ -1338,6 +1708,74 @@ mod tests {
     }
 
     #[test]
+    fn parses_vss_control_errors_without_recording_volumes_as_failed_files() {
+        let create_failure = br#"{"message_type":"error","error":{"message":"failed to create snapshot for [c:\\]: VSS error: unexpected provider error"},"during":"archival","item":"c:\\"}"#;
+        let mount_failure = br#"{"message_type":"error","error":{"message":"VSS error: GetSnapshotProperties() for mount point d:\\ failed"},"during":"archival","item":"d:\\"}"#;
+        let cleanup_failure = br#"{"message_type":"error","error":{"message":"failed to delete VSS snapshot: cleanup error"},"during":"archival","item":"c:\\"}"#;
+        let ordinary_failure = br#"{"message_type":"error","error":{"message":"failed to create snapshot metadata"},"during":"archival","item":"C:\\Data\\file.txt"}"#;
+
+        assert!(matches!(
+            parse_output_event(create_failure),
+            Ok(Some(OutputEvent::VssFallback))
+        ));
+        assert!(matches!(
+            parse_output_event(mount_failure),
+            Ok(Some(OutputEvent::VssFallback))
+        ));
+        assert!(matches!(
+            parse_output_event(cleanup_failure),
+            Ok(Some(OutputEvent::VssCleanupFailed))
+        ));
+        assert!(matches!(
+            parse_output_event(ordinary_failure),
+            Ok(Some(OutputEvent::FailureItem(item))) if item == r"C:\Data\file.txt"
+        ));
+    }
+
+    #[test]
+    fn network_sources_are_rejected_before_restic_runs() {
+        for source in [
+            PathBuf::from(r"\\server\share\Data"),
+            PathBuf::from(r"\\?\UNC\server\share\Data"),
+        ] {
+            let mut config = EffectiveConfig::default();
+            config.repository.url = Some("local:C:/backup".to_owned());
+            config.backup.paths = vec![source];
+
+            assert_eq!(
+                build_backup_invocations(
+                    OsStr::new("restic.exe"),
+                    Path::new(r"C:\ProgramData\ResticPal"),
+                    &config,
+                ),
+                Err(InvocationError::UnsupportedNetworkBackupSource)
+            );
+        }
+    }
+
+    #[test]
+    fn local_source_resolution_preserves_ordinary_restic_path_namespaces() {
+        assert_eq!(
+            ordinary_windows_path(Path::new(r"\\?\C:\ProgramData\ResticPal")),
+            PathBuf::from(r"C:\ProgramData\ResticPal")
+        );
+        assert_eq!(
+            ordinary_windows_path(Path::new(r"\\?\UNC\server\share\Data")),
+            PathBuf::from(r"\\server\share\Data")
+        );
+        assert!(source_is_network_path(Path::new(r"\\server\share\Data")));
+        assert!(source_uses_unsupported_local_namespace(Path::new(
+            r"\\.\PhysicalDrive0"
+        )));
+        assert!(source_uses_unsupported_local_namespace(Path::new(
+            r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1"
+        )));
+        assert!(source_uses_unsupported_local_namespace(Path::new(
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Data"
+        )));
+    }
+
+    #[test]
     fn stderr_is_reduced_to_allowlisted_diagnostic_codes() {
         assert_eq!(
             classify_stderr(br"open C:\Users\Yann\private.txt: Access denied"),
@@ -1350,6 +1788,15 @@ mod tests {
         assert_eq!(
             classify_stderr(b"dial tcp: connection refused"),
             Some("restic_repository_unreachable")
+        );
+        assert_eq!(
+            classify_stderr(b"VSS error: insufficient privilege to create a shadow copy"),
+            Some("restic_vss_unavailable")
+        );
+        assert_eq!(
+            classify_stderr(br"C:\VssData does not exist, skipping"),
+            None,
+            "a path containing VSS must not be mistaken for a shadow-copy failure"
         );
         assert_eq!(classify_stderr(b"arbitrary secret output"), None);
     }
@@ -1404,6 +1851,7 @@ mod tests {
             Ok(parsed),
             Ok(ParsedOutput::default()),
             b"",
+            false,
         );
         assert_eq!(outcome.kind, BackupOutcomeKind::Succeeded);
         assert_eq!(
@@ -1415,11 +1863,15 @@ mod tests {
     #[test]
     fn fake_process_reports_progress_and_success_without_leaking_secret_arguments() {
         let mut invocation = powershell_invocation(
-            r#"if ($env:RESTIC_PASSWORD -ne 'test-secret') { exit 12 }; [Console]::Out.WriteLine('{"message_type":"status","percent_done":0.5,"total_files":2,"files_done":1,"total_bytes":20,"bytes_done":10}'); [Console]::Out.WriteLine('{"message_type":"summary","total_files_processed":2,"total_bytes_processed":20,"data_added":7,"snapshot_id":"snapshot-1"}')"#,
+            r#"if ($env:RESTIC_PASSWORD -ne 'test-secret') { exit 12 }; if ($env:RESTIC_CACHE_DIR -ne 'C:\ProgramData\ResticPal-Test\Cache') { exit 13 }; [Console]::Out.WriteLine('{"message_type":"status","percent_done":0.5,"total_files":2,"files_done":1,"total_bytes":20,"bytes_done":10}'); [Console]::Out.WriteLine('{"message_type":"summary","total_files_processed":2,"total_bytes_processed":20,"data_added":7,"snapshot_id":"snapshot-1"}')"#,
         );
         invocation.secret_environment.insert(
             SecretEnvironmentVariable::ResticPassword,
             "password-ref".to_owned(),
+        );
+        invocation.environment.insert(
+            OsString::from("RESTIC_CACHE_DIR"),
+            OsString::from(r"C:\Untrusted\Cache"),
         );
         let runner = executor(BTreeMap::from([(
             "password-ref".to_owned(),
@@ -1431,6 +1883,7 @@ mod tests {
             &invocation,
             Duration::from_secs(10),
             &CancellationToken::default(),
+            false,
             |update| progress.push(update),
         );
 
@@ -1463,8 +1916,13 @@ mod tests {
         });
         let started = Instant::now();
 
-        let outcome =
-            runner.execute_invocation(&invocation, Duration::from_secs(10), &cancellation, |_| {});
+        let outcome = runner.execute_invocation(
+            &invocation,
+            Duration::from_secs(10),
+            &cancellation,
+            false,
+            |_| {},
+        );
         canceller.join().expect("canceller should finish");
 
         assert_eq!(outcome.kind, BackupOutcomeKind::Cancelled);
@@ -1528,7 +1986,8 @@ mod tests {
     #[test]
     fn process_termination_falls_back_to_the_child_when_the_job_handle_is_invalid() {
         let invocation = powershell_invocation("Start-Sleep -Seconds 30");
-        let mut command = command_for(&invocation, &[]);
+        let cache_directory = PathBuf::from(r"C:\ProgramData\ResticPal-Test\Cache");
+        let mut command = command_for(&invocation, &[], &cache_directory);
         let mut child = command.spawn().expect("start fallback process");
         let started = Instant::now();
 
@@ -1622,6 +2081,7 @@ mod tests {
             &invocation,
             Duration::from_secs(10),
             &CancellationToken::default(),
+            false,
             |_| {},
         );
 
@@ -1642,6 +2102,169 @@ mod tests {
         assert!(
             !format!("{:?}", outcome.failure_details).contains(r"C:\Users\Example\locked.txt"),
             "debug output must redact sensitive source paths"
+        );
+    }
+
+    #[test]
+    fn successful_restic_exit_reports_vss_live_fallback_as_a_warning() {
+        let invocation = powershell_invocation(
+            r#"[Console]::Error.WriteLine('{"message_type":"error","error":{"message":"failed to create snapshot for [c:\\]: VSS error: unexpected provider error"},"during":"archival","item":"c:\\"}'); [Console]::Out.WriteLine('{"message_type":"summary","total_files_processed":2,"total_bytes_processed":20,"data_added":7,"snapshot_id":"live-fallback"}')"#,
+        );
+        let runner = executor(BTreeMap::new());
+
+        let outcome = runner.execute_invocation(
+            &invocation,
+            Duration::from_secs(10),
+            &CancellationToken::default(),
+            false,
+            |_| {},
+        );
+
+        assert_eq!(outcome.kind, BackupOutcomeKind::SucceededWithWarnings);
+        assert_eq!(outcome.warning_code.as_deref(), Some("restic_vss_fallback"));
+        assert_eq!(
+            outcome.summary.expect("summary").snapshot_id.as_deref(),
+            Some("live-fallback")
+        );
+        assert!(outcome.failure_details.items().is_empty());
+        assert_eq!(outcome.failure_details.omitted(), 0);
+    }
+
+    #[test]
+    fn vss_fallback_remains_primary_while_partial_file_details_are_retained() {
+        let invocation = powershell_invocation(
+            r#"[Console]::Error.WriteLine('{"message_type":"error","error":{"message":"failed to create snapshot for [c:\\]: VSS error: unexpected provider error"},"during":"archival","item":"c:\\"}'); [Console]::Error.WriteLine('{"message_type":"error","error":{"message":"Access denied"},"during":"archival","item":"C:\\Users\\Example\\locked.txt"}'); [Console]::Out.WriteLine('{"message_type":"summary","total_files_processed":2,"total_bytes_processed":20,"data_added":7,"snapshot_id":"partial-live"}'); exit 3"#,
+        );
+        let runner = executor(BTreeMap::new());
+
+        let outcome = runner.execute_invocation(
+            &invocation,
+            Duration::from_secs(10),
+            &CancellationToken::default(),
+            false,
+            |_| {},
+        );
+
+        assert_eq!(outcome.kind, BackupOutcomeKind::SucceededWithWarnings);
+        assert_eq!(
+            outcome.warning_code.as_deref(),
+            Some("restic_vss_fallback_and_partial_source")
+        );
+        assert_eq!(
+            outcome.failure_details.items(),
+            [r"C:\Users\Example\locked.txt"]
+        );
+    }
+
+    #[test]
+    fn known_unc_source_and_vss_cleanup_failure_are_never_plain_successes() {
+        use std::os::windows::process::ExitStatusExt;
+
+        let summary = BackupSummary {
+            files_processed: 1,
+            bytes_processed: 2,
+            data_added: 3,
+            snapshot_id: Some("snapshot".to_owned()),
+        };
+        let unc_outcome = finish_outcome(
+            ExitStatus::from_raw(0),
+            Ok(ParsedOutput {
+                summary: Some(summary.clone()),
+                ..ParsedOutput::default()
+            }),
+            Ok(ParsedOutput::default()),
+            b"",
+            true,
+        );
+        assert_eq!(unc_outcome.kind, BackupOutcomeKind::SucceededWithWarnings);
+        assert_eq!(
+            unc_outcome.warning_code.as_deref(),
+            Some("restic_vss_fallback")
+        );
+
+        let cleanup_outcome = finish_outcome(
+            ExitStatus::from_raw(0),
+            Ok(ParsedOutput {
+                summary: Some(summary),
+                vss_cleanup_failed: true,
+                ..ParsedOutput::default()
+            }),
+            Ok(ParsedOutput::default()),
+            b"",
+            false,
+        );
+        assert_eq!(
+            cleanup_outcome.kind,
+            BackupOutcomeKind::SucceededWithWarnings
+        );
+        assert_eq!(
+            cleanup_outcome.warning_code.as_deref(),
+            Some("restic_vss_cleanup_failed")
+        );
+
+        let combined_outcome = finish_outcome(
+            ExitStatus::from_raw(0),
+            Ok(ParsedOutput {
+                summary: Some(BackupSummary {
+                    files_processed: 1,
+                    bytes_processed: 2,
+                    data_added: 3,
+                    snapshot_id: Some("combined".to_owned()),
+                }),
+                vss_fallback: true,
+                vss_cleanup_failed: true,
+                ..ParsedOutput::default()
+            }),
+            Ok(ParsedOutput::default()),
+            b"",
+            false,
+        );
+        assert_eq!(
+            combined_outcome.warning_code.as_deref(),
+            Some("restic_vss_fallback_and_cleanup_failed")
+        );
+
+        let partial_cleanup_outcome = finish_outcome(
+            ExitStatus::from_raw(3),
+            Ok(ParsedOutput {
+                summary: Some(BackupSummary {
+                    files_processed: 1,
+                    bytes_processed: 2,
+                    data_added: 3,
+                    snapshot_id: Some("partial-cleanup".to_owned()),
+                }),
+                vss_cleanup_failed: true,
+                ..ParsedOutput::default()
+            }),
+            Ok(ParsedOutput::default()),
+            b"",
+            false,
+        );
+        assert_eq!(
+            partial_cleanup_outcome.warning_code.as_deref(),
+            Some("restic_partial_source_and_vss_cleanup_failed")
+        );
+
+        let fallback_partial_cleanup_outcome = finish_outcome(
+            ExitStatus::from_raw(3),
+            Ok(ParsedOutput {
+                summary: Some(BackupSummary {
+                    files_processed: 1,
+                    bytes_processed: 2,
+                    data_added: 3,
+                    snapshot_id: Some("fallback-partial-cleanup".to_owned()),
+                }),
+                vss_fallback: true,
+                vss_cleanup_failed: true,
+                ..ParsedOutput::default()
+            }),
+            Ok(ParsedOutput::default()),
+            b"",
+            false,
+        );
+        assert_eq!(
+            fallback_partial_cleanup_outcome.warning_code.as_deref(),
+            Some("restic_vss_fallback_partial_source_and_cleanup_failed")
         );
     }
 
@@ -1710,6 +2333,7 @@ C:\Missing Source does not exist, skipping
             &invocation,
             Duration::from_secs(10),
             &CancellationToken::default(),
+            false,
             |_| {},
         );
 
@@ -1763,8 +2387,10 @@ C:\Missing Source does not exist, skipping
         config.backup.paths = vec![PathBuf::from(r"C:\data")];
 
         let executable = OsString::from("restic.exe");
-        let (unlock, backup) = build_backup_invocations(executable.as_os_str(), &config)
-            .expect("append-only backup plan");
+        let data_directory = PathBuf::from(r"C:\ProgramData\ResticPal");
+        let (unlock, backup) =
+            build_backup_invocations(executable.as_os_str(), &data_directory, &config)
+                .expect("append-only backup plan");
 
         assert_eq!(unlock.operation, ResticOperation::Unlock);
         assert_eq!(unlock.arguments, [OsString::from("unlock")]);
@@ -1775,6 +2401,17 @@ C:\Missing Source does not exist, skipping
                 .any(|argument| argument == OsStr::new("--remove-all"))
         );
         assert_eq!(backup.operation, ResticOperation::Backup);
+        let required_exclusion = [
+            OsString::from("--iexclude"),
+            data_directory.into_os_string(),
+        ];
+        assert!(
+            backup
+                .arguments
+                .windows(required_exclusion.len())
+                .any(|arguments| arguments == required_exclusion),
+            "every service backup must exclude resticpal's internal data directory"
+        );
         assert!(
             backup
                 .arguments
@@ -1803,7 +2440,8 @@ C:\Missing Source does not exist, skipping
         }
 
         let (unlock, mut invocation) =
-            build_backup_invocations(restic.as_os_str(), config).expect("real backup invocations");
+            build_backup_invocations(restic.as_os_str(), runner.data_directory.as_ref(), config)
+                .expect("real backup invocations");
         assert_eq!(
             runner
                 .execute_repository_invocation(&unlock, STALE_LOCK_CLEANUP_TIMEOUT, cancellation,)
@@ -1827,6 +2465,7 @@ C:\Missing Source does not exist, skipping
             &invocation,
             Duration::from_secs(config.schedule.wake_lock_timeout_seconds),
             cancellation,
+            false,
             |_| {},
         )
     }
@@ -1836,12 +2475,45 @@ C:\Missing Source does not exist, skipping
         let temporary = tempfile::tempdir().expect("temporary directory");
         let repository = temporary.path().join("repository");
         let source = temporary.path().join("source");
+        let data_directory = source.join("ProgramData").join("ResticPal");
+        let cache_directory = data_directory.join("Cache");
         fs::create_dir(&source).expect("source directory");
+        fs::create_dir_all(&cache_directory).expect("protected cache fixture");
+        let stale_cache_directory = cache_directory.join("0".repeat(64));
+        fs::create_dir(&stale_cache_directory).expect("stale cache namespace fixture");
+        age_cache_directory_for_cleanup(&stale_cache_directory);
         fs::write(source.join("document.txt"), b"first version\n").expect("initial source file");
+        let internal_sentinel = "resticpal-internal-sentinel-must-never-be-backed-up.txt";
+        fs::write(data_directory.join(internal_sentinel), b"internal state\n")
+            .expect("internal data exclusion fixture");
 
-        let mut config = local_repository_config(&repository, &source);
-        let runner = real_restic_executor(&restic, "correct horse battery staple");
+        let aliased_source = volume_guid_alias(&source);
+        let mut config = local_repository_config(&repository, &aliased_source);
+        let runner = real_restic_executor(&restic, &data_directory, "correct horse battery staple");
         let cancellation = CancellationToken::default();
+
+        assert_eq!(
+            runner.backup(&config, &cancellation, |_| {}).kind,
+            BackupOutcomeKind::Failed {
+                code: "backup_source_namespace_unsupported".to_owned()
+            },
+            "a volume-GUID source alias must fail closed instead of changing the exclusion namespace"
+        );
+        config.backup.paths = vec![PathBuf::from(source.to_string_lossy().to_ascii_uppercase())];
+
+        let configured_sources = config.backup.paths.clone();
+        config.backup.paths = vec![
+            fs::canonicalize(data_directory.join(internal_sentinel))
+                .expect("canonical protected-file source fixture"),
+        ];
+        assert_eq!(
+            runner.backup(&config, &cancellation, |_| {}).kind,
+            BackupOutcomeKind::Failed {
+                code: "protected_backup_source".to_owned()
+            },
+            "an explicitly named internal file must be rejected before restic can bypass excludes"
+        );
+        config.backup.paths = configured_sources;
 
         assert_eq!(
             runner
@@ -1864,7 +2536,7 @@ C:\Missing Source does not exist, skipping
             RepositoryOutcomeKind::Succeeded
         );
 
-        let wrong_password = real_restic_executor(&restic, "definitely wrong");
+        let wrong_password = real_restic_executor(&restic, &data_directory, "definitely wrong");
         assert_eq!(
             wrong_password
                 .repository_operation(&config, ResticOperation::Probe, &cancellation)
@@ -1888,6 +2560,35 @@ C:\Missing Source does not exist, skipping
         assert!(first_summary.bytes_processed >= 14);
         assert!(first_summary.data_added > 0);
         assert!(first_summary.snapshot_id.is_some());
+        let first_snapshot_id = first_summary
+            .snapshot_id
+            .as_deref()
+            .expect("first snapshot id");
+        let listing = restic_snapshot_listing(
+            &restic,
+            &repository,
+            &cache_directory,
+            "correct horse battery staple",
+            first_snapshot_id,
+        );
+        assert!(
+            !String::from_utf8_lossy(&listing).contains(internal_sentinel),
+            "the service-owned data directory must be excluded even when it is under a source"
+        );
+        assert!(
+            cache_directory.join("CACHEDIR.TAG").is_file(),
+            "restic must mark its explicit cache directory"
+        );
+        assert!(
+            !stale_cache_directory.exists(),
+            "backup-time cache cleanup must remove an obsolete repository namespace"
+        );
+        let first_cache_directories = repository_cache_directories(&cache_directory);
+        assert_eq!(
+            first_cache_directories.len(),
+            1,
+            "one repository must produce exactly one reusable cache namespace"
+        );
 
         let missing_source = temporary.path().join("missing-source");
         config.backup.paths.push(missing_source.clone());
@@ -1933,6 +2634,11 @@ C:\Missing Source does not exist, skipping
         assert!(second_summary.data_added > 0);
         assert!(second_summary.snapshot_id.is_some());
         assert_ne!(first_summary.snapshot_id, second_summary.snapshot_id);
+        assert_eq!(
+            repository_cache_directories(&cache_directory),
+            first_cache_directories,
+            "successive backups must reuse the repository's persistent cache namespace"
+        );
 
         config.repository.mode = RepositoryMode::Standard;
         assert_eq!(

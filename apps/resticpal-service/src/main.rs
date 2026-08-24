@@ -238,6 +238,7 @@ fn run_service(arguments: &[OsString]) -> ServiceResult<()> {
     );
     let executor = ResticExecutor::new(
         restic_path(),
+        data_root,
         secret_resolver(credential_store),
         Arc::new(SystemWakeLockProvider),
     );

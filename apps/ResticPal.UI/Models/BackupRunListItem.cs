@@ -39,26 +39,16 @@ public sealed class BackupRunListItem
             ? "No aggregate file statistics were reported."
             : string.Join(" · ", summary);
 
-        if (run.FailedItemCount > 0)
-        {
-            Detail = BackupWarningPresentation.CountSummary(run.FailedItemCount);
-        }
-        else if (!string.IsNullOrWhiteSpace(run.ErrorCode))
-        {
-            Detail = $"Sanitized error code: {run.ErrorCode}";
-        }
-        else if (!string.IsNullOrWhiteSpace(run.SnapshotId))
-        {
-            Detail = $"Snapshot {run.SnapshotId}";
-        }
-        else
-        {
-            Detail = "No additional details.";
-        }
+        Detail = BackupWarningPresentation.RunDetail(
+            run.Outcome,
+            run.ErrorCode,
+            run.FailedItemCount,
+            run.SnapshotId);
 
-        bool isPartialSourceWarning = run.Outcome == "succeeded_with_warnings"
-            && run.ErrorCode == "restic_partial_source";
-        FailureDetailsVisibility = run.FailedItemCount > 0 || isPartialSourceWarning
+        FailureDetailsVisibility = BackupWarningPresentation.HasSourceDetails(
+            run.Outcome,
+            run.ErrorCode,
+            run.FailedItemCount)
             ? Visibility.Visible
             : Visibility.Collapsed;
         FailureDetailsButtonText = BackupWarningPresentation.ViewButtonLabel(run.FailedItemCount);

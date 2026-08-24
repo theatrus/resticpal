@@ -112,10 +112,12 @@ $resolvedUpgradeFromMsiPath = if ([string]::IsNullOrWhiteSpace($UpgradeFromMsiPa
 }
 $installRoot = Join-Path $env:ProgramFiles 'resticpal'
 $dataRoot = Join-Path $env:ProgramData 'ResticPal'
+$cacheRoot = Join-Path $dataRoot 'Cache'
 $startMenuShortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\resticpal.lnk'
 $onboardingMarker = Join-Path $env:LOCALAPPDATA 'resticpal\onboarding-shown-v1'
 $interactiveSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
-$e2eRoot = Join-Path $dataRoot 'E2E'
+$e2eRoot = Join-Path $env:SystemDrive (
+    'ResticPal-Installed-E2E-' + [Guid]::NewGuid().ToString('N'))
 $sourceRoot = Join-Path $e2eRoot 'Source'
 $backupRoot = Join-Path $e2eRoot 'Repository'
 if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
@@ -133,6 +135,7 @@ $installedPackagePath = $null
 $onboardingMarkerCreatedByTest = $false
 $testReachedPersistenceCheck = $false
 $candidateFileVersion = $null
+$cacheStateAfterFirstBackup = $null
 
 function Invoke-Installer([string] $Arguments, [string] $Action) {
     $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" `
@@ -329,6 +332,40 @@ function Wait-AutomationTextContains(
     throw "Timed out waiting for '$ExpectedText' in UI element $AutomationId. Observed: $lastText"
 }
 
+function Assert-AutomationTextDoesNotContain(
+    [Diagnostics.Process] $Process,
+    [string] $AutomationId,
+    [string] $ForbiddenText
+) {
+    $processCondition = [Windows.Automation.PropertyCondition]::new(
+        [Windows.Automation.AutomationElement]::ProcessIdProperty,
+        $Process.Id
+    )
+    $idCondition = [Windows.Automation.PropertyCondition]::new(
+        [Windows.Automation.AutomationElement]::AutomationIdProperty,
+        $AutomationId
+    )
+    $condition = [Windows.Automation.AndCondition]::new($processCondition, $idCondition)
+    $element = [Windows.Automation.AutomationElement]::RootElement.FindFirst(
+        [Windows.Automation.TreeScope]::Descendants,
+        $condition
+    )
+    if ($null -eq $element) {
+        return
+    }
+    $text = @(
+        $element.Current.Name
+        $element.FindAll(
+            [Windows.Automation.TreeScope]::Descendants,
+            [Windows.Automation.Condition]::TrueCondition
+        ) |
+            ForEach-Object { $_.Current.Name }
+    ) -join ' '
+    if ($text.IndexOf($ForbiddenText, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        throw "UI element $AutomationId unexpectedly retained '$ForbiddenText': $text"
+    }
+}
+
 function Wait-NativeWindowForProcess(
     [Diagnostics.Process] $Process,
     [string] $ClassName,
@@ -484,6 +521,242 @@ function Write-RandomTestFile([string] $Path, [int] $SizeInMiB) {
     }
 }
 
+function Assert-MachineOnlyAcl(
+    [string] $Path,
+    [switch] $RequireProtected,
+    [switch] $RequireInheritedRules,
+    [switch] $RequireDirectoryInheritance
+) {
+    $acl = Get-Acl -LiteralPath $Path
+    if ($RequireProtected -and -not $acl.AreAccessRulesProtected) {
+        throw "$Path does not have a protected DACL."
+    }
+    if ($RequireInheritedRules -and $acl.AreAccessRulesProtected) {
+        throw "$Path unexpectedly blocks the cache root's inherited DACL."
+    }
+
+    $systemSid = 'S-1-5-18'
+    $administratorsSid = 'S-1-5-32-544'
+    $allowedSids = @($systemSid, $administratorsSid)
+    $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($allowedSids -notcontains $ownerSid) {
+        throw "$Path has untrusted owner SID $ownerSid."
+    }
+
+    $rules = @($acl.GetAccessRules(
+        $true,
+        $true,
+        [Security.Principal.SecurityIdentifier]
+    ))
+    if ($rules.Count -ne 2) {
+        throw "$Path has $($rules.Count) access rules instead of the two trusted machine rules."
+    }
+
+    $observedSids = @()
+    foreach ($rule in $rules) {
+        $sid = $rule.IdentityReference.Value
+        if ($allowedSids -notcontains $sid) {
+            throw "$Path grants access to untrusted SID $sid."
+        }
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            throw "$Path contains a deny rule for trusted SID $sid instead of the expected allow rule."
+        }
+        if (($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) `
+            -ne [Security.AccessControl.FileSystemRights]::FullControl) {
+            throw "$Path does not grant full control to trusted SID $sid."
+        }
+        if ($RequireInheritedRules -and -not $rule.IsInherited) {
+            throw "$Path has a non-inherited access rule for trusted SID $sid."
+        }
+        if ($RequireProtected -and $rule.IsInherited) {
+            throw "$Path has an inherited access rule despite its protected DACL."
+        }
+        if ($RequireDirectoryInheritance) {
+            $expectedInheritance = `
+                [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor `
+                [Security.AccessControl.InheritanceFlags]::ObjectInherit
+            if (($rule.InheritanceFlags -band $expectedInheritance) -ne $expectedInheritance) {
+                throw "$Path does not propagate its trusted rule for SID $sid to files and directories."
+            }
+        }
+        $observedSids += $sid
+    }
+    foreach ($sid in $allowedSids) {
+        if ($observedSids -notcontains $sid) {
+            throw "$Path is missing the required access rule for SID $sid."
+        }
+    }
+}
+
+function Get-ResticCacheState {
+    if (-not (Test-Path -LiteralPath $cacheRoot -PathType Container)) {
+        throw "The installed service did not create its restic cache at $cacheRoot."
+    }
+    $cacheEntries = @(Get-ChildItem -LiteralPath $cacheRoot -Force)
+    if ($cacheEntries.Count -eq 0) {
+        throw 'The installed service created an empty restic cache.'
+    }
+
+    $cacheTag = Join-Path $cacheRoot 'CACHEDIR.TAG'
+    if (-not (Test-Path -LiteralPath $cacheTag -PathType Leaf)) {
+        throw 'The restic cache is missing CACHEDIR.TAG.'
+    }
+    $cacheTagInfo = Get-Item -LiteralPath $cacheTag
+    if ($cacheTagInfo.Length -eq 0) {
+        throw 'The restic cache has an empty CACHEDIR.TAG.'
+    }
+
+    $repositoryDirectories = @(
+        Get-ChildItem -LiteralPath $cacheRoot -Directory -Force |
+            Where-Object Name -Match '^[0-9a-f]{64}$'
+    )
+    if ($repositoryDirectories.Count -ne 1) {
+        throw "Expected one repository cache directory, found $($repositoryDirectories.Count)."
+    }
+    $repositoryDirectory = $repositoryDirectories[0]
+    $repositoryVersion = Join-Path $repositoryDirectory.FullName 'version'
+    if (-not (Test-Path -LiteralPath $repositoryVersion -PathType Leaf)) {
+        throw 'The repository cache is missing its version file.'
+    }
+    $repositoryFiles = @(
+        Get-ChildItem -LiteralPath $repositoryDirectory.FullName -File -Recurse -Force
+    )
+    if ($repositoryFiles.Count -eq 0) {
+        throw 'The repository cache directory contains no cached metadata.'
+    }
+
+    Assert-MachineOnlyAcl `
+        $cacheRoot `
+        -RequireProtected `
+        -RequireDirectoryInheritance
+    Assert-MachineOnlyAcl $cacheTag -RequireInheritedRules
+    Assert-MachineOnlyAcl $repositoryDirectory.FullName -RequireInheritedRules
+    Assert-MachineOnlyAcl $repositoryVersion -RequireInheritedRules
+
+    $cacheRootInfo = Get-Item -LiteralPath $cacheRoot
+    $repositoryVersionInfo = Get-Item -LiteralPath $repositoryVersion
+    return [pscustomobject]@{
+        root_creation_ticks = $cacheRootInfo.CreationTimeUtc.Ticks
+        tag_sha256 = (Get-FileHash -LiteralPath $cacheTag -Algorithm SHA256).Hash
+        tag_length = $cacheTagInfo.Length
+        repository_name = $repositoryDirectory.Name
+        repository_creation_ticks = $repositoryDirectory.CreationTimeUtc.Ticks
+        repository_version_sha256 = (
+            Get-FileHash -LiteralPath $repositoryVersion -Algorithm SHA256
+        ).Hash
+        repository_version_length = $repositoryVersionInfo.Length
+        cached_file_count = $repositoryFiles.Count
+    }
+}
+
+function Assert-ResticCacheReused(
+    [pscustomobject] $Expected,
+    [string] $LifecycleStage
+) {
+    $actual = Get-ResticCacheState
+    foreach ($property in @(
+        'root_creation_ticks',
+        'tag_sha256',
+        'tag_length',
+        'repository_name',
+        'repository_creation_ticks',
+        'repository_version_sha256',
+        'repository_version_length'
+    )) {
+        if ($actual.$property -cne $Expected.$property) {
+            throw "The restic cache changed $property instead of being reused $LifecycleStage."
+        }
+    }
+    Write-Host (
+        "The LocalSystem restic cache repository $($actual.repository_name) was reused " +
+        "$LifecycleStage with $($actual.cached_file_count) cached files."
+    )
+}
+
+function Assert-SnapshotCached([pscustomobject] $CacheState, [string] $SnapshotId) {
+    if ($SnapshotId -notmatch '^[0-9a-f]{64}$') {
+        throw "The backup returned an invalid full snapshot identifier: $SnapshotId"
+    }
+    $snapshotPath = Join-Path `
+        (Join-Path `
+            (Join-Path $cacheRoot $CacheState.repository_name) `
+            'snapshots') `
+        (Join-Path $SnapshotId.Substring(0, 2) $SnapshotId)
+    if (-not (Test-Path -LiteralPath $snapshotPath -PathType Leaf)) {
+        throw "The LocalSystem cache does not contain completed snapshot $SnapshotId."
+    }
+    Assert-MachineOnlyAcl $snapshotPath -RequireInheritedRules
+}
+
+function Assert-InternalDataExcluded([string] $SnapshotId, [string] $SentinelName) {
+    $previousResticEnvironment = @(
+        [Environment]::GetEnvironmentVariables('Process').GetEnumerator() |
+            Where-Object {
+                ([string] $_.Key).StartsWith(
+                    'RESTIC_',
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            } |
+            ForEach-Object {
+                [pscustomobject]@{
+                    name = [string] $_.Key
+                    value = [string] $_.Value
+                }
+            }
+    )
+    try {
+        foreach ($variable in $previousResticEnvironment) {
+            [Environment]::SetEnvironmentVariable($variable.name, $null, 'Process')
+        }
+        [Environment]::SetEnvironmentVariable(
+            'RESTIC_PASSWORD',
+            'resticpal-e2e-disposable-password',
+            'Process'
+        )
+        $listing = @(
+            & (Join-Path $installRoot 'restic.exe') `
+                --repo $backupRoot `
+                --no-cache `
+                ls $SnapshotId 2>&1 |
+                ForEach-Object ToString
+        )
+        $listingExitCode = $LASTEXITCODE
+    } finally {
+        $currentResticEnvironmentNames = @(
+            [Environment]::GetEnvironmentVariables('Process').Keys |
+                Where-Object {
+                    ([string] $_).StartsWith(
+                        'RESTIC_',
+                        [StringComparison]::OrdinalIgnoreCase
+                    )
+                }
+        )
+        foreach ($name in $currentResticEnvironmentNames) {
+            [Environment]::SetEnvironmentVariable([string] $name, $null, 'Process')
+        }
+        foreach ($variable in $previousResticEnvironment) {
+            [Environment]::SetEnvironmentVariable(
+                $variable.name,
+                $variable.value,
+                'Process'
+            )
+        }
+    }
+    if ($listingExitCode -ne 0) {
+        throw "Listing installed-service snapshot $SnapshotId failed with exit code $listingExitCode."
+    }
+    $listingText = $listing -join "`n"
+    foreach ($expectedSourceFile in @('document.txt', 'vss-exclusive-open.txt')) {
+        if ($listingText.IndexOf($expectedSourceFile, [StringComparison]::Ordinal) -lt 0) {
+            throw "Snapshot $SnapshotId is missing expected source file $expectedSourceFile."
+        }
+    }
+    if ($listingText.IndexOf($SentinelName, [StringComparison]::Ordinal) -ge 0) {
+        throw "Snapshot $SnapshotId included resticpal internal data $SentinelName."
+    }
+    Write-Host 'The production backup excluded resticpal internal data from an explicitly configured source.'
+}
+
 function Wait-DiagnosticEvents([string[]] $EventIds, [TimeSpan] $Timeout) {
     $deadline = [DateTime]::UtcNow + $Timeout
     do {
@@ -509,6 +782,9 @@ if (Test-Path -LiteralPath $installRoot) {
 if (Test-Path -LiteralPath $dataRoot) {
     throw "The data directory already exists: $dataRoot"
 }
+if (Test-Path -LiteralPath $e2eRoot) {
+    throw "The disposable source/repository directory already exists: $e2eRoot"
+}
 if (Test-Path -LiteralPath $onboardingMarker -PathType Leaf) {
     throw "The current user already has a first-run marker; use Windows Sandbox for a clean onboarding test: $onboardingMarker"
 }
@@ -533,14 +809,36 @@ try {
         )
         $upgradeSentinel = Join-Path $dataRoot 'upgrade-sentinel.txt'
         Set-Content -LiteralPath $upgradeSentinel -Value 'preserve across major upgrade' -NoNewline
+        New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
+        $upgradeCacheSentinel = Join-Path $cacheRoot 'upgrade-cache-sentinel.txt'
+        $upgradeCacheSentinelContent = (
+            'preserve cache across major upgrade ' + [Guid]::NewGuid().ToString('N')
+        )
+        Set-Content `
+            -LiteralPath $upgradeCacheSentinel `
+            -Value $upgradeCacheSentinelContent `
+            -NoNewline
         Write-Host "Upgrading the baseline installation to $resolvedMsiPath"
     }
     Write-Host "Installing $resolvedMsiPath"
     Invoke-Installer "/i `"$resolvedMsiPath`" /qn /norestart /l*v `"$installLog`"" 'Installation'
     $installedByTest = $true
     $installedPackagePath = $resolvedMsiPath
-    if ($null -ne $resolvedUpgradeFromMsiPath -and -not (Test-Path -LiteralPath $upgradeSentinel -PathType Leaf)) {
-        throw 'The major upgrade did not preserve existing machine data.'
+    if ($null -ne $resolvedUpgradeFromMsiPath) {
+        if (-not (Test-Path -LiteralPath $upgradeSentinel -PathType Leaf)) {
+            throw 'The major upgrade did not preserve existing machine data.'
+        }
+        if (-not (Test-Path -LiteralPath $upgradeCacheSentinel -PathType Leaf)) {
+            throw 'The major upgrade did not preserve the existing restic cache sentinel.'
+        }
+        $preservedCacheSentinelContent = Get-Content `
+            -LiteralPath $upgradeCacheSentinel `
+            -Raw
+        if (-not $preservedCacheSentinelContent.Equals(
+                $upgradeCacheSentinelContent,
+                [StringComparison]::Ordinal)) {
+            throw 'The major upgrade changed the existing restic cache sentinel.'
+        }
     }
 
     $service = Get-Service -Name ResticPal
@@ -860,13 +1158,56 @@ try {
     }
     Write-Host 'A service-loaded repository can be tested immediately without an unnecessary save.'
 
-    Assert-Accepted @{
-        type = 'update_backup_sources'
-        paths = @($sourceRoot)
-        exclusions = @()
+    $lockedSourcePath = Join-Path $sourceRoot 'vss-exclusive-open.txt'
+    $internalExclusionSentinelName = 'must-never-be-backed-up.txt'
+    Set-Content `
+        -LiteralPath (Join-Path $dataRoot $internalExclusionSentinelName) `
+        -Value 'resticpal service data is always excluded from backup sources' `
+        -NoNewline
+    Set-Content `
+        -LiteralPath $lockedSourcePath `
+        -Value 'This file must be read from the LocalSystem VSS snapshot.' `
+        -NoNewline
+    $lockedSourceStream = [IO.File]::Open(
+        $lockedSourcePath,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::None
+    )
+    $programDataExclusions = @(
+        Get-ChildItem -LiteralPath $env:ProgramData -Force |
+            Where-Object {
+                -not $_.FullName.Equals($dataRoot, [StringComparison]::OrdinalIgnoreCase)
+            } |
+            ForEach-Object FullName
+    )
+    if ($programDataExclusions.Count -gt 500) {
+        throw "The Sandbox ProgramData fixture needs too many exclusions: $($programDataExclusions.Count)."
     }
-    $automaticRun = Wait-Backup ([TimeSpan]::FromMinutes(3))
-    Write-Host "Initial configuration automatically started append-only snapshot $($automaticRun.snapshot_id)."
+    try {
+        Assert-Accepted @{
+            type = 'update_backup_sources'
+            # ProgramData is a legitimate broad ancestor. Every sibling is
+            # excluded by the fixture, leaving the mandatory ResticPal rule as
+            # the only reason the protected data-root sentinel is absent.
+            paths = @($sourceRoot, $env:ProgramData)
+            exclusions = $programDataExclusions
+        }
+        $automaticRun = Wait-Backup ([TimeSpan]::FromMinutes(3))
+    } finally {
+        $lockedSourceStream.Dispose()
+    }
+    Write-Host (
+        "Initial configuration automatically started append-only snapshot " +
+        "$($automaticRun.snapshot_id) while a source file was exclusively open."
+    )
+    $cacheStateAfterFirstBackup = Get-ResticCacheState
+    Assert-SnapshotCached $cacheStateAfterFirstBackup $automaticRun.snapshot_id
+    Assert-InternalDataExcluded $automaticRun.snapshot_id $internalExclusionSentinelName
+    Write-Host (
+        "The protected LocalSystem cache contains repository " +
+        "$($cacheStateAfterFirstBackup.repository_name) and the first VSS-backed snapshot."
+    )
     # Give the manual run enough real work that the one-second active-backup
     # refresh cadence must render its running state before completion.
     Write-RandomTestFile (Join-Path $sourceRoot 'manual-status-transition.bin') 256
@@ -874,13 +1215,17 @@ try {
     $runBackupButton = Wait-AutomationElementEnabled $updatesUiProcess 'RunBackupButton' ([TimeSpan]::FromSeconds(10))
     $runBackupInvoke = $runBackupButton.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)
     $runBackupInvoke.Invoke()
-    # The persistent acknowledgement is the installed accessibility contract;
-    # the short requested-card dwell has focused pure-state coverage because
-    # UI Automation may coalesce intermediate TextBlock Name notifications.
-    Wait-AutomationTextContains $updatesUiProcess 'MessageBar' 'Backup requested' ([TimeSpan]::FromSeconds(10)) | Out-Null
+    # The overview card is the acknowledgement surface. The shared bottom
+    # InfoBar is reserved for rejection/error messages so an accepted request
+    # cannot leave a stale "Backup requested" toast behind.
+    Wait-AutomationTextContains $updatesUiProcess 'StatusCardTitle' 'Backup requested' ([TimeSpan]::FromSeconds(10)) | Out-Null
     Wait-AutomationTextContains $updatesUiProcess 'StatusCardTitle' 'Backup in progress' ([TimeSpan]::FromSeconds(30)) | Out-Null
+    Assert-AutomationTextDoesNotContain $updatesUiProcess 'MessageBar' 'Backup requested'
     $run = Wait-Backup ([TimeSpan]::FromMinutes(3)) $automaticRun.snapshot_id
     Wait-AutomationTextContains $updatesUiProcess 'StatusCardTitle' 'Protected' ([TimeSpan]::FromSeconds(15)) | Out-Null
+    Assert-ResticCacheReused $cacheStateAfterFirstBackup 'for the subsequent manual backup'
+    Assert-SnapshotCached $cacheStateAfterFirstBackup $run.snapshot_id
+    Assert-InternalDataExcluded $run.snapshot_id $internalExclusionSentinelName
     Write-Host "Run backup now rendered its acknowledgement, running, and completed states for append-only snapshot $($run.snapshot_id)."
 
     $appendOnlyRetention = Invoke-ResticPalRequest @{ type = 'get_retention' }
@@ -920,9 +1265,14 @@ try {
     }
     $diagnostics = Wait-DiagnosticEvents @('retention.succeeded', 'backup.succeeded') ([TimeSpan]::FromSeconds(10))
     $diagnosticJson = $diagnostics | ConvertTo-Json -Compress -Depth 12
-    if ($diagnosticJson.Contains($sourceRoot) -or $diagnosticJson.Contains($backupRoot)) {
+    if ($diagnosticJson.Contains($sourceRoot) `
+        -or $diagnosticJson.Contains($backupRoot) `
+        -or $diagnosticJson.Contains($dataRoot)) {
         throw 'Operational diagnostics disclosed a source or repository path.'
     }
+    Assert-ResticCacheReused $cacheStateAfterFirstBackup 'for the standard backup and retention pass'
+    Assert-SnapshotCached $cacheStateAfterFirstBackup $standardRun.snapshot_id
+    Assert-InternalDataExcluded $standardRun.snapshot_id $internalExclusionSentinelName
     Write-Host "Standard backup snapshot $($standardRun.snapshot_id) completed with local retention and prune."
 
     Restart-Service -Name ResticPal -Force
@@ -944,6 +1294,8 @@ try {
         -or $updatesAfterRestart.configuration.automatic_install_locked) {
         throw 'The automatic-update setting did not survive the installed service restart.'
     }
+    Assert-ResticCacheReused $cacheStateAfterFirstBackup 'after the service restart'
+    Assert-SnapshotCached $cacheStateAfterFirstBackup $standardRun.snapshot_id
     $testReachedPersistenceCheck = $true
 } finally {
     if ($installedByTest -and -not $KeepInstalled) {
@@ -997,11 +1349,26 @@ try {
             throw 'Uninstall removed machine backup data instead of preserving it.'
         }
         if ($testReachedPersistenceCheck) {
+            Assert-ResticCacheReused $cacheStateAfterFirstBackup 'after uninstall'
+            Assert-SnapshotCached $cacheStateAfterFirstBackup $standardRun.snapshot_id
             Write-Host 'Install, backup, restart, persistence, and uninstall checks passed.'
         }
         if ($onboardingMarkerCreatedByTest) {
             Remove-Item -LiteralPath $onboardingMarker -Force
         }
         Remove-Item -LiteralPath $dataRoot -Recurse -Force
+        if (Test-Path -LiteralPath $e2eRoot) {
+            $resolvedE2eRoot = [IO.Path]::GetFullPath($e2eRoot)
+            $expectedE2eParent = [IO.Path]::GetFullPath("$env:SystemDrive\")
+            $actualE2eParent = [IO.Path]::GetDirectoryName($resolvedE2eRoot)
+            $actualE2eName = [IO.Path]::GetFileName($resolvedE2eRoot)
+            if (-not $actualE2eParent.TrimEnd('\').Equals(
+                    $expectedE2eParent.TrimEnd('\'),
+                    [StringComparison]::OrdinalIgnoreCase) `
+                -or $actualE2eName -notmatch '^ResticPal-Installed-E2E-[0-9a-f]{32}$') {
+                throw "Refusing to remove an unsafe installed-test directory: $resolvedE2eRoot"
+            }
+            Remove-Item -LiteralPath $resolvedE2eRoot -Recurse -Force
+        }
     }
 }

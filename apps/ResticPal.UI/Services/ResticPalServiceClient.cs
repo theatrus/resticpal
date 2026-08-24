@@ -93,7 +93,7 @@ internal sealed class ResticPalServiceClient
                 true),
             "succeeded_with_warnings" => (
                 "Protected with warnings",
-                "The latest backup completed, but some files need attention.",
+                BackupWarningPresentation.CurrentStatusDescription,
                 true,
                 false),
             "failed" => (
