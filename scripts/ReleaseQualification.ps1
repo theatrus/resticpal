@@ -3,6 +3,13 @@
 # table-driven tests exercise these exact functions without GitHub or network
 # access.
 
+$script:FrozenLegacyAppCastLength = [uint64]969
+$script:FrozenLegacyAppCastSha256 =
+    'eeffa6fc466c0d3f5c95043538742665732a044118286ff94368c163fef7a4e2'
+$script:FrozenLegacySignatureLength = [uint64]88
+$script:FrozenLegacySignatureSha256 =
+    '85d591ce0a7d936be3da429583737838f3ef075565a483c32dc7faaa6085d377'
+
 function Assert-QualificationJsonObject {
     param(
         [AllowNull()] $Value,
@@ -642,10 +649,22 @@ function Assert-UpdateQualificationEvidence {
     }
 
     Assert-QualificationJsonObject -Value $Manifest -Path 'release_manifest'
+    $isBridgeTransition = (
+        $PreviousVersion -ceq '1.0.6' -and $Version -ceq '1.0.7')
+    if (-not $isBridgeTransition -and
+        ([Version]$Version -le [Version]'1.0.7' -or
+         [Version]$PreviousVersion -lt [Version]'1.0.7')) {
+        throw 'Steady-state qualification requires a v1.0.8+ candidate and v1.0.7+ previous client.'
+    }
+    $expectedManifestSchema = if ($isBridgeTransition) {
+        [uint64]5
+    } else {
+        [uint64]6
+    }
     $manifestSchema = Get-RequiredQualificationUInt64 `
         -InputObject $Manifest -Name schema -Path 'release_manifest'
-    if ($manifestSchema -ne 5) {
-        throw 'release_manifest.schema must be the integer 5.'
+    if ($manifestSchema -ne $expectedManifestSchema) {
+        throw "release_manifest.schema must be the integer $expectedManifestSchema."
     }
     $manifestVersion = Get-RequiredQualificationString `
         -InputObject $Manifest -Name version -Path 'release_manifest'
@@ -682,31 +701,106 @@ function Assert-UpdateQualificationEvidence {
     Assert-QualificationExactString `
         -Actual $legacySignatureRecord.Name -Expected 'appcast.xml.signature' `
         -Path 'release_manifest.files.legacy_appcast_signature.name'
-    if ($legacyAppcastRecord.Length -ne $appcastRecord.Length -or
-        $legacyAppcastRecord.Sha256 -cne $appcastRecord.Sha256 -or
-        $legacySignatureRecord.Length -ne $signatureRecord.Length -or
-        $legacySignatureRecord.Sha256 -cne $signatureRecord.Sha256) {
-        throw ('release_manifest legacy appcast records must be byte-identical ' +
-               'to the v2 appcast records except for their filenames.')
-    }
-    $dualNamedFeed = Get-RequiredQualificationProperty `
-        -InputObject $Manifest -Name dual_named_feed -Path 'release_manifest'
-    Assert-QualificationJsonObject `
-        -Value $dualNamedFeed -Path 'release_manifest.dual_named_feed'
-    $dualNamedFeedVersion = Get-RequiredQualificationString `
-        -InputObject $dualNamedFeed -Name version `
-        -Path 'release_manifest.dual_named_feed'
-    $dualNamedFeedAppcastHash = Get-RequiredQualificationHash `
-        -InputObject $dualNamedFeed -Name appcast_sha256 `
-        -Path 'release_manifest.dual_named_feed'
-    $dualNamedFeedSignatureHash = Get-RequiredQualificationHash `
-        -InputObject $dualNamedFeed -Name appcast_signature_sha256 `
-        -Path 'release_manifest.dual_named_feed'
-    if ($dualNamedFeedVersion -cne $Version -or
-        $dualNamedFeedAppcastHash -cne $legacyAppcastRecord.Sha256 -or
-        $dualNamedFeedSignatureHash -cne $legacySignatureRecord.Sha256) {
-        throw ('release_manifest.dual_named_feed must bind the release version ' +
-               'and byte-identical legacy appcast file hashes.')
+    $frozenLegacyBinding = $null
+    if ($isBridgeTransition) {
+        if ($legacyAppcastRecord.Length -ne $appcastRecord.Length -or
+            $legacyAppcastRecord.Sha256 -cne $appcastRecord.Sha256 -or
+            $legacySignatureRecord.Length -ne $signatureRecord.Length -or
+            $legacySignatureRecord.Sha256 -cne $signatureRecord.Sha256) {
+            throw ('release_manifest legacy appcast records must be byte-identical ' +
+                   'to the v2 appcast records for the v1.0.7 bridge.')
+        }
+        $dualNamedFeed = Get-RequiredQualificationProperty `
+            -InputObject $Manifest -Name dual_named_feed -Path 'release_manifest'
+        Assert-QualificationJsonObject `
+            -Value $dualNamedFeed -Path 'release_manifest.dual_named_feed'
+        $dualNamedFeedVersion = Get-RequiredQualificationString `
+            -InputObject $dualNamedFeed -Name version `
+            -Path 'release_manifest.dual_named_feed'
+        $dualNamedFeedAppcastHash = Get-RequiredQualificationHash `
+            -InputObject $dualNamedFeed -Name appcast_sha256 `
+            -Path 'release_manifest.dual_named_feed'
+        $dualNamedFeedSignatureHash = Get-RequiredQualificationHash `
+            -InputObject $dualNamedFeed -Name appcast_signature_sha256 `
+            -Path 'release_manifest.dual_named_feed'
+        if ($dualNamedFeedVersion -cne $Version -or
+            $dualNamedFeedAppcastHash -cne $legacyAppcastRecord.Sha256 -or
+            $dualNamedFeedSignatureHash -cne $legacySignatureRecord.Sha256) {
+            throw ('release_manifest.dual_named_feed must bind the release version ' +
+                   'and byte-identical legacy appcast file hashes.')
+        }
+    } else {
+        if ($legacyAppcastRecord.Length -ne $script:FrozenLegacyAppCastLength -or
+            $legacyAppcastRecord.Sha256 -cne $script:FrozenLegacyAppCastSha256 -or
+            $legacySignatureRecord.Length -ne $script:FrozenLegacySignatureLength -or
+            $legacySignatureRecord.Sha256 -cne
+                $script:FrozenLegacySignatureSha256) {
+            throw 'release_manifest legacy records do not match the immutable v1.0.7 byte pins.'
+        }
+        $candidateV2Feed = Get-RequiredQualificationProperty `
+            -InputObject $Manifest -Name candidate_v2_feed -Path 'release_manifest'
+        Assert-QualificationJsonObject `
+            -Value $candidateV2Feed -Path 'release_manifest.candidate_v2_feed'
+        $candidateV2Version = Get-RequiredQualificationString `
+            -InputObject $candidateV2Feed -Name version `
+            -Path 'release_manifest.candidate_v2_feed'
+        $candidateV2AppcastHash = Get-RequiredQualificationHash `
+            -InputObject $candidateV2Feed -Name appcast_sha256 `
+            -Path 'release_manifest.candidate_v2_feed'
+        $candidateV2SignatureHash = Get-RequiredQualificationHash `
+            -InputObject $candidateV2Feed -Name appcast_signature_sha256 `
+            -Path 'release_manifest.candidate_v2_feed'
+        if ($candidateV2Version -cne $Version -or
+            $candidateV2AppcastHash -cne $appcastRecord.Sha256 -or
+            $candidateV2SignatureHash -cne $signatureRecord.Sha256) {
+            throw ('release_manifest.candidate_v2_feed must bind the candidate version ' +
+                   'and exact v2 appcast file hashes.')
+        }
+
+        $frozenLegacyFeed = Get-RequiredQualificationProperty `
+            -InputObject $Manifest -Name frozen_legacy_feed -Path 'release_manifest'
+        Assert-QualificationJsonObject `
+            -Value $frozenLegacyFeed -Path 'release_manifest.frozen_legacy_feed'
+        $frozenLegacyVersion = Get-RequiredQualificationString `
+            -InputObject $frozenLegacyFeed -Name version `
+            -Path 'release_manifest.frozen_legacy_feed'
+        $frozenLegacyBaselineTag = Get-RequiredQualificationString `
+            -InputObject $frozenLegacyFeed -Name baseline_tag `
+            -Path 'release_manifest.frozen_legacy_feed'
+        $frozenLegacyBaselineUrl = Get-RequiredQualificationString `
+            -InputObject $frozenLegacyFeed -Name baseline_release_url `
+            -Path 'release_manifest.frozen_legacy_feed'
+        $frozenLegacySourceTag = Get-RequiredQualificationString `
+            -InputObject $frozenLegacyFeed -Name source_tag `
+            -Path 'release_manifest.frozen_legacy_feed'
+        $frozenLegacySourceUrl = Get-RequiredQualificationString `
+            -InputObject $frozenLegacyFeed -Name source_release_url `
+            -Path 'release_manifest.frozen_legacy_feed'
+        $frozenLegacyAppcastHash = Get-RequiredQualificationHash `
+            -InputObject $frozenLegacyFeed -Name appcast_sha256 `
+            -Path 'release_manifest.frozen_legacy_feed'
+        $frozenLegacySignatureHash = Get-RequiredQualificationHash `
+            -InputObject $frozenLegacyFeed -Name appcast_signature_sha256 `
+            -Path 'release_manifest.frozen_legacy_feed'
+        $expectedPreviousTag = "v$PreviousVersion"
+        $expectedPreviousReleaseUrl = (
+            "https://github.com/theatrus/resticpal/releases/tag/$expectedPreviousTag")
+        if ($frozenLegacyVersion -cne '1.0.7' -or
+            $frozenLegacyBaselineTag -cne 'v1.0.7' -or
+            $frozenLegacyBaselineUrl -cne
+                'https://github.com/theatrus/resticpal/releases/tag/v1.0.7' -or
+            $frozenLegacySourceTag -cne $expectedPreviousTag -or
+            $frozenLegacySourceUrl -cne $expectedPreviousReleaseUrl -or
+            $frozenLegacyAppcastHash -cne $legacyAppcastRecord.Sha256 -or
+            $frozenLegacySignatureHash -cne $legacySignatureRecord.Sha256) {
+            throw ('release_manifest.frozen_legacy_feed must bind exact v1.0.7 ' +
+                   'bytes fetched from the official previous release.')
+        }
+        $frozenLegacyBinding = [pscustomobject]@{
+            SourceTag = $frozenLegacySourceTag
+            Appcast = $legacyAppcastRecord
+            Signature = $legacySignatureRecord
+        }
     }
 
     $updatePackageValue = Get-RequiredQualificationProperty `
@@ -728,8 +822,6 @@ function Assert-UpdateQualificationEvidence {
         -Value $updatePackage.Signature `
         -Path 'release_manifest.update_package.signature'
 
-    $isBridgeTransition = (
-        $PreviousVersion -ceq '1.0.6' -and $Version -ceq '1.0.7')
     $automaticQualification = Get-RequiredQualificationProperty `
         -InputObject $Manifest -Name automatic_qualification -Path 'release_manifest'
     Assert-QualificationJsonObject `
@@ -1002,6 +1094,57 @@ function Assert-UpdateQualificationEvidence {
         $apiAssetDigest -cne "sha256:$publishedAssetHash" -or
         $apiAssetUrl -cne $expectedPublishedAssetUrl) {
         throw 'evidence.published_release does not match the official GitHub release asset.'
+    }
+    if (-not $isBridgeTransition) {
+        foreach ($legacySource in @(
+            [pscustomobject]@{
+                Name = 'appcast.xml'
+                Record = $frozenLegacyBinding.Appcast
+            },
+            [pscustomobject]@{
+                Name = 'appcast.xml.signature'
+                Record = $frozenLegacyBinding.Signature
+            }
+        )) {
+            $matchingLegacyAssets = @($apiAssets | Where-Object {
+                if ($null -eq $_ -or
+                    ($_ -isnot [pscustomobject] -and
+                     $_ -isnot [Collections.IDictionary])) {
+                    return $false
+                }
+                try {
+                    (Get-RequiredQualificationString `
+                        -InputObject $_ -Name name `
+                        -Path 'published_release_api.assets[]') -ceq
+                        $legacySource.Name
+                } catch {
+                    $false
+                }
+            })
+            if ($matchingLegacyAssets.Count -ne 1) {
+                throw ("published_release_api must contain exactly one frozen " +
+                       "$($legacySource.Name) asset.")
+            }
+            $legacyApiAsset = $matchingLegacyAssets[0]
+            $legacyApiSize = Get-RequiredQualificationUInt64 `
+                -InputObject $legacyApiAsset -Name size `
+                -Path 'published_release_api.assets[]'
+            $legacyApiDigest = Get-RequiredQualificationString `
+                -InputObject $legacyApiAsset -Name digest `
+                -Path 'published_release_api.assets[]'
+            $legacyApiUrl = Get-RequiredQualificationString `
+                -InputObject $legacyApiAsset -Name url `
+                -Path 'published_release_api.assets[]'
+            $expectedLegacyApiUrl = (
+                "https://github.com/theatrus/resticpal/releases/download/" +
+                "$expectedPublishedTag/$($legacySource.Name)")
+            if ($legacyApiSize -ne $legacySource.Record.Length -or
+                $legacyApiDigest -cne "sha256:$($legacySource.Record.Sha256)" -or
+                $legacyApiUrl -cne $expectedLegacyApiUrl) {
+                throw ("release_manifest frozen $($legacySource.Name) does not " +
+                       'match the official previous GitHub release asset.')
+            }
+        }
     }
 
     $verification = Get-RequiredQualificationProperty `

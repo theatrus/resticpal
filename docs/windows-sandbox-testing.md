@@ -43,14 +43,14 @@ Only one automated Sandbox session may be active at a time. The launcher refuses
 
 The ordinary `-UpgradeFromMsiPath` lifecycle proves MSI major-upgrade behavior by invoking the new installer directly. It does not prove that an already-published NetSparkle client preserves the `.msi` extension after a redirected download. Use the dedicated update test for that release-blocking check.
 
-First download the old installer from its published GitHub release and obtain a manually dispatched, Authenticode-signed candidate. Stage the new release before preparing either appcast name. The stage contains only the exact MSI, checksum, license, and notices; it must contain no appcast assets. This lets the deployed legacy hook populate and verify the direct package mirror while leaving the currently live feed untouched.
+First download the immediately preceding installer from its published GitHub release and obtain a manually dispatched, Authenticode-signed candidate. Stage the new release before preparing the candidate v2 appcast. The stage contains only the exact MSI, checksum, license, and notices; it must contain no appcast assets. This lets the deployed helper populate and verify the direct package mirror while leaving both live feeds untouched.
 
 ```powershell
-New-Item -ItemType Directory -Path artifacts\published\v1.0.6 -Force | Out-Null
-gh release download v1.0.6 `
+New-Item -ItemType Directory -Path artifacts\published\v1.0.7 -Force | Out-Null
+gh release download v1.0.7 `
     --repo theatrus/resticpal `
-    --pattern resticpal-1.0.6-x64.msi `
-    --dir artifacts\published\v1.0.6
+    --pattern resticpal-1.0.7-x64.msi `
+    --dir artifacts\published\v1.0.7
 
 gh workflow run ci.yml --ref main
 # Wait for the manual run to pass, then stage only its signed package assets.
@@ -60,10 +60,10 @@ gh workflow run ci.yml --ref main
     -ReleaseNotesPath C:\path\to\release-notes.md `
     -Stage
 
-# Wait for updates.resticpal.com/releases/v1.0.7/resticpal-1.0.7-x64.msi
+# Wait for updates.resticpal.com/releases/v1.0.8/resticpal-1.0.8-x64.msi
 # to return the staged MSI directly with the signed artifact's exact length
-# and SHA-256. Preparation repeats that check before signing the canonical
-# appcast-v2.xml and creating byte-identical appcast.xml aliases.
+# and SHA-256. Preparation repeats that check before signing appcast-v2.xml
+# and binding the immutable v1.0.7 legacy compatibility pair.
 .\scripts\Publish-Release.ps1 -RunId <signed-run-id>
 ```
 
@@ -72,12 +72,12 @@ launcher default):
 
 ```powershell
 .\scripts\Start-WindowsSandboxUpdateTest.ps1 `
-    -PublishedClientMsiPath artifacts\published\v1.0.6\resticpal-1.0.6-x64.msi `
-    -ExpectedPublishedVersion 1.0.6 `
-    -CandidateMsiPath artifacts\release\v1.0.7\ci-artifact\artifacts\installer\output\resticpal-1.0.7-x64.msi `
-    -ExpectedCandidateVersion 1.0.7 `
-    -AppCastPath artifacts\release\v1.0.7\feed\appcast-v2.xml `
-    -AppCastSignaturePath artifacts\release\v1.0.7\feed\appcast-v2.xml.signature
+    -PublishedClientMsiPath artifacts\published\v1.0.7\resticpal-1.0.7-x64.msi `
+    -ExpectedPublishedVersion 1.0.7 `
+    -CandidateMsiPath artifacts\release\v1.0.8\ci-artifact\artifacts\installer\output\resticpal-1.0.8-x64.msi `
+    -ExpectedCandidateVersion 1.0.8 `
+    -AppCastPath artifacts\release\v1.0.8\feed\appcast-v2.xml `
+    -AppCastSignaturePath artifacts\release\v1.0.8\feed\appcast-v2.xml.signature
 ```
 
 Every release now requires a complementary automatic qualification with the same
@@ -86,15 +86,12 @@ official previous-client MSI and prepared candidate:
 ```powershell
 .\scripts\Start-WindowsSandboxUpdateTest.ps1 `
     -InstallationMode Automatic `
-    -PublishedClientMsiPath artifacts\published\v1.0.6\resticpal-1.0.6-x64.msi `
-    -ExpectedPublishedVersion 1.0.6 `
-    -CandidateMsiPath artifacts\release\v1.0.7\ci-artifact\artifacts\installer\output\resticpal-1.0.7-x64.msi `
-    -ExpectedCandidateVersion 1.0.7 `
-    -AppCastPath artifacts\release\v1.0.7\feed\appcast-v2.xml `
-    -AppCastSignaturePath artifacts\release\v1.0.7\feed\appcast-v2.xml.signature `
-    -ProbeAppCastPath artifacts\release\v1.0.7\probe\appcast-v2-probe.xml `
-    -ProbeAppCastSignaturePath artifacts\release\v1.0.7\probe\appcast-v2-probe.xml.signature `
-    -ProbePayloadPath artifacts\release\v1.0.7\probe\resticpal-1.0.8-x64.msi
+    -PublishedClientMsiPath artifacts\published\v1.0.7\resticpal-1.0.7-x64.msi `
+    -ExpectedPublishedVersion 1.0.7 `
+    -CandidateMsiPath artifacts\release\v1.0.8\ci-artifact\artifacts\installer\output\resticpal-1.0.8-x64.msi `
+    -ExpectedCandidateVersion 1.0.8 `
+    -AppCastPath artifacts\release\v1.0.8\feed\appcast-v2.xml `
+    -AppCastSignaturePath artifacts\release\v1.0.8\feed\appcast-v2.xml.signature
 ```
 
 The launcher queries the official GitHub API for the stable `v<old-version>` release and requires the local old MSI to match that release's exact asset name, SHA-256 digest, length, and download URL. The guest redirects only its own update hostnames to a loopback HTTPS origin trusted by an ephemeral Sandbox-only certificate, then serves the exact prepared appcast and candidate. A GitHub test enclosure, when explicitly used for compatibility testing, is redirected to an extensionless object URL without `Content-Disposition`.
@@ -121,7 +118,7 @@ three installed executable versions change to the candidate; the service returns
 as LocalSystem; the automatic setting survives the upgrade; and exactly one
 replacement tray remains in the interactive session.
 
-Results are written under `artifacts\windows-sandbox-update`. Keep both resulting `result.json` files, their `guest.log` files, `test-artifacts\staged-update.json`, origin request logs, and MSI logs with the release evidence. Both the prompted and automatic v1.0.6→v1.0.7 results are release blockers. Finalization binds their hashes plus normalized evidence into the prepared schema-5 manifest before uploading either signed name pair:
+Results are written under `artifacts\windows-sandbox-update`. Keep both resulting `result.json` files, their `guest.log` files, `test-artifacts\staged-update.json`, origin request logs, and MSI logs with the release evidence. Both prompted and automatic results from the immediately preceding published client are release blockers. Finalization binds their hashes plus normalized evidence into the prepared schema-6 manifest before exposing the candidate v2 feed:
 
 ```powershell
 .\scripts\Publish-Release.ps1 `
@@ -132,7 +129,7 @@ Results are written under `artifacts\windows-sandbox-update`. Keep both resultin
     -Finalize
 ```
 
-The Sandbox test does not mutate either public appcast. Until qualification-bound finalization succeeds, the staged GitHub release has no appcast assets and the old live legacy feed remains unchanged. Finalization uploads the final checksum and canonical signed `appcast-v2.xml` pair first, then its byte-identical legacy signature and `appcast.xml` last. That last upload exposes the qualified update through the legacy GitHub fallback; the following release edit makes the deployed hook advance the legacy live feed. The hook does not mirror the v2 name, so new clients temporarily receive the same signed v2 bytes from their GitHub fallback after the primary returns 404.
+The Sandbox test does not mutate either public appcast. Until qualification-bound finalization succeeds, the staged GitHub release has no appcast assets and both live feeds remain unchanged. Finalization uploads the final checksum and exact frozen v1.0.7 legacy pair first, then the candidate v2 signature and `appcast-v2.xml` last. That last upload exposes the qualified update through the GitHub v2 fallback; the following release edit makes the deployed helper advance the live v2 pair while preserving the immutable legacy feed.
 
 ## Sandbox connection failures
 
