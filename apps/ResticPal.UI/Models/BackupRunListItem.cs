@@ -9,6 +9,7 @@ public sealed class BackupRunListItem
     internal BackupRunListItem(BackupRun run)
     {
         Id = run.Id;
+        SnapshotId = run.SnapshotId;
         Headline = run.Outcome switch
         {
             "succeeded" => "Backup completed",
@@ -52,15 +53,21 @@ public sealed class BackupRunListItem
             ? Visibility.Visible
             : Visibility.Collapsed;
         FailureDetailsButtonText = BackupWarningPresentation.ViewButtonLabel(run.FailedItemCount);
+        BrowseSnapshotVisibility = !string.IsNullOrWhiteSpace(run.SnapshotId)
+            && run.Outcome is "succeeded" or "succeeded_with_warnings"
+                ? Visibility.Visible
+                : Visibility.Collapsed;
     }
 
     public ulong Id { get; }
+    public string? SnapshotId { get; }
     public string Headline { get; }
     public string CompletedAtText { get; }
     public string Summary { get; }
     public string Detail { get; }
     public Visibility FailureDetailsVisibility { get; }
     public string FailureDetailsButtonText { get; }
+    public Visibility BrowseSnapshotVisibility { get; }
 
     private static string FormatDuration(TimeSpan duration)
     {

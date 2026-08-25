@@ -50,6 +50,11 @@
                     <SymbolIcon Symbol="Clock" />
                 </NavigationViewItem.Icon>
             </NavigationViewItem>
+            <NavigationViewItem x:Name="RestoreItem" Content="Restore files" Tag="restore">
+                <NavigationViewItem.Icon>
+                    <FontIcon Glyph="&#xE777;" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
             <NavigationViewItem x:Name="DiagnosticsItem" Content="Diagnostics" Tag="diagnostics">
                 <NavigationViewItem.Icon>
                     <FontIcon Glyph="&#xE9D9;" />
@@ -619,6 +624,12 @@
                                                 Content="{Binding FailureDetailsButtonText}"
                                                 Tag="{Binding}"
                                                 Visibility="{Binding FailureDetailsVisibility}" />
+                                            <Button
+                                                HorizontalAlignment="Left"
+                                                Click="BrowseBackupSnapshotButton_Click"
+                                                Content="Browse this backup"
+                                                Tag="{Binding}"
+                                                Visibility="{Binding BrowseSnapshotVisibility}" />
                                         </StackPanel>
                                     </Border>
                                 </DataTemplate>
@@ -626,6 +637,257 @@
                         </ListView>
                     </Grid>
                 </Grid>
+
+                <ScrollViewer x:Name="RestorePanel" Visibility="Collapsed">
+                    <Grid MaxWidth="920" Padding="32" HorizontalAlignment="Stretch" RowSpacing="20">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <Grid ColumnSpacing="20">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Restore files" />
+                                <TextBlock
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Choose an existing backup, browse one file or folder, and restore a verified copy into a new local folder. Existing files are never overwritten."
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                                <Button
+                                    x:Name="RefreshRestoreButton"
+                                    Click="RefreshRestoreButton_Click"
+                                    Content="Refresh" />
+                                <ProgressRing x:Name="RestorePageProgress" IsActive="False" Width="24" Height="24" />
+                            </StackPanel>
+                        </Grid>
+
+                        <Border
+                            Grid.Row="1"
+                            Padding="20"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                            <Grid ColumnSpacing="20">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Spacing="4" VerticalAlignment="Center">
+                                    <TextBlock FontWeight="SemiBold" Text="Allow file restores on this PC" />
+                                    <TextBlock
+                                        x:Name="RestoreSettingsDescription"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        Text="Only an administrator can browse backup snapshots or restore files."
+                                        TextWrapping="Wrap" />
+                                </StackPanel>
+                                <ToggleSwitch
+                                    x:Name="RestoreEnabledToggle"
+                                    Grid.Column="1"
+                                    IsEnabled="False"
+                                    OffContent="Off"
+                                    OnContent="On"
+                                    Toggled="RestoreEnabledToggle_Toggled"
+                                    VerticalAlignment="Center" />
+                            </Grid>
+                        </Border>
+
+                        <InfoBar
+                            x:Name="RestorePolicyMessage"
+                            Grid.Row="2"
+                            IsClosable="False"
+                            IsOpen="False"
+                            Severity="Informational" />
+
+                        <Border
+                            x:Name="RestoreSnapshotCard"
+                            Grid.Row="3"
+                            Padding="20"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Visibility="Collapsed">
+                            <StackPanel Spacing="16">
+                                <TextBlock FontSize="17" FontWeight="SemiBold" Text="1. Choose a backup" />
+                                <TextBlock
+                                    x:Name="RestoreSnapshotSummary"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Loading backups from the repository…"
+                                    TextWrapping="Wrap" />
+                                <Grid ColumnSpacing="16">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <CalendarDatePicker
+                                        x:Name="RestoreDatePicker"
+                                        DateChanged="RestoreDatePicker_DateChanged"
+                                        Header="Backup date"
+                                        PlaceholderText="Select a backup date" />
+                                    <ComboBox
+                                        x:Name="RestoreSnapshotPicker"
+                                        Grid.Column="1"
+                                        DisplayMemberPath="DisplayName"
+                                        Header="Backup time"
+                                        HorizontalAlignment="Stretch"
+                                        ItemsSource="{x:Bind RestoreSnapshotOptions}"
+                                        PlaceholderText="Select a backup"
+                                        SelectionChanged="RestoreSnapshotPicker_SelectionChanged" />
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            x:Name="RestoreBrowserCard"
+                            Grid.Row="4"
+                            Padding="20"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Visibility="Collapsed">
+                            <StackPanel Spacing="14">
+                                <TextBlock FontSize="17" FontWeight="SemiBold" Text="2. Select one file or folder" />
+                                <BreadcrumbBar
+                                    x:Name="RestoreBreadcrumbBar"
+                                    ItemClicked="RestoreBreadcrumbBar_ItemClicked"
+                                    ItemsSource="{x:Bind RestoreBreadcrumbs}">
+                                    <BreadcrumbBar.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding DisplayName}" />
+                                        </DataTemplate>
+                                    </BreadcrumbBar.ItemTemplate>
+                                </BreadcrumbBar>
+                                <Grid ColumnSpacing="12" Padding="12,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="32" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="110" />
+                                        <ColumnDefinition Width="150" />
+                                        <ColumnDefinition Width="72" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="1" FontWeight="SemiBold" Text="Name" />
+                                    <TextBlock Grid.Column="2" FontWeight="SemiBold" Text="Size" />
+                                    <TextBlock Grid.Column="3" FontWeight="SemiBold" Text="Modified" />
+                                </Grid>
+                                <ListView
+                                    x:Name="RestoreEntriesList"
+                                    ItemsSource="{x:Bind RestoreEntries}"
+                                    MaxHeight="360"
+                                    SelectionChanged="RestoreEntriesList_SelectionChanged"
+                                    SelectionMode="Single">
+                                    <ListView.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid ColumnSpacing="12" Padding="2,8">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="32" />
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="110" />
+                                                    <ColumnDefinition Width="150" />
+                                                    <ColumnDefinition Width="72" />
+                                                </Grid.ColumnDefinitions>
+                                                <FontIcon Glyph="{Binding IconGlyph}" />
+                                                <TextBlock Grid.Column="1" Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                                                <TextBlock Grid.Column="2" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{Binding SizeText}" />
+                                                <TextBlock Grid.Column="3" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{Binding ModifiedAtText}" />
+                                                <Button
+                                                    Grid.Column="4"
+                                                    Click="OpenRestoreDirectoryButton_Click"
+                                                    Content="Open"
+                                                    Tag="{Binding}"
+                                                    Visibility="{Binding OpenVisibility}" />
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ListView.ItemTemplate>
+                                </ListView>
+                                <TextBlock
+                                    x:Name="RestoreDirectoryMessage"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Select a backup to browse its files."
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            x:Name="RestoreSelectionCard"
+                            Grid.Row="5"
+                            Padding="20"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Visibility="Collapsed">
+                            <StackPanel Spacing="14">
+                                <TextBlock FontSize="17" FontWeight="SemiBold" Text="3. Choose where to restore" />
+                                <TextBlock
+                                    x:Name="RestoreSelectionDescription"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="Select one file or folder from the backup above."
+                                    TextWrapping="Wrap" />
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <Button
+                                        x:Name="ChooseRestoreDestinationButton"
+                                        Click="ChooseRestoreDestinationButton_Click"
+                                        Content="Choose destination" />
+                                    <Button
+                                        x:Name="StartRestoreButton"
+                                        Click="StartRestoreButton_Click"
+                                        Content="Restore selected item"
+                                        IsEnabled="False"
+                                        Style="{StaticResource AccentButtonStyle}" />
+                                </StackPanel>
+                                <TextBlock
+                                    x:Name="RestoreDestinationDescription"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="ResticPal creates a new folder and never replaces existing files."
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            x:Name="RestoreProgressCard"
+                            Grid.Row="6"
+                            Padding="20"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8"
+                            Visibility="Collapsed">
+                            <StackPanel Spacing="12">
+                                <TextBlock x:Name="RestoreProgressTitle" FontSize="17" FontWeight="SemiBold" Text="Restore in progress" />
+                                <ProgressBar x:Name="RestoreProgressBar" IsIndeterminate="True" />
+                                <TextBlock x:Name="RestoreProgressDescription" Text="Preparing the restore…" TextWrapping="Wrap" />
+                                <TextBlock
+                                    x:Name="RestoreProgressDestination"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    IsTextSelectionEnabled="True"
+                                    TextWrapping="Wrap" />
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <Button
+                                        x:Name="CancelRestoreButton"
+                                        Click="CancelRestoreButton_Click"
+                                        Content="Cancel restore" />
+                                    <Button
+                                        x:Name="OpenRestoredFolderButton"
+                                        Click="OpenRestoredFolderButton_Click"
+                                        Content="Open restored folder"
+                                        Visibility="Collapsed" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+                </ScrollViewer>
 
                 <Grid
                     x:Name="DiagnosticsPanel"

@@ -1,10 +1,12 @@
 //! Restic child-process execution with bounded output parsing and cancellation.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -15,24 +17,44 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use resticpal_core::config::{EffectiveConfig, SecretEnvironmentVariable};
 use resticpal_core::restic::{
     InvocationError, ResticCommandBuilder, ResticInvocation, ResticOperation,
+    validate_restore_snapshot_id, validate_restore_snapshot_path,
     windows_path_is_same_or_descendant,
 };
 use resticpal_core::status::{BackupProgress, MAX_BACKUP_FAILED_ITEMS, is_safe_backup_failed_item};
+use resticpal_protocol::{RestoreEntryView, RestoreNodeType, RestoreSnapshotView};
 use resticpal_windows::credentials::DpapiSecretStore;
 use serde::Deserialize;
-use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE};
-use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_CANCELLED, ERROR_MORE_DATA, HANDLE, HLOCAL, LocalFree,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_FILE_OBJECT, SetSecurityInfo,
+};
+use windows::Win32::Security::{
+    ACL, DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateDirectoryW, FILE_GENERIC_READ, GetDriveTypeW, WRITE_DAC,
+};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
+use windows::Win32::System::SystemInformation::{
+    ComputerNamePhysicalDnsHostname, GetComputerNameExW,
+};
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows::Win32::System::WindowsProgramming::DRIVE_REMOTE;
-use windows::core::PCWSTR;
+use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR, w};
 use zeroize::Zeroizing;
 
 use crate::power_request::TimedSystemPowerRequest;
@@ -44,6 +66,22 @@ const STALE_LOCK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_PENDING_PROGRESS_EVENTS: usize = 16;
+const MAX_RESTORE_SNAPSHOTS: usize = 2_048;
+const MAX_RESTORE_DIRECTORY_ENTRIES: usize = 4_096;
+const MAX_RESTORE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESTORE_PREFLIGHT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RESTORE_PREFLIGHT_NODES: usize = 250_000;
+const MAX_RESTORE_ITEM_PATH_BYTES: usize = 4 * 1024;
+const MAX_RESTORE_ITEM_NAME_BYTES: usize = 1_024;
+const MAX_RESTORE_SNAPSHOT_PATHS: usize = 128;
+const MAX_RESTORE_HOSTNAME_BYTES: usize = 255;
+#[cfg(not(test))]
+const RESTORE_DIRECTORY_SDDL: PCWSTR = w!("O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+// Unit and disposable-repository tests execute under the developer account,
+// not LocalSystem. Owner Rights keeps those non-service harnesses usable while
+// production builds always require an explicitly SYSTEM-owned directory.
+#[cfg(test)]
+const RESTORE_DIRECTORY_SDDL: PCWSTR = w!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)");
 const INHERITED_ENVIRONMENT: &[&str] = &[
     "SystemRoot",
     "TEMP",
@@ -61,8 +99,71 @@ impl CancellationToken {
         self.0.store(true, Ordering::Release);
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RestoreError {
+    pub(crate) code: &'static str,
+}
+
+impl RestoreError {
+    pub(crate) const fn new(code: &'static str) -> Self {
+        Self { code }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RestoreProgress {
+    pub(crate) destination: Option<PathBuf>,
+    pub(crate) files_restored: Option<u64>,
+    pub(crate) bytes_restored: Option<u64>,
+    pub(crate) total_files: Option<u64>,
+    pub(crate) total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestoreOutcome {
+    pub(crate) kind: RestoreOutcomeKind,
+    pub(crate) destination: Option<PathBuf>,
+    pub(crate) files_restored: u64,
+    pub(crate) bytes_restored: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestoreOutcomeKind {
+    Succeeded,
+    Failed { code: String },
+    Cancelled,
+}
+
+impl RestoreOutcome {
+    pub(crate) fn failed(code: &str) -> Self {
+        Self {
+            kind: RestoreOutcomeKind::Failed {
+                code: code.to_owned(),
+            },
+            destination: None,
+            files_restored: 0,
+            bytes_restored: 0,
+        }
+    }
+
+    fn failed_at(code: &str, destination: Option<PathBuf>) -> Self {
+        let mut outcome = Self::failed(code);
+        outcome.destination = destination;
+        outcome
+    }
+
+    fn cancelled(destination: Option<PathBuf>) -> Self {
+        Self {
+            kind: RestoreOutcomeKind::Cancelled,
+            destination,
+            files_restored: 0,
+            bytes_restored: 0,
+        }
     }
 }
 
@@ -197,6 +298,206 @@ impl ResticExecutor {
             false,
             on_progress,
         )
+    }
+
+    /// Reads a bounded list of snapshots created by this Windows hostname.
+    pub(crate) fn list_snapshots(
+        &self,
+        config: &EffectiveConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RestoreSnapshotView>, RestoreError> {
+        let hostname = current_restic_hostname()?;
+        let mut invocation = ResticCommandBuilder::new(self.executable.as_ref())
+            .inspection(config, ResticOperation::Snapshots)
+            .map_err(|_| RestoreError::new("invalid_repository_configuration"))?;
+        invocation.arguments.push("--host".into());
+        invocation.arguments.push(hostname.clone().into());
+        let output = self.execute_capture_invocation(
+            &invocation,
+            REPOSITORY_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        let wire: Vec<WireRestoreSnapshot> = serde_json::from_slice(&output)
+            .map_err(|_| RestoreError::new("restore_snapshot_output_invalid"))?;
+        if wire.len() > MAX_RESTORE_SNAPSHOTS {
+            return Err(RestoreError::new("restore_snapshot_limit_exceeded"));
+        }
+        let mut snapshots = Vec::with_capacity(wire.len());
+        for snapshot in wire {
+            validate_restore_snapshot_id(&snapshot.id)
+                .map_err(|_| RestoreError::new("restore_snapshot_output_invalid"))?;
+            if snapshot.hostname.len() > MAX_RESTORE_HOSTNAME_BYTES
+                || snapshot.hostname.chars().any(char::is_control)
+                || snapshot.paths.len() > MAX_RESTORE_SNAPSHOT_PATHS
+                || snapshot.paths.iter().any(|path| {
+                    path.is_empty()
+                        || path.len() > MAX_RESTORE_ITEM_PATH_BYTES
+                        || path.chars().any(char::is_control)
+                })
+            {
+                return Err(RestoreError::new("restore_snapshot_output_invalid"));
+            }
+            // The CLI host selector and this independent check must both agree
+            // before another machine's private snapshot metadata is exposed.
+            if !snapshot.hostname.eq_ignore_ascii_case(&hostname) {
+                continue;
+            }
+            snapshots.push(RestoreSnapshotView {
+                id: snapshot.id,
+                time: snapshot.time,
+                hostname: snapshot.hostname,
+                paths: snapshot.paths,
+            });
+        }
+        snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.time));
+        Ok(snapshots)
+    }
+
+    /// Lists a single directory without recursive enumeration or raw output.
+    pub(crate) fn list_directory(
+        &self,
+        config: &EffectiveConfig,
+        snapshot_id: &str,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RestoreEntryView>, RestoreError> {
+        let invocation = ResticCommandBuilder::new(self.executable.as_ref())
+            .directory_listing(config, snapshot_id, path)
+            .map_err(|error| RestoreError::new(restore_invocation_error_code(&error)))?;
+        let output = self.execute_capture_invocation(
+            &invocation,
+            REPOSITORY_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        parse_restore_directory(&output, path)
+    }
+
+    /// Restores one validated node into a fresh local destination. Restic
+    /// creates its ordinary shared repository lock; no unlock or destructive
+    /// maintenance command is ever executed as part of this operation.
+    pub(crate) fn restore(
+        &self,
+        config: &EffectiveConfig,
+        snapshot_id: &str,
+        path: &str,
+        destination: &Path,
+        cancellation: &CancellationToken,
+        mut on_progress: impl FnMut(RestoreProgress),
+    ) -> RestoreOutcome {
+        if let Err(error) = validate_restore_snapshot_id(snapshot_id)
+            .and_then(|()| validate_restore_snapshot_path(path))
+        {
+            return RestoreOutcome::failed(restore_invocation_error_code(&error));
+        }
+        if path == "/" {
+            return RestoreOutcome::failed("restore_path_invalid");
+        }
+        let parent = match validate_restore_destination(
+            destination,
+            self.data_directory.as_ref(),
+            self.executable.as_ref(),
+        ) {
+            Ok(parent) => parent,
+            Err(error) => return RestoreOutcome::failed(error.code),
+        };
+        let parent_lock = match lock_restore_directory(&parent) {
+            Ok(lock) => lock,
+            Err(error) => return RestoreOutcome::failed(error.code),
+        };
+        if let Err(error) = ensure_locked_restore_directory(&parent) {
+            return RestoreOutcome::failed(error.code);
+        }
+        if cancellation.is_cancelled() {
+            return RestoreOutcome::cancelled(None);
+        }
+        let operation_timeout = Duration::from_secs(config.schedule.wake_lock_timeout_seconds);
+        let operation_started = Instant::now();
+        let mut preflight = match ResticCommandBuilder::new(self.executable.as_ref())
+            .directory_listing(config, snapshot_id, path)
+        {
+            Ok(invocation) => invocation,
+            Err(error) => return RestoreOutcome::failed(restore_invocation_error_code(&error)),
+        };
+        let Some(command_index) = preflight
+            .arguments
+            .iter()
+            .position(|argument| argument == OsStr::new("ls"))
+        else {
+            return RestoreOutcome::failed("restore_subtree_preflight_failed");
+        };
+        preflight
+            .arguments
+            .insert(command_index + 1, OsString::from("--recursive"));
+        if let Err(error) = self.execute_restore_subtree_preflight(
+            &preflight,
+            operation_timeout,
+            cancellation,
+            path,
+        ) {
+            if error.code == "restore_cancelled" {
+                return RestoreOutcome::cancelled(None);
+            }
+            if error.code == "restore_query_timed_out" {
+                return RestoreOutcome::failed("restore_timed_out");
+            }
+            return RestoreOutcome::failed(error.code);
+        }
+        if cancellation.is_cancelled() {
+            return RestoreOutcome::cancelled(None);
+        }
+        if operation_started.elapsed() >= operation_timeout {
+            return RestoreOutcome::failed("restore_timed_out");
+        }
+        let unique_destination = match create_restore_destination(&parent) {
+            Ok(destination) => destination,
+            Err(error) => return RestoreOutcome::failed(error.code),
+        };
+        let destination = Some(unique_destination.clone());
+        let destination_lock = match lock_restore_directory_for_handoff(&unique_destination) {
+            Ok(lock) => lock,
+            Err(error) => return RestoreOutcome::failed_at(error.code, destination),
+        };
+        let outcome = (|| {
+            if let Err(error) = ensure_locked_restore_directory(&unique_destination) {
+                return RestoreOutcome::failed_at(error.code, destination.clone());
+            }
+            if let Err(error) = verify_protected_restore_directory(&parent_lock, &destination_lock)
+            {
+                return RestoreOutcome::failed_at(error.code, destination.clone());
+            }
+            on_progress(RestoreProgress {
+                destination: destination.clone(),
+                ..RestoreProgress::default()
+            });
+            let invocation = match ResticCommandBuilder::new(self.executable.as_ref()).restore(
+                config,
+                snapshot_id,
+                path,
+                &unique_destination,
+            ) {
+                Ok(invocation) => invocation,
+                Err(error) => {
+                    return RestoreOutcome::failed_at(
+                        restore_invocation_error_code(&error),
+                        destination.clone(),
+                    );
+                }
+            };
+            let Some(remaining_timeout) = operation_timeout
+                .checked_sub(operation_started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                return RestoreOutcome::failed_at("restore_timed_out", destination.clone());
+            };
+            self.execute_restore_invocation(
+                &invocation,
+                remaining_timeout,
+                destination.clone(),
+                cancellation,
+                &mut on_progress,
+            )
+        })();
+        finish_restore_destination(&parent_lock, &destination_lock, outcome, destination)
     }
 
     pub fn repository_operation(
@@ -382,6 +683,335 @@ impl ResticExecutor {
         RepositoryOutcome::failed(code)
     }
 
+    fn execute_capture_invocation(
+        &self,
+        invocation: &ResticInvocation,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>, RestoreError> {
+        let secrets = self
+            .resolve_secrets(&invocation.secret_environment)
+            .map_err(|_| RestoreError::new("credential_unavailable"))?;
+        let _wake_lock = self
+            .wake_locks
+            .acquire(timeout)
+            .map_err(|_| RestoreError::new("wake_lock_unavailable"))?;
+        if cancellation.is_cancelled() {
+            return Err(RestoreError::new("restore_cancelled"));
+        }
+        let job =
+            KillOnDropJob::new().map_err(|_| RestoreError::new("process_isolation_failed"))?;
+        let mut command = command_for(invocation, &secrets, self.cache_directory.as_ref());
+        let mut child = command
+            .spawn()
+            .map_err(|_| RestoreError::new("restic_start_failed"))?;
+        drop(command);
+        drop(secrets);
+        if job.assign(&child).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RestoreError::new("process_isolation_failed"));
+        }
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RestoreError::new("restic_output_unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| RestoreError::new("restic_output_unavailable"))?;
+        let stdout_thread =
+            thread::spawn(move || read_bounded_with_overflow(stdout, MAX_RESTORE_OUTPUT_BYTES));
+        let stderr_thread = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
+        let mut job = Some(job);
+        let started = Instant::now();
+        let mut cancelled = false;
+        let mut timed_out = false;
+        let mut termination_failed = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if cancellation.is_cancelled() || started.elapsed() >= timeout {
+                        cancelled = cancellation.is_cancelled();
+                        timed_out = !cancelled;
+                        termination_failed = !terminate_process_tree(
+                            job.take().expect("a running child retains its job"),
+                            &mut child,
+                        );
+                        break Err(());
+                    }
+                    thread::sleep(PROCESS_POLL_INTERVAL);
+                }
+                Err(_) => {
+                    termination_failed = !terminate_process_tree(
+                        job.take().expect("a running child retains its job"),
+                        &mut child,
+                    );
+                    break Err(());
+                }
+            }
+        };
+        if termination_failed {
+            drop(stdout_thread);
+            drop(stderr_thread);
+            return Err(RestoreError::new("restic_termination_failed"));
+        }
+        let (stdout, overflow) = stdout_thread.join().unwrap_or_else(|_| (Vec::new(), true));
+        let stderr = stderr_thread.join().unwrap_or_default();
+        if cancelled {
+            return Err(RestoreError::new("restore_cancelled"));
+        }
+        if timed_out {
+            return Err(RestoreError::new("restore_query_timed_out"));
+        }
+        let status = status.map_err(|()| RestoreError::new("restic_wait_failed"))?;
+        if !status.success() {
+            return Err(RestoreError::new(
+                classify_stderr(&stderr).unwrap_or("restore_repository_query_failed"),
+            ));
+        }
+        if overflow {
+            return Err(RestoreError::new("restore_output_limit_exceeded"));
+        }
+        Ok(stdout)
+    }
+
+    /// Parses recursive preflight output as it arrives rather than retaining a
+    /// directory tree in memory. This keeps ordinary large Documents restores
+    /// practical while still bounding work and rejecting every unsafe node.
+    fn execute_restore_subtree_preflight(
+        &self,
+        invocation: &ResticInvocation,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+        selected: &str,
+    ) -> Result<(), RestoreError> {
+        let secrets = self
+            .resolve_secrets(&invocation.secret_environment)
+            .map_err(|_| RestoreError::new("credential_unavailable"))?;
+        let _wake_lock = self
+            .wake_locks
+            .acquire(timeout)
+            .map_err(|_| RestoreError::new("wake_lock_unavailable"))?;
+        if cancellation.is_cancelled() {
+            return Err(RestoreError::new("restore_cancelled"));
+        }
+        let job =
+            KillOnDropJob::new().map_err(|_| RestoreError::new("process_isolation_failed"))?;
+        let mut command = command_for(invocation, &secrets, self.cache_directory.as_ref());
+        let mut child = command
+            .spawn()
+            .map_err(|_| RestoreError::new("restic_start_failed"))?;
+        drop(command);
+        drop(secrets);
+        if job.assign(&child).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RestoreError::new("process_isolation_failed"));
+        }
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RestoreError::new("restic_output_unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| RestoreError::new("restic_output_unavailable"))?;
+        let selected = selected.to_owned();
+        let stdout_thread = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let result = validate_restore_subtree_reader(&mut reader, &selected);
+            if result.is_err() {
+                // Keep draining until restic exits (or cancellation kills it)
+                // so rejecting one bad node cannot deadlock a full stdout pipe.
+                drain(reader);
+            }
+            result
+        });
+        let stderr_thread = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
+        let mut job = Some(job);
+        let started = Instant::now();
+        let mut cancelled = false;
+        let mut timed_out = false;
+        let mut termination_failed = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if cancellation.is_cancelled() || started.elapsed() >= timeout {
+                        cancelled = cancellation.is_cancelled();
+                        timed_out = !cancelled;
+                        termination_failed = !terminate_process_tree(
+                            job.take().expect("a running child retains its job"),
+                            &mut child,
+                        );
+                        break Err(());
+                    }
+                    thread::sleep(PROCESS_POLL_INTERVAL);
+                }
+                Err(_) => {
+                    termination_failed = !terminate_process_tree(
+                        job.take().expect("a running child retains its job"),
+                        &mut child,
+                    );
+                    break Err(());
+                }
+            }
+        };
+        if termination_failed {
+            drop(stdout_thread);
+            drop(stderr_thread);
+            return Err(RestoreError::new("restic_termination_failed"));
+        }
+        let parsed = stdout_thread
+            .join()
+            .unwrap_or(Err(RestoreError::new("restore_subtree_preflight_failed")));
+        let stderr = stderr_thread.join().unwrap_or_default();
+        if cancelled {
+            return Err(RestoreError::new("restore_cancelled"));
+        }
+        if timed_out {
+            return Err(RestoreError::new("restore_query_timed_out"));
+        }
+        let status = status.map_err(|()| RestoreError::new("restic_wait_failed"))?;
+        if !status.success() {
+            return Err(RestoreError::new(
+                classify_stderr(&stderr).unwrap_or("restore_subtree_preflight_failed"),
+            ));
+        }
+        parsed
+    }
+
+    fn execute_restore_invocation(
+        &self,
+        invocation: &ResticInvocation,
+        timeout: Duration,
+        destination: Option<PathBuf>,
+        cancellation: &CancellationToken,
+        mut on_progress: impl FnMut(RestoreProgress),
+    ) -> RestoreOutcome {
+        let secrets = match self.resolve_secrets(&invocation.secret_environment) {
+            Ok(secrets) => secrets,
+            Err(_) => return RestoreOutcome::failed_at("credential_unavailable", destination),
+        };
+        let _wake_lock = match self.wake_locks.acquire(timeout) {
+            Ok(lock) => lock,
+            Err(_) => return RestoreOutcome::failed_at("wake_lock_unavailable", destination),
+        };
+        if cancellation.is_cancelled() {
+            return RestoreOutcome::cancelled(destination);
+        }
+        let job = match KillOnDropJob::new() {
+            Ok(job) => job,
+            Err(_) => return RestoreOutcome::failed_at("process_isolation_failed", destination),
+        };
+        let mut command = command_for(invocation, &secrets, self.cache_directory.as_ref());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => return RestoreOutcome::failed_at("restic_start_failed", destination),
+        };
+        drop(command);
+        drop(secrets);
+        if job.assign(&child).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return RestoreOutcome::failed_at("process_isolation_failed", destination);
+        }
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => return RestoreOutcome::failed_at("restic_output_unavailable", destination),
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => return RestoreOutcome::failed_at("restic_output_unavailable", destination),
+        };
+        let (progress_tx, progress_rx) = mpsc::sync_channel(MAX_PENDING_PROGRESS_EVENTS);
+        let stdout_thread = thread::spawn(move || read_restore_output(stdout, &progress_tx));
+        let stderr_thread = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
+        let mut job = Some(job);
+        let started = Instant::now();
+        let mut cancelled = false;
+        let mut timed_out = false;
+        let mut termination_failed = false;
+        let status = loop {
+            for mut progress in progress_rx.try_iter() {
+                progress.destination = destination.clone();
+                on_progress(progress);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if cancellation.is_cancelled() || started.elapsed() >= timeout {
+                        cancelled = cancellation.is_cancelled();
+                        timed_out = !cancelled;
+                        termination_failed = !terminate_process_tree(
+                            job.take().expect("a running child retains its job"),
+                            &mut child,
+                        );
+                        break Err(());
+                    }
+                    thread::sleep(PROCESS_POLL_INTERVAL);
+                }
+                Err(_) => {
+                    termination_failed = !terminate_process_tree(
+                        job.take().expect("a running child retains its job"),
+                        &mut child,
+                    );
+                    break Err(());
+                }
+            }
+        };
+        if termination_failed {
+            drop(stdout_thread);
+            drop(stderr_thread);
+            // The outer restore stack owns deny-DELETE locks for the selected
+            // parent and its SYSTEM-only destination. Never return while the
+            // privileged child may still reopen paths there: doing so would
+            // release those handles, permit FILE_DELETE_CHILD replacement, and
+            // let a local attacker redirect subsequent LocalSystem writes.
+            // Catastrophic OS termination failures deliberately quarantine this
+            // worker (and all repository/update operations) until exit is
+            // positively confirmed.
+            quarantine_restore_child_until_exit(&mut child);
+            return RestoreOutcome::failed_at("restic_termination_failed", destination);
+        }
+        let parsed = stdout_thread
+            .join()
+            .unwrap_or(Err(RestoreError::new("restore_output_invalid")));
+        let stderr = stderr_thread.join().unwrap_or_default();
+        for mut progress in progress_rx.try_iter() {
+            progress.destination = destination.clone();
+            on_progress(progress);
+        }
+        if cancelled {
+            return RestoreOutcome::cancelled(destination);
+        }
+        if timed_out {
+            return RestoreOutcome::failed_at("restore_timed_out", destination);
+        }
+        let status = match status {
+            Ok(status) => status,
+            Err(()) => return RestoreOutcome::failed_at("restic_wait_failed", destination),
+        };
+        if !status.success() {
+            return RestoreOutcome::failed_at(
+                classify_stderr(&stderr).unwrap_or("restore_failed"),
+                destination,
+            );
+        }
+        let summary = match parsed {
+            Ok(summary) => summary,
+            Err(error) => return RestoreOutcome::failed_at(error.code, destination),
+        };
+        RestoreOutcome {
+            kind: RestoreOutcomeKind::Succeeded,
+            destination,
+            files_restored: summary.files_restored.unwrap_or_default(),
+            bytes_restored: summary.bytes_restored.unwrap_or_default(),
+        }
+    }
+
     fn execute_invocation(
         &self,
         invocation: &ResticInvocation,
@@ -535,6 +1165,625 @@ fn build_backup_invocations(
     Ok((unlock, backup))
 }
 
+fn restore_invocation_error_code(error: &InvocationError) -> &'static str {
+    match error {
+        InvocationError::InvalidRestoreSnapshotId => "restore_snapshot_invalid",
+        InvocationError::InvalidRestoreSnapshotPath => "restore_path_invalid",
+        InvocationError::InvalidRestoreDestination => "restore_destination_invalid",
+        InvocationError::ForbiddenByRepositoryMode { .. } => "restore_forbidden",
+        _ => "invalid_repository_configuration",
+    }
+}
+
+fn validate_restore_destination(
+    destination: &Path,
+    protected_data: &Path,
+    executable: &OsStr,
+) -> Result<PathBuf, RestoreError> {
+    if !destination.is_absolute()
+        || destination.as_os_str().encode_wide().count()
+            > resticpal_core::config::MAX_PATH_CHARACTERS
+        || destination
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || !matches!(
+            destination.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+        )
+    {
+        return Err(RestoreError::new("restore_destination_invalid"));
+    }
+    if source_is_network_path(destination) {
+        return Err(RestoreError::new("restore_destination_network_unsupported"));
+    }
+    let metadata = fs::symlink_metadata(destination)
+        .map_err(|_| RestoreError::new("restore_destination_unavailable"))?;
+    if !metadata.is_dir() {
+        return Err(RestoreError::new("restore_destination_not_directory"));
+    }
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(RestoreError::new("restore_destination_alias_unsupported"));
+    }
+    let canonical = ordinary_windows_path(
+        &fs::canonicalize(destination)
+            .map_err(|_| RestoreError::new("restore_destination_unavailable"))?,
+    );
+    let equivalent = windows_path_is_same_or_descendant(destination, &canonical)
+        && windows_path_is_same_or_descendant(&canonical, destination);
+    if !equivalent {
+        return Err(RestoreError::new("restore_destination_alias_unsupported"));
+    }
+
+    let mut protected = vec![protected_data.to_path_buf()];
+    if let Ok(canonical_data) = fs::canonicalize(protected_data) {
+        protected.push(ordinary_windows_path(&canonical_data));
+    }
+    let executable = Path::new(executable);
+    if let Ok(executable) = fs::canonicalize(executable)
+        && let Some(parent) = ordinary_windows_path(&executable).parent()
+    {
+        protected.push(parent.to_path_buf());
+    }
+    if let Some(windows) = std::env::var_os("SystemRoot") {
+        protected.push(PathBuf::from(windows));
+    }
+    if protected.iter().any(|protected| {
+        windows_path_is_same_or_descendant(destination, protected)
+            || windows_path_is_same_or_descendant(&canonical, protected)
+    }) {
+        return Err(RestoreError::new("restore_destination_protected"));
+    }
+    Ok(canonical)
+}
+
+struct RestoreSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl RestoreSecurityDescriptor {
+    fn protected_directory() -> Result<Self, RestoreError> {
+        Self::from_sddl(RESTORE_DIRECTORY_SDDL)
+    }
+
+    fn from_sddl(sddl: PCWSTR) -> Result<Self, RestoreError> {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: the static SDDL is null-terminated and conversion returns a
+        // uniquely owned LocalAlloc descriptor.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl,
+                SDDL_REVISION_1,
+                &raw mut descriptor,
+                None,
+            )
+        }
+        .map_err(|_| RestoreError::new("restore_destination_security_failed"))?;
+        Ok(Self(descriptor))
+    }
+
+    fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>())
+                .expect("SECURITY_ATTRIBUTES size fits in u32"),
+            lpSecurityDescriptor: self.0.0,
+            bInheritHandle: false.into(),
+        }
+    }
+}
+
+impl Drop for RestoreSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.0.is_null() {
+            // SAFETY: both SDDL conversion and GetSecurityInfo return one
+            // descriptor allocated by LocalAlloc.
+            let _ = unsafe { LocalFree(Some(HLOCAL(self.0.0))) };
+        }
+    }
+}
+
+fn create_restore_destination(parent: &Path) -> Result<PathBuf, RestoreError> {
+    let security = RestoreSecurityDescriptor::protected_directory()?;
+    let attributes = security.attributes();
+    let label = format!(
+        "ResticPal Restore - {}",
+        Utc::now().format("%Y-%m-%d %H%M%S")
+    );
+    for attempt in 0..1_000_u16 {
+        let name = if attempt == 0 {
+            label.clone()
+        } else {
+            format!("{label} ({attempt})")
+        };
+        let candidate = parent.join(name);
+        let candidate_wide: Vec<u16> = candidate
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SECURITY_ATTRIBUTES installs the protected SYSTEM/Administrators
+        // DACL atomically; an unprivileged parent owner never gets a window to
+        // plant a junction inside the directory before LocalSystem extraction.
+        match unsafe {
+            CreateDirectoryW(PCWSTR(candidate_wide.as_ptr()), Some(&raw const attributes))
+        } {
+            Ok(()) => {
+                let canonical = ordinary_windows_path(
+                    &fs::canonicalize(&candidate)
+                        .map_err(|_| RestoreError::new("restore_destination_unavailable"))?,
+                );
+                if !windows_path_is_same_or_descendant(&canonical, parent)
+                    || !windows_path_is_same_or_descendant(&candidate, &canonical)
+                    || !windows_path_is_same_or_descendant(&canonical, &candidate)
+                {
+                    return Err(RestoreError::new("restore_destination_alias_unsupported"));
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => {}
+            Err(_) => return Err(RestoreError::new("restore_destination_creation_failed")),
+        }
+    }
+    Err(RestoreError::new("restore_destination_creation_failed"))
+}
+
+/// Deny DELETE sharing while restic runs so a user-writable destination cannot
+/// be exchanged for a junction between validation and LocalSystem extraction.
+fn lock_restore_directory(path: &Path) -> Result<fs::File, RestoreError> {
+    open_locked_restore_directory(path, false)
+}
+
+fn lock_restore_directory_for_handoff(path: &Path) -> Result<fs::File, RestoreError> {
+    open_locked_restore_directory(path, true)
+}
+
+fn open_locked_restore_directory(
+    path: &Path,
+    permit_security_handoff: bool,
+) -> Result<fs::File, RestoreError> {
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .share_mode(FILE_SHARE_READ_WRITE);
+    if permit_security_handoff {
+        options.access_mode(FILE_GENERIC_READ.0 | WRITE_DAC.0);
+    }
+    let handle = options
+        .open(path)
+        .map_err(|_| RestoreError::new("restore_destination_unavailable"))?;
+    let metadata = handle
+        .metadata()
+        .map_err(|_| RestoreError::new("restore_destination_unavailable"))?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(RestoreError::new("restore_destination_alias_unsupported"));
+    }
+    Ok(handle)
+}
+
+fn directory_security(
+    directory: &fs::File,
+) -> Result<(RestoreSecurityDescriptor, *mut ACL), RestoreError> {
+    let mut owner = PSID::default();
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the handle owns READ_CONTROL, output pointers are writable, and
+    // Windows allocates one descriptor containing the returned owner and DACL.
+    unsafe {
+        GetSecurityInfo(
+            HANDLE(directory.as_raw_handle()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            Some(&raw mut owner),
+            None,
+            Some(&raw mut dacl),
+            None,
+            Some(&raw mut descriptor),
+        )
+    }
+    .ok()
+    .map_err(|_| RestoreError::new("restore_destination_security_failed"))?;
+    let descriptor = RestoreSecurityDescriptor(descriptor);
+    if dacl.is_null() || owner.is_invalid() {
+        return Err(RestoreError::new("restore_destination_security_failed"));
+    }
+    Ok((descriptor, dacl))
+}
+
+fn restore_descriptor_owner(descriptor: &RestoreSecurityDescriptor) -> Result<PSID, RestoreError> {
+    let mut owner = PSID::default();
+    let mut defaulted = BOOL::default();
+    // SAFETY: the descriptor remains live and both owner outputs are writable.
+    unsafe { GetSecurityDescriptorOwner(descriptor.0, &raw mut owner, &raw mut defaulted) }
+        .map_err(|_| RestoreError::new("restore_destination_security_failed"))?;
+    if owner.is_invalid() {
+        return Err(RestoreError::new("restore_destination_security_failed"));
+    }
+    Ok(owner)
+}
+
+fn restore_descriptor_dacl(
+    descriptor: &RestoreSecurityDescriptor,
+) -> Result<*mut ACL, RestoreError> {
+    let mut present = BOOL::default();
+    let mut defaulted = BOOL::default();
+    let mut dacl = std::ptr::null_mut();
+    // SAFETY: the descriptor remains live and every DACL output is writable.
+    unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.0,
+            &raw mut present,
+            &raw mut dacl,
+            &raw mut defaulted,
+        )
+    }
+    .map_err(|_| RestoreError::new("restore_destination_security_failed"))?;
+    if !present.as_bool() || dacl.is_null() {
+        return Err(RestoreError::new("restore_destination_security_failed"));
+    }
+    Ok(dacl)
+}
+
+fn same_restore_acl(expected: *const ACL, actual: *const ACL) -> bool {
+    if expected.is_null() || actual.is_null() {
+        return false;
+    }
+    // SAFETY: each ACL points inside a live descriptor validated by Windows;
+    // AclSize is the readable extent of that descriptor-owned allocation.
+    let expected_size = usize::from(unsafe { (*expected).AclSize });
+    let actual_size = usize::from(unsafe { (*actual).AclSize });
+    expected_size == actual_size
+        && unsafe {
+            std::slice::from_raw_parts(expected.cast::<u8>(), expected_size)
+                == std::slice::from_raw_parts(actual.cast::<u8>(), actual_size)
+        }
+}
+
+fn directory_security_is_protected(
+    descriptor: &RestoreSecurityDescriptor,
+) -> Result<bool, RestoreError> {
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: the descriptor is live and output pointers are writable.
+    unsafe { GetSecurityDescriptorControl(descriptor.0, &raw mut control, &raw mut revision) }
+        .map_err(|_| RestoreError::new("restore_destination_security_failed"))?;
+    Ok(control & SE_DACL_PROTECTED.0 != 0)
+}
+
+fn verify_restore_security_descriptor(
+    actual: &RestoreSecurityDescriptor,
+    expected: &RestoreSecurityDescriptor,
+    expected_owner: PSID,
+) -> Result<(), RestoreError> {
+    if !directory_security_is_protected(actual)? {
+        return Err(RestoreError::new("restore_destination_security_failed"));
+    }
+    let actual_owner = restore_descriptor_owner(actual)?;
+    // SAFETY: both SIDs live inside their still-owned security descriptors.
+    if expected_owner.is_invalid() || unsafe { EqualSid(actual_owner, expected_owner) }.is_err() {
+        return Err(RestoreError::new("restore_destination_security_failed"));
+    }
+    if !same_restore_acl(
+        restore_descriptor_dacl(expected)?.cast_const(),
+        restore_descriptor_dacl(actual)?.cast_const(),
+    ) {
+        return Err(RestoreError::new("restore_destination_security_failed"));
+    }
+    Ok(())
+}
+
+fn verify_protected_restore_directory(
+    parent: &fs::File,
+    destination: &fs::File,
+) -> Result<(), RestoreError> {
+    let expected = RestoreSecurityDescriptor::protected_directory()?;
+    let (_parent_descriptor, _) = directory_security(parent)?;
+    let (actual, _) = directory_security(destination)?;
+    #[cfg(not(test))]
+    let expected_owner = restore_descriptor_owner(&expected)?;
+    #[cfg(test)]
+    let expected_owner = restore_descriptor_owner(&_parent_descriptor)?;
+    verify_restore_security_descriptor(&actual, &expected, expected_owner)
+}
+
+/// Expose completed or partial recovery output only after restic and all
+/// LocalSystem writes have stopped. Windows propagates the parent DACL's
+/// inheritable ACEs to already-created files and nested directories.
+fn handoff_restore_directory(
+    parent: &fs::File,
+    destination: &fs::File,
+) -> Result<(), RestoreError> {
+    let (_parent_descriptor, _) = directory_security(parent)?;
+    let (_trusted_descriptor, trusted_dacl) = directory_security(destination)?;
+    // Preserve the destination's authenticated SYSTEM/Administrators ACEs and
+    // let Windows add only legitimately inheritable parent ACEs. Copying the
+    // whole parent DACL would incorrectly expose parent-only permissions; a
+    // null DACL would grant full access to everyone.
+    // SAFETY: the destination handle owns WRITE_DAC, its non-null trusted DACL
+    // remains live through the descriptor, and both directories cannot move.
+    unsafe {
+        SetSecurityInfo(
+            HANDLE(destination.as_raw_handle()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(trusted_dacl.cast_const()),
+            None,
+        )
+    }
+    .ok()
+    .map_err(|_| RestoreError::new("restore_destination_security_failed"))?;
+    let (descriptor, _) = directory_security(destination)?;
+    if directory_security_is_protected(&descriptor)? {
+        return Err(RestoreError::new("restore_destination_security_failed"));
+    }
+    Ok(())
+}
+
+fn finish_restore_destination(
+    parent: &fs::File,
+    destination_lock: &fs::File,
+    outcome: RestoreOutcome,
+    destination: Option<PathBuf>,
+) -> RestoreOutcome {
+    if matches!(
+        &outcome.kind,
+        RestoreOutcomeKind::Failed { code } if code == "restic_termination_failed"
+    ) {
+        // A termination fault has already kept the worker quarantined until
+        // exit was proven. Leave its partial output protected and undisclosed
+        // anyway; administrators can inspect or remove it deliberately.
+        return RestoreOutcome::failed("restic_termination_failed");
+    }
+    match handoff_restore_directory(parent, destination_lock) {
+        Ok(()) => outcome,
+        Err(error) => RestoreOutcome::failed_at(error.code, destination),
+    }
+}
+
+fn quarantine_restore_child_until_exit(child: &mut Child) {
+    loop {
+        let _ = child.kill();
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) | Err(_) => thread::sleep(PROCESS_POLL_INTERVAL),
+        }
+    }
+}
+
+fn ensure_locked_restore_directory(path: &Path) -> Result<(), RestoreError> {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| RestoreError::new("restore_destination_unavailable"))?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(RestoreError::new("restore_destination_alias_unsupported"));
+    }
+    let canonical = ordinary_windows_path(
+        &fs::canonicalize(path)
+            .map_err(|_| RestoreError::new("restore_destination_unavailable"))?,
+    );
+    if !windows_path_is_same_or_descendant(path, &canonical)
+        || !windows_path_is_same_or_descendant(&canonical, path)
+    {
+        return Err(RestoreError::new("restore_destination_alias_unsupported"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct WireRestoreSnapshot {
+    id: String,
+    time: DateTime<Utc>,
+    hostname: String,
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireRestoreEntry {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default, rename = "type")]
+    node_type: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    mtime: Option<DateTime<Utc>>,
+}
+
+fn parse_restore_directory(
+    output: &[u8],
+    requested: &str,
+) -> Result<Vec<RestoreEntryView>, RestoreError> {
+    let mut reader = BufReader::new(output);
+    let mut line = Vec::new();
+    let mut entries = Vec::new();
+    while let Some(valid) = read_bounded_line(&mut reader, &mut line)
+        .map_err(|_| RestoreError::new("restore_directory_output_invalid"))?
+    {
+        if !valid {
+            return Err(RestoreError::new("restore_directory_output_invalid"));
+        }
+        let wire: WireRestoreEntry = serde_json::from_slice(&line)
+            .map_err(|_| RestoreError::new("restore_directory_output_invalid"))?;
+        let (name, path, kind) = match (wire.name, wire.path, wire.node_type) {
+            (None, None, None) => {
+                // `restic ls --json` begins with a snapshot metadata object.
+                continue;
+            }
+            (Some(name), Some(path), Some(kind)) => (name, path, kind),
+            _ => return Err(RestoreError::new("restore_directory_output_invalid")),
+        };
+        if path == requested {
+            continue;
+        }
+        let Some((parent, leaf)) = path.rsplit_once('/') else {
+            return Err(RestoreError::new("restore_directory_output_invalid"));
+        };
+        let parent = if parent.is_empty() { "/" } else { parent };
+        if parent != requested {
+            // Never trust an accidental recursive result or an unrelated path.
+            continue;
+        }
+        if path.len() > MAX_RESTORE_ITEM_PATH_BYTES
+            || name.len() > MAX_RESTORE_ITEM_NAME_BYTES
+            || name.is_empty()
+            || name != leaf
+            || name.contains('/')
+            || name.contains('\\')
+            || name.chars().any(char::is_control)
+            || validate_restore_snapshot_path(&path).is_err()
+        {
+            return Err(RestoreError::new("restore_directory_output_invalid"));
+        }
+        let node_type = match kind.as_str() {
+            "file" => RestoreNodeType::File,
+            "dir" | "directory" => RestoreNodeType::Directory,
+            // Symlinks, junction-like entries, sockets, and devices must never
+            // be restored by the initial local-only file recovery surface.
+            _ => continue,
+        };
+        if entries.len() >= MAX_RESTORE_DIRECTORY_ENTRIES {
+            return Err(RestoreError::new("restore_directory_limit_exceeded"));
+        }
+        entries.push(RestoreEntryView {
+            name,
+            path,
+            node_type,
+            size: wire.size,
+            modified_at: wire.mtime,
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+fn validate_restore_subtree(output: &[u8], selected: &str) -> Result<(), RestoreError> {
+    validate_restore_subtree_reader(&mut BufReader::new(output), selected)
+}
+
+fn validate_restore_subtree_reader(
+    reader: &mut impl BufRead,
+    selected: &str,
+) -> Result<(), RestoreError> {
+    let mut line = Vec::new();
+    let mut found = false;
+    let mut count = 0_usize;
+    let mut bytes = 0_usize;
+    let prefix = format!("{selected}/");
+    while let Some(valid) = read_bounded_line(reader, &mut line)
+        .map_err(|_| RestoreError::new("restore_subtree_preflight_failed"))?
+    {
+        bytes = bytes.saturating_add(line.len());
+        if !valid || bytes > MAX_RESTORE_PREFLIGHT_BYTES {
+            return Err(RestoreError::new("restore_output_limit_exceeded"));
+        }
+        let wire: WireRestoreEntry = serde_json::from_slice(&line)
+            .map_err(|_| RestoreError::new("restore_subtree_preflight_failed"))?;
+        let (name, path, kind) = match (wire.name, wire.path, wire.node_type) {
+            (None, None, None) => continue,
+            (Some(name), Some(path), Some(kind)) => (name, path, kind),
+            _ => return Err(RestoreError::new("restore_subtree_preflight_failed")),
+        };
+        if path != selected && !path.starts_with(&prefix) {
+            continue;
+        }
+        if path.len() > MAX_RESTORE_ITEM_PATH_BYTES
+            || name.len() > MAX_RESTORE_ITEM_NAME_BYTES
+            || name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.chars().any(char::is_control)
+            || path.rsplit('/').next() != Some(name.as_str())
+            || validate_restore_snapshot_path(&path).is_err()
+        {
+            return Err(RestoreError::new("restore_subtree_preflight_failed"));
+        }
+        if !matches!(kind.as_str(), "file" | "dir" | "directory") {
+            return Err(RestoreError::new("restore_unsupported_node"));
+        }
+        count = count.saturating_add(1);
+        if count > MAX_RESTORE_PREFLIGHT_NODES {
+            return Err(RestoreError::new("restore_directory_limit_exceeded"));
+        }
+        if path == selected {
+            found = true;
+        }
+    }
+    if !found {
+        return Err(RestoreError::new("restore_selected_node_unavailable"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireRestoreProgress {
+    #[serde(default)]
+    message_type: String,
+    #[serde(default)]
+    files_restored: Option<u64>,
+    #[serde(default)]
+    files_done: Option<u64>,
+    #[serde(default)]
+    bytes_restored: Option<u64>,
+    #[serde(default)]
+    bytes_done: Option<u64>,
+    #[serde(default)]
+    total_files: Option<u64>,
+    #[serde(default)]
+    total_bytes: Option<u64>,
+}
+
+fn read_restore_output(
+    stdout: impl Read,
+    progress: &mpsc::SyncSender<RestoreProgress>,
+) -> Result<RestoreProgress, RestoreError> {
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
+    let mut bytes = 0_usize;
+    let mut last = RestoreProgress::default();
+    while let Some(valid) = read_bounded_line(&mut reader, &mut line)
+        .map_err(|_| RestoreError::new("restore_output_invalid"))?
+    {
+        bytes = bytes.saturating_add(line.len());
+        if !valid || bytes > MAX_RESTORE_OUTPUT_BYTES {
+            drain(reader);
+            return Err(RestoreError::new("restore_output_limit_exceeded"));
+        }
+        let wire: WireRestoreProgress = serde_json::from_slice(&line)
+            .map_err(|_| RestoreError::new("restore_output_invalid"))?;
+        if !matches!(wire.message_type.as_str(), "status" | "summary") {
+            continue;
+        }
+        let update = RestoreProgress {
+            destination: None,
+            files_restored: wire.files_restored.or(wire.files_done),
+            bytes_restored: wire.bytes_restored.or(wire.bytes_done),
+            total_files: wire.total_files,
+            total_bytes: wire.total_bytes,
+        };
+        if update.files_restored.is_some() {
+            last.files_restored = update.files_restored;
+        }
+        if update.bytes_restored.is_some() {
+            last.bytes_restored = update.bytes_restored;
+        }
+        if update.total_files.is_some() {
+            last.total_files = update.total_files;
+        }
+        if update.total_bytes.is_some() {
+            last.total_bytes = update.total_bytes;
+        }
+        let _ = progress.try_send(last.clone());
+    }
+    Ok(last)
+}
+
 pub(crate) fn validate_backup_source_paths(
     sources: &[PathBuf],
     data_directory: Option<&Path>,
@@ -667,6 +1916,64 @@ fn backup_outcome_for_lock_cleanup(cleanup: &RepositoryOutcome) -> Option<Backup
             Some(BackupOutcome::failed(code))
         }
     }
+}
+
+/// Matches Go's Windows `os.Hostname`, which restic records in each snapshot.
+///
+/// `COMPUTERNAME` contains the legacy NetBIOS name and is capped at 15
+/// characters. On Windows Sandbox, domain hosts, and ordinary machines with a
+/// longer DNS name, selecting that value would silently hide every real backup.
+/// Never fall back to a different host identity: doing so could expose another
+/// computer's snapshots from a shared repository.
+fn current_restic_hostname() -> Result<String, RestoreError> {
+    let mut buffer = vec![0_u16; 64];
+    loop {
+        let mut required = u32::try_from(buffer.len())
+            .map_err(|_| RestoreError::new("restore_hostname_unavailable"))?;
+        // SAFETY: `buffer` contains at least `required` UTF-16 elements and the
+        // Win32 API initializes at most that many before reporting its length.
+        let result = unsafe {
+            GetComputerNameExW(
+                ComputerNamePhysicalDnsHostname,
+                Some(PWSTR(buffer.as_mut_ptr())),
+                &mut required,
+            )
+        };
+        match result {
+            Ok(()) => {
+                let length = usize::try_from(required)
+                    .map_err(|_| RestoreError::new("restore_hostname_unavailable"))?;
+                let value = buffer
+                    .get(..length)
+                    .ok_or_else(|| RestoreError::new("restore_hostname_unavailable"))?;
+                return decode_restic_hostname(value);
+            }
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_MORE_DATA.0) => {
+                let required = usize::try_from(required)
+                    .map_err(|_| RestoreError::new("restore_hostname_unavailable"))?;
+                // Windows includes the trailing NUL in its required capacity.
+                // Any UTF-16 value larger than this cannot meet the strict
+                // UTF-8-byte bound imposed on exposed snapshot hostnames.
+                if required <= buffer.len() || required > MAX_RESTORE_HOSTNAME_BYTES + 1 {
+                    return Err(RestoreError::new("restore_hostname_unavailable"));
+                }
+                buffer.resize(required, 0);
+            }
+            Err(_) => return Err(RestoreError::new("restore_hostname_unavailable")),
+        }
+    }
+}
+
+fn decode_restic_hostname(value: &[u16]) -> Result<String, RestoreError> {
+    let hostname =
+        String::from_utf16(value).map_err(|_| RestoreError::new("restore_hostname_unavailable"))?;
+    if hostname.is_empty()
+        || hostname.len() > MAX_RESTORE_HOSTNAME_BYTES
+        || hostname.chars().any(char::is_control)
+    {
+        return Err(RestoreError::new("restore_hostname_unavailable"));
+    }
+    Ok(hostname)
 }
 
 fn command_for(
@@ -996,6 +2303,22 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> Vec<u8> {
         .read_to_end(&mut output);
     drain(reader);
     output
+}
+
+fn read_bounded_with_overflow(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
+    let mut output = Vec::with_capacity(limit.min(8 * 1024));
+    let maximum = u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX);
+    let read_failed = reader
+        .by_ref()
+        .take(maximum)
+        .read_to_end(&mut output)
+        .is_err();
+    let overflow = read_failed || output.len() > limit;
+    if output.len() > limit {
+        output.truncate(limit);
+    }
+    drain(reader);
+    (output, overflow)
 }
 
 fn classify_stderr(stderr: &[u8]) -> Option<&'static str> {
@@ -1357,6 +2680,61 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn restic_hostname_preserves_physical_dns_names_beyond_the_netbios_limit() {
+        let dns_hostname = "1358B227-E6DF-42B8-B03A-F5EB8D629D10";
+        let legacy_computer_name = "1358B227-E6DF-4";
+        let encoded: Vec<_> = dns_hostname.encode_utf16().collect();
+
+        let decoded = decode_restic_hostname(&encoded).expect("valid physical DNS hostname");
+
+        assert_eq!(decoded, dns_hostname);
+        assert_ne!(decoded, legacy_computer_name);
+    }
+
+    #[test]
+    fn restic_hostname_rejects_invalid_utf16_controls_and_oversized_utf8() {
+        let oversized: Vec<_> = "é".repeat(128).encode_utf16().collect();
+        let control: Vec<_> = "backup\nhost".encode_utf16().collect();
+
+        for value in [
+            &[][..],
+            &[0xD800][..],
+            control.as_slice(),
+            oversized.as_slice(),
+        ] {
+            assert_eq!(
+                decode_restic_hostname(value)
+                    .expect_err("invalid hostname must fail closed")
+                    .code,
+                "restore_hostname_unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn restic_hostname_matches_windows_physical_dns_hostname_exactly() {
+        let mut buffer = [0_u16; MAX_RESTORE_HOSTNAME_BYTES + 1];
+        let mut length = u32::try_from(buffer.len()).expect("bounded hostname buffer");
+        // SAFETY: the fixed buffer has the advertised UTF-16 capacity.
+        unsafe {
+            GetComputerNameExW(
+                ComputerNamePhysicalDnsHostname,
+                Some(PWSTR(buffer.as_mut_ptr())),
+                &mut length,
+            )
+        }
+        .expect("physical Windows DNS hostname");
+        let length = usize::try_from(length).expect("bounded Windows hostname length");
+        let expected = String::from_utf16(&buffer[..length]).expect("valid Windows DNS hostname");
+
+        assert_eq!(
+            current_restic_hostname().expect("restic physical DNS hostname"),
+            expected,
+            "restic snapshots must use Go's physical DNS identity, including its casing"
+        );
+    }
+
     #[derive(Debug)]
     struct MapSecretResolver(BTreeMap<String, String>);
 
@@ -1582,6 +2960,379 @@ mod tests {
         assert!(!is_finalized_repository_lock_name(OsStr::new(
             "not-a-restic-lock"
         )));
+    }
+
+    #[test]
+    fn directory_listing_accepts_only_immediate_regular_files_and_directories() {
+        let output = concat!(
+            "{\"id\":\"snapshot metadata\"}\n",
+            "{\"name\":\"docs\",\"path\":\"/docs\",\"type\":\"dir\",\"mtime\":\"2026-08-24T12:00:00Z\"}\n",
+            "{\"name\":\"report [2025].txt\",\"path\":\"/report [2025].txt\",\"type\":\"file\",\"size\":42}\n",
+            "{\"name\":\"link\",\"path\":\"/link\",\"type\":\"symlink\"}\n",
+            "{\"name\":\"nested\",\"path\":\"/docs/nested\",\"type\":\"file\"}\n"
+        );
+        let entries = parse_restore_directory(output.as_bytes(), "/")
+            .expect("bounded immediate directory listing");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].node_type, RestoreNodeType::Directory);
+        assert_eq!(entries[1].node_type, RestoreNodeType::File);
+        assert_eq!(entries[1].size, Some(42));
+    }
+
+    #[test]
+    fn directory_listing_rejects_forged_or_unsafe_entry_names() {
+        for output in [
+            "{\"name\":\"wrong\",\"path\":\"/actual\",\"type\":\"file\"}\n",
+            "{\"name\":\"..\",\"path\":\"/..\",\"type\":\"dir\"}\n",
+            "{\"name\":\"hidden\",\"path\":\"/hidden\"}\n",
+            "not-json\n",
+        ] {
+            assert_eq!(
+                parse_restore_directory(output.as_bytes(), "/"),
+                Err(RestoreError::new("restore_directory_output_invalid"))
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_restore_preflight_rejects_hidden_links_devices_and_missing_nodes() {
+        let safe = concat!(
+            "{\"id\":\"snapshot metadata\"}\n",
+            "{\"name\":\"docs\",\"path\":\"/docs\",\"type\":\"dir\"}\n",
+            "{\"name\":\"report.txt\",\"path\":\"/docs/report.txt\",\"type\":\"file\"}\n"
+        );
+        assert_eq!(validate_restore_subtree(safe.as_bytes(), "/docs"), Ok(()));
+        for kind in ["symlink", "dev", "chardev", "fifo", "socket"] {
+            let unsafe_tree = format!(
+                "{safe}{{\"name\":\"hidden\",\"path\":\"/docs/hidden\",\"type\":\"{kind}\"}}\n"
+            );
+            assert_eq!(
+                validate_restore_subtree(unsafe_tree.as_bytes(), "/docs"),
+                Err(RestoreError::new("restore_unsupported_node")),
+                "hidden {kind}"
+            );
+        }
+        assert_eq!(
+            validate_restore_subtree(safe.as_bytes(), "/missing"),
+            Err(RestoreError::new("restore_selected_node_unavailable"))
+        );
+        let malformed = format!("{safe}{{\"name\":\"hidden\",\"path\":\"/docs/hidden\"}}\n");
+        assert_eq!(
+            validate_restore_subtree(malformed.as_bytes(), "/docs"),
+            Err(RestoreError::new("restore_subtree_preflight_failed"))
+        );
+    }
+
+    #[test]
+    fn recursive_restore_preflight_streams_large_normal_directories() {
+        let stem = "a".repeat(900);
+        let mut listing = String::from("{\"name\":\"docs\",\"path\":\"/docs\",\"type\":\"dir\"}\n");
+        for index in 0..5_000_u16 {
+            let name = format!("{index:04}-{stem}.txt");
+            listing.push_str(&format!(
+                "{{\"name\":\"{name}\",\"path\":\"/docs/{name}\",\"type\":\"file\"}}\n"
+            ));
+        }
+        assert!(listing.len() > MAX_RESTORE_OUTPUT_BYTES);
+        assert!(listing.lines().count() > MAX_RESTORE_DIRECTORY_ENTRIES);
+        assert_eq!(
+            validate_restore_subtree_reader(&mut BufReader::new(listing.as_bytes()), "/docs"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn restore_destination_must_be_local_existing_and_outside_protected_state() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = ordinary_windows_path(
+            &fs::canonicalize(temporary.path()).expect("canonical temporary root"),
+        );
+        let safe = root.join("recovered");
+        let protected = root.join("service-data");
+        fs::create_dir(&safe).expect("safe destination");
+        fs::create_dir(&protected).expect("protected service data");
+        assert_eq!(
+            validate_restore_destination(&safe, &protected, OsStr::new("unused.exe")),
+            Ok(safe.clone())
+        );
+        assert_eq!(
+            validate_restore_destination(&protected, &protected, OsStr::new("unused.exe")),
+            Err(RestoreError::new("restore_destination_protected"))
+        );
+        assert_eq!(
+            validate_restore_destination(
+                Path::new("relative"),
+                &protected,
+                OsStr::new("unused.exe")
+            ),
+            Err(RestoreError::new("restore_destination_invalid"))
+        );
+        assert_eq!(
+            validate_restore_destination(
+                &root.join("missing"),
+                &protected,
+                OsStr::new("unused.exe")
+            ),
+            Err(RestoreError::new("restore_destination_unavailable"))
+        );
+        let first = create_restore_destination(&safe).expect("first unique restore destination");
+        let second = create_restore_destination(&safe).expect("second unique restore destination");
+        assert_ne!(first, second);
+        assert!(first.is_dir() && second.is_dir());
+    }
+
+    #[test]
+    fn restore_directory_locks_prevent_rename_and_reparse_replacement() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = ordinary_windows_path(
+            &fs::canonicalize(temporary.path()).expect("canonical temporary root"),
+        );
+        let parent = root.join("parent");
+        fs::create_dir(&parent).expect("destination parent");
+        let destination = create_restore_destination(&parent).expect("unique child");
+        let parent_lock = lock_restore_directory(&parent).expect("lock parent against deletion");
+        let child_lock =
+            lock_restore_directory(&destination).expect("lock child against reparse replacement");
+
+        assert!(fs::rename(&parent, root.join("moved-parent")).is_err());
+        assert!(fs::rename(&destination, parent.join("moved-child")).is_err());
+        assert!(fs::remove_dir(&destination).is_err());
+
+        drop(child_lock);
+        drop(parent_lock);
+        fs::rename(&destination, parent.join("moved-child"))
+            .expect("closed handles release the destination lock");
+    }
+
+    #[test]
+    fn restored_children_are_protected_until_completed_parent_acl_handoff() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = ordinary_windows_path(
+            &fs::canonicalize(temporary.path()).expect("canonical temporary root"),
+        );
+        let parent = root.join("parent");
+        fs::create_dir(&parent).expect("restore destination parent");
+        let parent_lock = lock_restore_directory(&parent).expect("locked destination parent");
+        let destination = create_restore_destination(&parent).expect("protected restore child");
+        let destination_lock = lock_restore_directory_for_handoff(&destination)
+            .expect("destination handle with WRITE_DAC");
+        verify_protected_restore_directory(&parent_lock, &destination_lock)
+            .expect("restic must start with a protected LocalSystem directory");
+
+        let nested = destination.join("nested");
+        fs::create_dir(&nested).expect("nested restored directory");
+        let restored_file = nested.join("document.txt");
+        fs::write(&restored_file, b"restored contents\n").expect("service-owned restored contents");
+
+        handoff_restore_directory(&parent_lock, &destination_lock)
+            .expect("completed restore must inherit the chosen parent ACL");
+        let (destination_descriptor, _) = directory_security(&destination_lock)
+            .expect("handed-off destination security descriptor");
+        assert!(
+            !directory_security_is_protected(&destination_descriptor)
+                .expect("handed-off inheritance control"),
+            "the completed restore must resume inheriting its chosen parent ACL"
+        );
+        assert_eq!(
+            fs::read(&restored_file).expect("handed-off nested file is readable"),
+            b"restored contents\n"
+        );
+    }
+
+    #[test]
+    fn failed_restore_termination_never_hands_off_or_exposes_partial_output() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = ordinary_windows_path(
+            &fs::canonicalize(temporary.path()).expect("canonical temporary root"),
+        );
+        let parent = root.join("parent");
+        fs::create_dir(&parent).expect("restore destination parent");
+        let parent_lock = lock_restore_directory(&parent).expect("locked destination parent");
+        let destination = create_restore_destination(&parent).expect("protected recovery child");
+        let destination_lock = lock_restore_directory_for_handoff(&destination)
+            .expect("locked protected recovery child");
+        verify_protected_restore_directory(&parent_lock, &destination_lock)
+            .expect("authenticated LocalSystem recovery destination");
+
+        let failure = finish_restore_destination(
+            &parent_lock,
+            &destination_lock,
+            RestoreOutcome::failed_at("restic_termination_failed", Some(destination.clone())),
+            Some(destination.clone()),
+        );
+        assert_eq!(
+            failure.kind,
+            RestoreOutcomeKind::Failed {
+                code: "restic_termination_failed".to_owned()
+            }
+        );
+        assert!(
+            failure.destination.is_none(),
+            "untrusted partial recovery output must not be advertised to the requester"
+        );
+        verify_protected_restore_directory(&parent_lock, &destination_lock)
+            .expect("termination failure must preserve the original protected owner and ACL");
+        assert!(
+            fs::rename(&destination, parent.join("attacker-replacement")).is_err(),
+            "the quarantined worker must keep its no-delete child handle alive"
+        );
+        assert!(
+            fs::rename(&parent, root.join("attacker-parent")).is_err(),
+            "the quarantined worker must keep its no-delete parent handle alive"
+        );
+    }
+
+    fn test_descriptor_sddl(descriptor: &RestoreSecurityDescriptor) -> String {
+        let mut value = windows::core::PWSTR::null();
+        // SAFETY: the descriptor is live and Windows returns a LocalAlloc
+        // string owned by this helper until it is converted and freed.
+        unsafe {
+            windows::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.0,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &raw mut value,
+                None,
+            )
+        }
+        .expect("security descriptor SDDL");
+        let result = unsafe { value.to_string() }.expect("valid security descriptor SDDL");
+        let _ = unsafe { LocalFree(Some(HLOCAL(value.0.cast()))) };
+        result
+    }
+
+    #[test]
+    fn restore_handoff_inherits_only_inheritable_parent_permissions() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = ordinary_windows_path(
+            &fs::canonicalize(temporary.path()).expect("canonical temporary root"),
+        );
+        let parent = root.join("parent");
+        fs::create_dir(&parent).expect("restore destination parent");
+        let parent_lock =
+            lock_restore_directory_for_handoff(&parent).expect("parent handle with WRITE_DAC");
+        let parent_security = RestoreSecurityDescriptor::from_sddl(w!(
+            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)(A;OICI;FR;;;IU)(A;;FR;;;WD)"
+        ))
+        .expect("parent descriptor with inheritable and parent-only principals");
+        let parent_dacl =
+            restore_descriptor_dacl(&parent_security).expect("parent fixture descriptor DACL");
+        // Everyone can read the parent itself but is deliberately forbidden
+        // from inheriting access to recovered child data.
+        unsafe {
+            SetSecurityInfo(
+                HANDLE(parent_lock.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION
+                    | windows::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(parent_dacl.cast_const()),
+                None,
+            )
+        }
+        .ok()
+        .expect("custom parent-only Everyone ACE");
+
+        let destination = create_restore_destination(&parent).expect("trusted child");
+        let destination_lock = lock_restore_directory_for_handoff(&destination)
+            .expect("trusted child security handle");
+        verify_protected_restore_directory(&parent_lock, &destination_lock)
+            .expect("authenticated protected restore destination");
+        let nested = destination.join("nested");
+        fs::create_dir(&nested).expect("nested recovered directory");
+        let recovered = nested.join("recovered.txt");
+        fs::write(&recovered, b"private restored content\n").expect("private recovery fixture");
+
+        handoff_restore_directory(&parent_lock, &destination_lock)
+            .expect("ordinary parent inheritance handoff");
+        let (destination_descriptor, _) =
+            directory_security(&destination_lock).expect("handed-off child descriptor");
+        let destination_sddl = test_descriptor_sddl(&destination_descriptor);
+        assert!(
+            destination_sddl.contains(";;;IU)"),
+            "inheritable interactive-user access must reach the restored root: {destination_sddl}"
+        );
+        assert!(
+            !destination_sddl.contains(";;;WD)"),
+            "parent-only Everyone access must not reach private recovered data: {destination_sddl}"
+        );
+
+        let nested_lock = lock_restore_directory(&nested).expect("nested recovered directory");
+        let (nested_descriptor, _) =
+            directory_security(&nested_lock).expect("handed-off nested directory descriptor");
+        let nested_sddl = test_descriptor_sddl(&nested_descriptor);
+        assert!(
+            nested_sddl.contains(";;;IU)") && !nested_sddl.contains(";;;WD)"),
+            "inheritable interactive access must propagate without parent-only access: {nested_sddl}"
+        );
+        assert_eq!(
+            fs::read(&recovered).expect("readable recovered contents"),
+            b"private restored content\n"
+        );
+    }
+
+    #[test]
+    fn protected_restore_destination_rejects_a_substituted_untrusted_directory() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = ordinary_windows_path(
+            &fs::canonicalize(temporary.path()).expect("canonical temporary root"),
+        );
+        let parent = root.join("parent");
+        fs::create_dir(&parent).expect("restore destination parent");
+        let parent_lock = lock_restore_directory(&parent).expect("locked destination parent");
+        let destination = create_restore_destination(&parent).expect("trusted restore child");
+
+        // FILE_DELETE_CHILD on a writable parent can replace even a protected
+        // child before its no-delete handle is opened. A protected bit alone
+        // must never authenticate that replacement.
+        fs::remove_dir(&destination).expect("simulate parent-owner child replacement");
+        let untrusted = RestoreSecurityDescriptor::from_sddl(w!(
+            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)(A;OICI;FA;;;WD)"
+        ))
+        .expect("attacker-controlled protected directory descriptor");
+        let attributes = untrusted.attributes();
+        let path_wide: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe { CreateDirectoryW(PCWSTR(path_wide.as_ptr()), Some(&raw const attributes)) }
+            .expect("attacker-controlled protected replacement");
+        let destination_lock = lock_restore_directory_for_handoff(&destination)
+            .expect("lock the substituted child before inspecting its actual identity");
+        assert_eq!(
+            verify_protected_restore_directory(&parent_lock, &destination_lock),
+            Err(RestoreError::new("restore_destination_security_failed")),
+            "a protected replacement with an extra writable principal must be rejected"
+        );
+
+        let expected =
+            RestoreSecurityDescriptor::from_sddl(w!("O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"))
+                .expect("production SYSTEM-owned security descriptor");
+        let forged_owner =
+            RestoreSecurityDescriptor::from_sddl(w!("O:BAG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"))
+                .expect("substituted administrator-owned security descriptor");
+        let system_owner = restore_descriptor_owner(&expected).expect("SYSTEM owner SID");
+        assert_eq!(
+            verify_restore_security_descriptor(&forged_owner, &expected, system_owner),
+            Err(RestoreError::new("restore_destination_security_failed")),
+            "an exact privileged ACL must still be rejected when the owner is not SYSTEM"
+        );
+    }
+
+    #[test]
+    fn restore_progress_is_parsed_without_retaining_sensitive_output() {
+        let output = concat!(
+            "{\"message_type\":\"status\",\"files_restored\":1,\"bytes_restored\":20,\"total_files\":2,\"total_bytes\":42}\n",
+            "{\"message_type\":\"summary\",\"files_restored\":2,\"bytes_restored\":42}\n"
+        );
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let summary = read_restore_output(output.as_bytes(), &sender).expect("restore output");
+        assert_eq!(summary.files_restored, Some(2));
+        assert_eq!(summary.bytes_restored, Some(42));
+        assert_eq!(summary.total_files, Some(2));
+        assert_eq!(receiver.try_iter().count(), 2);
     }
 
     fn wait_until_process_is_unobservable(pid: u32) {
@@ -1990,6 +3741,32 @@ mod tests {
                 code: "repository_operation_timed_out".to_owned()
             }
         );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn restore_operation_has_a_hard_timeout_and_releases_its_process_tree() {
+        let mut invocation = powershell_invocation("Start-Sleep -Seconds 30");
+        invocation.operation = ResticOperation::Restore;
+        let runner = executor(BTreeMap::new());
+        let destination = PathBuf::from(r"C:\Recovery\Fresh");
+        let started = Instant::now();
+
+        let outcome = runner.execute_restore_invocation(
+            &invocation,
+            Duration::from_millis(200),
+            Some(destination.clone()),
+            &CancellationToken::default(),
+            |_| {},
+        );
+
+        assert_eq!(
+            outcome.kind,
+            RestoreOutcomeKind::Failed {
+                code: "restore_timed_out".to_owned()
+            }
+        );
+        assert_eq!(outcome.destination, Some(destination));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -2499,6 +4276,27 @@ C:\Missing Source does not exist, skipping
         fs::create_dir(&stale_cache_directory).expect("stale cache namespace fixture");
         age_cache_directory_for_cleanup(&stale_cache_directory);
         fs::write(source.join("document.txt"), b"first version\n").expect("initial source file");
+        fs::write(source.join("report [2025].txt"), b"glob-like literal\n")
+            .expect("glob-like source filename");
+        let nested_source = source.join("folder [one]");
+        fs::create_dir(&nested_source).expect("nested source directory");
+        fs::write(
+            nested_source.join("r\u{00e9}sum\u{00e9}.txt"),
+            b"nested unicode document\n",
+        )
+        .expect("nested Unicode source filename");
+        let unsafe_source = source.join("unsafe links");
+        fs::create_dir(&unsafe_source).expect("unsafe-node source directory");
+        let unsafe_link_created = match std::os::windows::fs::symlink_file(
+            source.join("document.txt"),
+            unsafe_source.join("hidden-link.txt"),
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("skipping real-restic symbolic-link fixture: {error}");
+                false
+            }
+        };
         let internal_sentinel = "resticpal-internal-sentinel-must-never-be-backed-up.txt";
         fs::write(data_directory.join(internal_sentinel), b"internal state\n")
             .expect("internal data exclusion fixture");
@@ -2654,6 +4452,189 @@ C:\Missing Source does not exist, skipping
             repository_cache_directories(&cache_directory),
             first_cache_directories,
             "successive backups must reuse the repository's persistent cache namespace"
+        );
+
+        let mut lowercase_source = source.to_string_lossy().into_owned();
+        let lowercase_drive = lowercase_source
+            .chars()
+            .next()
+            .expect("absolute Windows source drive")
+            .to_ascii_lowercase();
+        lowercase_source.replace_range(0..1, &lowercase_drive.to_string());
+        config.backup.paths = vec![PathBuf::from(&lowercase_source)];
+        let lowercase_backup =
+            execute_real_backup(&runner, &restic, &config, &cancellation, use_vss);
+        assert_eq!(lowercase_backup.kind, BackupOutcomeKind::Succeeded);
+        let lowercase_snapshot_id = lowercase_backup
+            .summary
+            .and_then(|summary| summary.snapshot_id)
+            .expect("lowercase-drive exact snapshot id");
+
+        let snapshots = runner
+            .list_snapshots(&config, &cancellation)
+            .expect("bounded current-host append-only snapshot query");
+        assert!(snapshots.len() >= 3);
+        assert!(
+            snapshots
+                .windows(2)
+                .all(|pair| pair[0].time >= pair[1].time)
+        );
+        assert!(snapshots.iter().all(|snapshot| {
+            snapshot.hostname.eq_ignore_ascii_case(
+                &current_restic_hostname().expect("restic physical DNS hostname"),
+            )
+        }));
+        let lowercase_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == lowercase_snapshot_id)
+            .expect("current-host lowercase-drive snapshot");
+        assert!(
+            lowercase_snapshot
+                .paths
+                .iter()
+                .any(|path| path.starts_with(&format!("{lowercase_drive}:"))),
+            "snapshot source metadata must preserve the configured drive-letter case"
+        );
+        let snapshot_id = lowercase_snapshot_id.as_str();
+        let mut directory = "/".to_owned();
+        let source_entries = loop {
+            let entries = runner
+                .list_directory(&config, snapshot_id, &directory, &cancellation)
+                .expect("lazy one-directory snapshot listing");
+            if directory == "/" {
+                assert!(
+                    entries
+                        .iter()
+                        .any(|entry| entry.path == format!("/{lowercase_drive}")),
+                    "snapshot directory browsing must preserve its actual lowercase drive path"
+                );
+            }
+            if entries.iter().any(|entry| entry.name == "document.txt") {
+                break entries;
+            }
+            let children: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.node_type == RestoreNodeType::Directory)
+                .collect();
+            assert_eq!(
+                children.len(),
+                1,
+                "snapshot source ancestors should be unambiguous"
+            );
+            directory = children[0].path.clone();
+        };
+        let recovered = temporary_root.join("recovered");
+        fs::create_dir(&recovered).expect("restore destination parent");
+        let sentinel = recovered.join("never-overwrite.txt");
+        fs::write(&sentinel, b"keep me\n").expect("unrelated restore parent sentinel");
+        if unsafe_link_created {
+            let unsafe_entry = source_entries
+                .iter()
+                .find(|entry| entry.name == "unsafe links")
+                .expect("unsafe directory must remain visible without exposing its link");
+            let original_destination_entries = fs::read_dir(&recovered)
+                .expect("original restore parent contents")
+                .count();
+            let rejected = runner.restore(
+                &config,
+                snapshot_id,
+                &unsafe_entry.path,
+                &recovered,
+                &cancellation,
+                |_| {},
+            );
+            assert_eq!(
+                rejected.kind,
+                RestoreOutcomeKind::Failed {
+                    code: "restore_unsupported_node".to_owned()
+                },
+                "a hidden symbolic-link descendant must fail the real-restic subtree preflight"
+            );
+            assert!(
+                rejected.destination.is_none(),
+                "unsafe-subtree rejection must occur before allocating a restore destination"
+            );
+            assert_eq!(
+                fs::read_dir(&recovered)
+                    .expect("restore parent contents after unsafe rejection")
+                    .count(),
+                original_destination_entries,
+                "unsafe-subtree rejection must not create any output directory"
+            );
+            assert_eq!(
+                fs::read(&sentinel).expect("sentinel after unsafe rejection"),
+                b"keep me\n"
+            );
+        }
+        for (name, expected_relative, expected_content) in [
+            (
+                "report [2025].txt",
+                PathBuf::from("report [2025].txt"),
+                b"glob-like literal\n".as_slice(),
+            ),
+            (
+                "folder [one]",
+                PathBuf::from("folder [one]").join("r\u{00e9}sum\u{00e9}.txt"),
+                b"nested unicode document\n".as_slice(),
+            ),
+        ] {
+            let entry = source_entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .expect("selected snapshot file or directory");
+            let mut initial_destination = None;
+            let restored = runner.restore(
+                &config,
+                snapshot_id,
+                &entry.path,
+                &recovered,
+                &cancellation,
+                |progress| {
+                    if initial_destination.is_none() {
+                        initial_destination = progress.destination;
+                    }
+                },
+            );
+            assert_eq!(
+                restored.kind,
+                RestoreOutcomeKind::Succeeded,
+                "restoring {name}"
+            );
+            assert!(
+                restored.files_restored >= 1,
+                "restoring {name} must report at least one recovered file"
+            );
+            assert!(
+                restored.bytes_restored >= u64::try_from(expected_content.len()).unwrap(),
+                "restoring {name} must report its recovered byte count"
+            );
+            let destination = restored.destination.expect("unique restored destination");
+            assert_eq!(initial_destination, Some(destination.clone()));
+            assert_eq!(
+                fs::read(destination.join(expected_relative)).expect("restored contents"),
+                expected_content,
+                "restoring {name} must select only its literal subtree"
+            );
+            assert_eq!(repository_lock_count(&repository), 0);
+        }
+        assert_eq!(
+            fs::read(sentinel).expect("preserved sentinel"),
+            b"keep me\n"
+        );
+        assert_eq!(
+            runner
+                .restore(
+                    &config,
+                    snapshot_id,
+                    &source_entries[0].path,
+                    &data_directory,
+                    &cancellation,
+                    |_| {},
+                )
+                .kind,
+            RestoreOutcomeKind::Failed {
+                code: "restore_destination_protected".to_owned()
+            }
         );
 
         config.repository.mode = RepositoryMode::Standard;

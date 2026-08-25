@@ -46,6 +46,7 @@ pub struct LocalConfig {
     pub schedule: LocalScheduleConfig,
     pub retention: LocalRetentionConfig,
     pub updates: LocalUpdateConfig,
+    pub restore: LocalRestoreConfig,
     pub management: LocalManagementConfig,
 }
 
@@ -58,6 +59,7 @@ impl Default for LocalConfig {
             schedule: LocalScheduleConfig::default(),
             retention: LocalRetentionConfig::default(),
             updates: LocalUpdateConfig::default(),
+            restore: LocalRestoreConfig::default(),
             management: LocalManagementConfig::default(),
         }
     }
@@ -128,6 +130,14 @@ pub struct LocalUpdateConfig {
     /// Install strictly signed product updates in the background through the
     /// LocalSystem service. This remains opt-in for existing installations.
     pub automatic_install: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalRestoreConfig {
+    /// Permit an administrator to browse snapshots and restore their contents.
+    /// Managed installations require an explicit schema-v3 policy grant.
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +352,8 @@ pub struct EffectiveConfig {
     pub schedule: ScheduleConfig,
     pub retention: RetentionConfig,
     pub updates: UpdateConfig,
+    #[serde(default)]
+    pub restore: RestoreConfig,
 }
 
 impl EffectiveConfig {
@@ -540,6 +552,19 @@ pub struct UpdateConfig {
     pub automatic_install: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreConfig {
+    /// Standalone installations allow administrator-controlled restores.
+    /// Managed policy resolution separately denies restores without a grant.
+    pub enabled: bool,
+}
+
+impl Default for RestoreConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 fn is_valid_option_name(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -666,6 +691,7 @@ mod tests {
         assert_eq!(config.retention.yearly, 3);
         assert_eq!(config.retention.prune_interval_days, 7);
         assert!(!config.updates.automatic_install);
+        assert!(config.restore.enabled);
     }
 
     #[test]
@@ -808,6 +834,7 @@ mod tests {
         assert_eq!(config.schedule.interval_hours, None);
         assert_eq!(config.repository.mode, Some(RepositoryMode::AppendOnly));
         assert_eq!(config.updates.automatic_install, None);
+        assert_eq!(config.restore.enabled, None);
     }
 
     #[test]
@@ -828,6 +855,38 @@ mod tests {
         let serialized = config.to_toml_pretty().expect("configuration serializes");
         assert!(serialized.contains("schema_version = 1"));
         assert!(serialized.contains("automatic_install = true"));
+    }
+
+    #[test]
+    fn parses_local_restore_setting_as_an_explicit_override() {
+        let config = LocalConfig::from_toml(
+            r#"
+                schema_version = 1
+
+                [restore]
+                enabled = false
+            "#,
+        )
+        .expect("local restore configuration should parse");
+
+        assert_eq!(config.restore.enabled, Some(false));
+        let serialized = config.to_toml_pretty().expect("configuration serializes");
+        assert!(serialized.contains("[restore]"));
+        assert!(serialized.contains("enabled = false"));
+    }
+
+    #[test]
+    fn older_effective_configuration_defaults_restore_to_enabled() {
+        let mut serialized =
+            serde_json::to_value(EffectiveConfig::default()).expect("effective config serializes");
+        serialized
+            .as_object_mut()
+            .expect("effective config is an object")
+            .remove("restore");
+
+        let restored: EffectiveConfig =
+            serde_json::from_value(serialized).expect("older effective config should deserialize");
+        assert!(restored.restore.enabled);
     }
 
     #[test]
@@ -927,6 +986,7 @@ mod tests {
             .expect("checked-in example should stay valid");
 
         assert_eq!(config.repository.mode, Some(RepositoryMode::AppendOnly));
+        assert_eq!(config.restore.enabled, Some(true));
         assert_eq!(
             config
                 .repository

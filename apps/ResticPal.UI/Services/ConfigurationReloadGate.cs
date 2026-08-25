@@ -9,7 +9,8 @@ internal enum ConfigurationPageKind
     Schedule = 1 << 2,
     Retention = 1 << 3,
     Updates = 1 << 4,
-    All = Sources | Repository | Schedule | Retention | Updates,
+    Restore = 1 << 5,
+    All = Sources | Repository | Schedule | Retention | Updates | Restore,
 }
 
 /// <summary>

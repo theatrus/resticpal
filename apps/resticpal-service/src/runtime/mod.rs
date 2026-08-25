@@ -16,11 +16,13 @@ mod events;
 mod helpers;
 mod ipc;
 mod lifecycle;
+mod restore;
 mod scheduler;
 mod state;
 
 pub(crate) use enrollment::ManagedPolicyApplyOutcome;
-pub use events::{RuntimeEvent, ScheduleAction};
+pub use events::{RestoreQueryOutcome, RestoreQueryRequest, RuntimeEvent, ScheduleAction};
+pub(crate) use restore::restore_failure_message;
 pub use state::ServiceRuntime;
 
 #[cfg(test)]

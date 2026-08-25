@@ -6,9 +6,9 @@ using System.Text.Json.Serialization;
 
 namespace ResticPal.UI.Services;
 
-internal sealed class ResticPalServiceClient
+internal sealed partial class ResticPalServiceClient
 {
-    private const int ProtocolVersion = 4;
+    private const int ProtocolVersion = 5;
     private const int MaxFrameBytes = 1024 * 1024;
     private static long _nextRequestId;
 
@@ -521,10 +521,11 @@ internal sealed class ResticPalServiceClient
         timeout.CancelAfter(requestTimeout ?? TimeSpan.FromSeconds(2));
         await using var pipe = new NamedPipeClientStream(
             ".",
-            "ResticPal.v4",
+            "ResticPal.v5",
             PipeDirection.InOut,
             PipeOptions.Asynchronous);
         await pipe.ConnectAsync(timeout.Token);
+        ServicePipeIdentity.Verify(pipe);
 
         byte[] header = new byte[sizeof(uint)];
         BinaryPrimitives.WriteUInt32LittleEndian(header, checked((uint)payload.Length));

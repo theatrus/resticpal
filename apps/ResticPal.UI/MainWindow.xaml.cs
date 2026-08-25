@@ -38,6 +38,7 @@ public sealed partial class MainWindow : Window
         _showOnboarding = showOnboarding;
         _showUpdates = showUpdates;
         InitializeComponent();
+        InitializeRestoreTracking();
         BackupPaths.CollectionChanged += (_, _) => RefreshSourcesControlState();
         RefreshConfigurationControlStates();
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "resticpal.ico"));
@@ -46,6 +47,7 @@ public sealed partial class MainWindow : Window
         Closed += (_, _) =>
         {
             _statusRefreshTimer.Stop();
+            StopRestoreTracking();
             _updates.Dispose();
         };
         UpdateStatusDescription.Text =
@@ -86,6 +88,7 @@ public sealed partial class MainWindow : Window
         SchedulePanel.Visibility = tag == "schedule" ? Visibility.Visible : Visibility.Collapsed;
         RetentionPanel.Visibility = tag == "retention" ? Visibility.Visible : Visibility.Collapsed;
         HistoryPanel.Visibility = tag == "history" ? Visibility.Visible : Visibility.Collapsed;
+        RestorePanel.Visibility = tag == "restore" ? Visibility.Visible : Visibility.Collapsed;
         DiagnosticsPanel.Visibility = tag == "diagnostics" ? Visibility.Visible : Visibility.Collapsed;
         ManagementPanel.Visibility = tag == "settings" ? Visibility.Visible : Visibility.Collapsed;
 
@@ -112,6 +115,12 @@ public sealed partial class MainWindow : Window
         else if (tag == "history" && !_historyLoaded)
         {
             await LoadHistoryAsync();
+        }
+        else if (tag == "restore")
+        {
+            // Repository snapshots change whenever a backup completes. Re-entering
+            // recovery must not preserve an earlier empty or stale inventory.
+            await LoadRestorePageAsync(refreshSnapshots: true);
         }
         else if (tag == "diagnostics" && !_diagnosticsLoaded)
         {
@@ -313,6 +322,16 @@ public sealed partial class MainWindow : Window
                         await LoadUpdateSettingsAsync();
                         return _updateSettingsLoaded;
                     });
+                await ReloadPendingConfigurationPageAsync(
+                    ConfigurationPageKind.Restore,
+                    hasUnsavedChanges: false,
+                    discardEdits: discardEdits,
+                    async () =>
+                    {
+                        _restoreSettingsLoaded = false;
+                        await LoadRestoreSettingsAsync();
+                        return _restoreSettingsLoaded;
+                    });
             }
             finally
             {
@@ -366,6 +385,10 @@ public sealed partial class MainWindow : Window
         {
             pages |= ConfigurationPageKind.Retention;
         }
+        if (_restoreSettingsLoaded || RestorePanel.Visibility == Visibility.Visible)
+        {
+            pages |= ConfigurationPageKind.Restore;
+        }
         return pages;
     }
 
@@ -386,6 +409,9 @@ public sealed partial class MainWindow : Window
             RetentionHasUnsavedChanges());
         AddIfReloadable(
             ConfigurationPageKind.Updates,
+            hasUnsavedChanges: false);
+        AddIfReloadable(
+            ConfigurationPageKind.Restore,
             hasUnsavedChanges: false);
         return pages;
 
@@ -422,6 +448,7 @@ public sealed partial class MainWindow : Window
         || ConfigurationPageOperationActive("repository-")
         || ConfigurationPageOperationActive("schedule-")
         || ConfigurationPageOperationActive("retention-")
+        || ConfigurationPageOperationActive("restore-settings-")
         || ConfigurationPageOperationActive("update-settings-")
         || _updateSettingsBusyScopeCount > 0
         || _updateBusyScopeCount > 0;
@@ -463,6 +490,7 @@ public sealed partial class MainWindow : Window
         SetRepositoryBusy(false);
         SetScheduleBusy(false);
         SetRetentionBusy(false);
+        RefreshRestoreControlState();
         RefreshUpdateControlState();
     }
 

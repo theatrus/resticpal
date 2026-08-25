@@ -15,7 +15,8 @@ public sealed class ConfigurationReloadGateTests
             ConfigurationPageKind.Sources
             | ConfigurationPageKind.Schedule
             | ConfigurationPageKind.Retention
-            | ConfigurationPageKind.Updates);
+            | ConfigurationPageKind.Updates
+            | ConfigurationPageKind.Restore);
 
         Assert.Equal(ConfigurationPageKind.Repository, plan.PendingPages);
         Assert.True(plan.Needs(ConfigurationPageKind.Repository));
@@ -37,6 +38,7 @@ public sealed class ConfigurationReloadGateTests
         Assert.True(plan.Needs(ConfigurationPageKind.Repository));
         Assert.True(plan.Needs(ConfigurationPageKind.Retention));
         Assert.True(plan.Needs(ConfigurationPageKind.Updates));
+        Assert.True(plan.Needs(ConfigurationPageKind.Restore));
     }
 
     [Fact]
@@ -73,6 +75,35 @@ public sealed class ConfigurationReloadGateTests
         Assert.True(plan.Needs(ConfigurationPageKind.Schedule));
         Assert.True(plan.Needs(ConfigurationPageKind.Retention));
         Assert.True(plan.Needs(ConfigurationPageKind.Updates));
+        Assert.True(plan.Needs(ConfigurationPageKind.Restore));
+    }
+
+    [Fact]
+    public void RestorePolicyBecomesEligibleWhenItsPageIsOpened()
+    {
+        var plan = new ConfigurationPageSynchronizationPlan();
+        plan.Begin("managed-revision-1", force: false, ConfigurationPageKind.Updates);
+        plan.Complete(ConfigurationPageKind.Updates);
+
+        plan.Begin(
+            "managed-revision-1",
+            force: false,
+            ConfigurationPageKind.Updates | ConfigurationPageKind.Restore);
+
+        Assert.False(plan.Needs(ConfigurationPageKind.Updates));
+        Assert.True(plan.Needs(ConfigurationPageKind.Restore));
+    }
+
+    [Fact]
+    public void ManagedRevisionRechecksPreviouslyLoadedRestoreAccess()
+    {
+        var plan = new ConfigurationPageSynchronizationPlan();
+        plan.Begin("managed-revision-1", force: false, ConfigurationPageKind.Restore);
+        plan.Complete(ConfigurationPageKind.Restore);
+
+        plan.Begin("managed-revision-2", force: false, ConfigurationPageKind.Restore);
+
+        Assert.True(plan.Needs(ConfigurationPageKind.Restore));
     }
 
     [Fact]

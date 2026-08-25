@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{
-    ConfigValidationError, EffectiveConfig, RepositoryMode, SecretEnvironmentVariable,
-    repository_option_disables_source_snapshots,
+    ConfigValidationError, EffectiveConfig, MAX_PATH_CHARACTERS, RepositoryMode,
+    SecretEnvironmentVariable, repository_option_disables_source_snapshots,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +17,8 @@ pub enum ResticOperation {
     Unlock,
     Probe,
     Snapshots,
+    List,
+    Restore,
     Check,
     Initialize,
     Forget,
@@ -35,7 +37,13 @@ impl ResticOperation {
             RepositoryMode::AppendOnly => {
                 matches!(
                     self,
-                    Self::Backup | Self::Unlock | Self::Probe | Self::Snapshots | Self::Check
+                    Self::Backup
+                        | Self::Unlock
+                        | Self::Probe
+                        | Self::Snapshots
+                        | Self::List
+                        | Self::Restore
+                        | Self::Check
                 )
             }
         }
@@ -258,6 +266,99 @@ impl ResticCommandBuilder {
         })
     }
 
+    /// Lists exactly one directory from one unambiguous repository snapshot.
+    pub fn directory_listing(
+        &self,
+        config: &EffectiveConfig,
+        snapshot_id: &str,
+        path: &str,
+    ) -> Result<ResticInvocation, InvocationError> {
+        authorize_operation(config.repository.mode, ResticOperation::List)?;
+        validate_restore_snapshot_id(snapshot_id)?;
+        validate_restore_snapshot_path(path)?;
+        config.validate()?;
+        let repository = config
+            .repository
+            .url
+            .as_ref()
+            .ok_or(InvocationError::MissingRepository)?;
+        let mut arguments = repository_options(config);
+        arguments.extend([
+            OsString::from("ls"),
+            OsString::from("--json"),
+            OsString::from("--sort"),
+            OsString::from("name"),
+            OsString::from(snapshot_id),
+            OsString::from(path),
+        ]);
+        Ok(ResticInvocation {
+            operation: ResticOperation::List,
+            executable: self.executable.clone(),
+            arguments,
+            environment: BTreeMap::from([(
+                OsString::from("RESTIC_REPOSITORY"),
+                OsString::from(repository),
+            )]),
+            secret_environment: config.repository.secret_refs.clone(),
+        })
+    }
+
+    /// Restores one exact node into a newly-created destination. The snapshot
+    /// subtree syntax strips ancestors; an anchored, escaped include selects
+    /// the leaf without interpreting glob characters in real filenames.
+    pub fn restore(
+        &self,
+        config: &EffectiveConfig,
+        snapshot_id: &str,
+        path: &str,
+        destination: &Path,
+    ) -> Result<ResticInvocation, InvocationError> {
+        authorize_operation(config.repository.mode, ResticOperation::Restore)?;
+        validate_restore_snapshot_id(snapshot_id)?;
+        validate_restore_snapshot_path(path)?;
+        if path == "/" {
+            return Err(InvocationError::InvalidRestoreSnapshotPath);
+        }
+        if !destination.is_absolute() {
+            return Err(InvocationError::InvalidRestoreDestination);
+        }
+        config.validate()?;
+        let repository = config
+            .repository
+            .url
+            .as_ref()
+            .ok_or(InvocationError::MissingRepository)?;
+        let (parent, leaf) = path
+            .rsplit_once('/')
+            .ok_or(InvocationError::InvalidRestoreSnapshotPath)?;
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let selection = format!("{snapshot_id}:{parent}");
+        let include = format!("/{}", escape_restic_pattern_component(leaf));
+        let mut arguments = repository_options(config);
+        arguments.extend([
+            OsString::from("restore"),
+            OsString::from("--json"),
+            OsString::from("--verify"),
+            OsString::from("--overwrite"),
+            OsString::from("never"),
+            OsString::from("--target"),
+            destination.as_os_str().to_os_string(),
+            OsString::from("--include"),
+            OsString::from(include),
+            OsString::from(selection),
+        ]);
+        Ok(ResticInvocation {
+            operation: ResticOperation::Restore,
+            executable: self.executable.clone(),
+            arguments,
+            environment: BTreeMap::from([(
+                OsString::from("RESTIC_REPOSITORY"),
+                OsString::from(repository),
+            )]),
+            secret_environment: config.repository.secret_refs.clone(),
+        })
+    }
+
     pub fn retention(
         &self,
         config: &EffectiveConfig,
@@ -304,6 +405,48 @@ impl ResticCommandBuilder {
             secret_environment: config.repository.secret_refs.clone(),
         })
     }
+}
+
+pub fn validate_restore_snapshot_id(snapshot_id: &str) -> Result<(), InvocationError> {
+    if snapshot_id.len() != 64
+        || !snapshot_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(InvocationError::InvalidRestoreSnapshotId);
+    }
+    Ok(())
+}
+
+pub fn validate_restore_snapshot_path(path: &str) -> Result<(), InvocationError> {
+    if path.is_empty()
+        || path.len() > MAX_PATH_CHARACTERS
+        || !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path != "/"
+            && path
+                .split('/')
+                .skip(1)
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(InvocationError::InvalidRestoreSnapshotPath);
+    }
+    Ok(())
+}
+
+fn escape_restic_pattern_component(component: &str) -> String {
+    let mut escaped = String::with_capacity(component.len());
+    for character in component.chars() {
+        match character {
+            '*' => escaped.push_str("[*]"),
+            '?' => escaped.push_str("[?]"),
+            '[' => escaped.push_str("[[]"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 pub fn authorize_operation(
@@ -429,6 +572,12 @@ pub enum InvocationError {
     UnsupportedBackupSourceNamespace,
     #[error("network backup sources are not supported")]
     UnsupportedNetworkBackupSource,
+    #[error("restore requires one exact 64-character lowercase snapshot ID")]
+    InvalidRestoreSnapshotId,
+    #[error("restore requires a normalized absolute snapshot path")]
+    InvalidRestoreSnapshotPath,
+    #[error("restore requires an absolute local destination directory")]
+    InvalidRestoreDestination,
     #[error("{operation:?} is forbidden in repository mode {mode:?}")]
     ForbiddenByRepositoryMode {
         mode: RepositoryMode,
@@ -613,6 +762,8 @@ mod tests {
             ResticOperation::Unlock,
             ResticOperation::Probe,
             ResticOperation::Snapshots,
+            ResticOperation::List,
+            ResticOperation::Restore,
             ResticOperation::Check,
         ] {
             assert_eq!(
@@ -643,6 +794,96 @@ mod tests {
             );
             assert_eq!(invocation.secret_environment, config.repository.secret_refs);
         }
+    }
+
+    #[test]
+    fn snapshot_and_directory_restore_are_allowlisted_without_repository_mutations() {
+        let config = configured(RepositoryMode::AppendOnly);
+        let snapshot_id = "a".repeat(64);
+        let builder = ResticCommandBuilder::new("restic.exe");
+        let listing = builder
+            .directory_listing(&config, &snapshot_id, "/C/Users/Yann")
+            .expect("append-only snapshot browsing");
+        assert_eq!(listing.operation, ResticOperation::List);
+        assert_eq!(
+            listing.arguments,
+            [
+                "--option",
+                "s3.region=us-west-2",
+                "ls",
+                "--json",
+                "--sort",
+                "name",
+                snapshot_id.as_str(),
+                "/C/Users/Yann",
+            ]
+            .map(OsString::from)
+        );
+
+        let restore = builder
+            .restore(
+                &config,
+                &snapshot_id,
+                "/C/Users/Yann/report [2025]?.txt",
+                Path::new(r"C:\Recovery\Fresh"),
+            )
+            .expect("append-only safe restore");
+        assert_eq!(restore.operation, ResticOperation::Restore);
+        let arguments: Vec<_> = restore
+            .arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert!(arguments.contains(&"--verify".to_owned()));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--overwrite", "never"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--include", "/report [[]2025][?].txt"])
+        );
+        assert!(arguments.contains(&format!("{snapshot_id}:/C/Users/Yann")));
+        assert!(!arguments.iter().any(|argument| argument == "--delete"));
+    }
+
+    #[test]
+    fn restore_rejects_ambiguous_snapshot_ids_traversal_and_relative_destinations() {
+        let config = configured(RepositoryMode::AppendOnly);
+        let builder = ResticCommandBuilder::new("restic.exe");
+        for invalid in ["latest", "abc", &"A".repeat(64), &"g".repeat(64)] {
+            assert_eq!(
+                builder.directory_listing(&config, invalid, "/"),
+                Err(InvocationError::InvalidRestoreSnapshotId)
+            );
+        }
+        let snapshot_id = "a".repeat(64);
+        for invalid in [
+            "",
+            "relative",
+            "//server/share",
+            "/a/../b",
+            "/a/./b",
+            "/a//b",
+            "/a\\b",
+            "/a\n",
+        ] {
+            assert_eq!(
+                builder.directory_listing(&config, &snapshot_id, invalid),
+                Err(InvocationError::InvalidRestoreSnapshotPath),
+                "path {invalid:?}"
+            );
+        }
+        assert_eq!(
+            builder.restore(&config, &snapshot_id, "/file", Path::new("relative")),
+            Err(InvocationError::InvalidRestoreDestination)
+        );
+        assert_eq!(
+            builder.restore(&config, &snapshot_id, "/", Path::new(r"C:\Recovery")),
+            Err(InvocationError::InvalidRestoreSnapshotPath)
+        );
     }
 
     #[test]

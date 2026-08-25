@@ -28,15 +28,21 @@ use conditions::{SystemConditions, WinRtApartment};
 use config_store::LocalConfigStore;
 use executor::{
     BackupOutcome, CancellationToken, DpapiSecretResolver, RepositoryOutcome, ResticExecutor,
-    SecretResolver, SystemWakeLockProvider, UnavailableSecretResolver,
+    RestoreOutcome, RestoreOutcomeKind, SecretResolver, SystemWakeLockProvider,
+    UnavailableSecretResolver,
 };
 use resticpal_core::restic::ResticOperation;
 use resticpal_core::status::BackupState;
 use resticpal_protocol::DiagnosticLevel;
-use resticpal_protocol::{RepositoryOperationKind, UpdatePackage};
+use resticpal_protocol::{
+    RepositoryOperationKind, RestoreJobState, RestoreStatusView, UpdatePackage,
+};
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::{DEFAULT_PIPE_NAME, NamedPipeServer};
-use runtime::{ManagedPolicyApplyOutcome, RuntimeEvent, ScheduleAction, ServiceRuntime};
+use runtime::{
+    ManagedPolicyApplyOutcome, RestoreQueryOutcome, RestoreQueryRequest, RuntimeEvent,
+    ScheduleAction, ServiceRuntime,
+};
 use updater::UpdateInstallOutcome;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{
@@ -500,6 +506,8 @@ fn run_event_loop(
 ) {
     let mut active_backup: Option<CancellationToken> = None;
     let mut active_repository_operation: Option<CancellationToken> = None;
+    let mut active_restore_query: Option<(u64, CancellationToken)> = None;
+    let mut active_restore_job: Option<(u64, CancellationToken)> = None;
     evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
     loop {
         let delay = runtime.next_evaluation_delay(Utc::now());
@@ -522,11 +530,19 @@ fn run_event_loop(
                 if let Some(cancellation) = &active_repository_operation {
                     cancellation.cancel();
                 }
+                if let Some((_, cancellation)) = &active_restore_query {
+                    cancellation.cancel();
+                }
+                if let Some((_, cancellation)) = &active_restore_job {
+                    cancellation.cancel();
+                }
                 drain_cancelled_operations(
                     events,
                     &runtime,
                     &mut active_backup,
                     &mut active_repository_operation,
+                    &mut active_restore_query,
+                    &mut active_restore_job,
                 );
                 break;
             }
@@ -543,7 +559,11 @@ fn run_event_loop(
                 active_backup = None;
             }
             Ok(RuntimeEvent::RepositoryOperationRequested(operation)) => {
-                if active_backup.is_some() || active_repository_operation.is_some() {
+                if active_backup.is_some()
+                    || active_repository_operation.is_some()
+                    || active_restore_query.is_some()
+                    || active_restore_job.is_some()
+                {
                     runtime.finish_repository_operation(
                         operation,
                         &RepositoryOutcome::failed("repository_operation_conflict"),
@@ -574,7 +594,11 @@ fn run_event_loop(
                 evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
             }
             Ok(RuntimeEvent::UpdateInstallRequested(package)) => {
-                if active_backup.is_some() || active_repository_operation.is_some() {
+                if active_backup.is_some()
+                    || active_repository_operation.is_some()
+                    || active_restore_query.is_some()
+                    || active_restore_job.is_some()
+                {
                     runtime.finish_update_install(&UpdateInstallOutcome::Failed {
                         code: "update_operation_conflict",
                     });
@@ -590,6 +614,131 @@ fn run_event_loop(
             Ok(RuntimeEvent::UpdateInstallFinished(outcome)) => {
                 runtime.finish_update_install(&outcome);
                 evaluate_and_maybe_start(&runtime, &executor, &event_sender, &mut active_backup);
+            }
+            Ok(RuntimeEvent::RestoreQueryRequested { query_id, request }) => {
+                if active_backup.is_some()
+                    || active_repository_operation.is_some()
+                    || active_restore_query.is_some()
+                    || active_restore_job.is_some()
+                {
+                    runtime.finish_restore_query(
+                        query_id,
+                        RestoreQueryOutcome::Failed {
+                            code: "repository_operation_conflict".to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                let cancellation = CancellationToken::default();
+                active_restore_query = Some((query_id, cancellation.clone()));
+                if start_restore_query_worker(
+                    Arc::clone(&runtime),
+                    executor.clone(),
+                    query_id,
+                    request,
+                    cancellation,
+                    event_sender.clone(),
+                )
+                .is_err()
+                {
+                    runtime.finish_restore_query(
+                        query_id,
+                        RestoreQueryOutcome::Failed {
+                            code: "executor_start_failed".to_owned(),
+                        },
+                    );
+                    active_restore_query = None;
+                }
+            }
+            Ok(RuntimeEvent::RestoreQueryCancelled { query_id }) => {
+                if let Some((active_id, cancellation)) = &active_restore_query
+                    && *active_id == query_id
+                {
+                    cancellation.cancel();
+                }
+            }
+            Ok(RuntimeEvent::RestoreQueryFinished { query_id, outcome }) => {
+                if active_restore_query
+                    .as_ref()
+                    .is_some_and(|(active_id, _)| *active_id == query_id)
+                {
+                    runtime.finish_restore_query(query_id, outcome);
+                    active_restore_query = None;
+                    evaluate_and_maybe_start(
+                        &runtime,
+                        &executor,
+                        &event_sender,
+                        &mut active_backup,
+                    );
+                }
+            }
+            Ok(RuntimeEvent::RestoreRequested {
+                job_id,
+                snapshot_id,
+                path,
+                destination,
+            }) => {
+                if active_backup.is_some()
+                    || active_repository_operation.is_some()
+                    || active_restore_query.is_some()
+                    || active_restore_job.is_some()
+                {
+                    runtime.finish_restore(
+                        job_id,
+                        restore_outcome_status(
+                            job_id,
+                            RestoreOutcome::failed("repository_operation_conflict"),
+                        ),
+                    );
+                    continue;
+                }
+                let cancellation = CancellationToken::default();
+                active_restore_job = Some((job_id, cancellation.clone()));
+                if start_restore_worker(
+                    Arc::clone(&runtime),
+                    executor.clone(),
+                    job_id,
+                    RestoreSelection {
+                        snapshot_id,
+                        path,
+                        destination,
+                    },
+                    cancellation,
+                    event_sender.clone(),
+                )
+                .is_err()
+                {
+                    runtime.finish_restore(
+                        job_id,
+                        restore_outcome_status(
+                            job_id,
+                            RestoreOutcome::failed("executor_start_failed"),
+                        ),
+                    );
+                    active_restore_job = None;
+                }
+            }
+            Ok(RuntimeEvent::RestoreCancelled { job_id }) => {
+                if let Some((active_id, cancellation)) = &active_restore_job
+                    && *active_id == job_id
+                {
+                    cancellation.cancel();
+                }
+            }
+            Ok(RuntimeEvent::RestoreFinished { job_id, status }) => {
+                if active_restore_job
+                    .as_ref()
+                    .is_some_and(|(active_id, _)| *active_id == job_id)
+                {
+                    runtime.finish_restore(job_id, status);
+                    active_restore_job = None;
+                    evaluate_and_maybe_start(
+                        &runtime,
+                        &executor,
+                        &event_sender,
+                        &mut active_backup,
+                    );
+                }
             }
             Ok(RuntimeEvent::Resume) => {
                 runtime.record_resume(Utc::now());
@@ -613,9 +762,14 @@ fn drain_cancelled_operations(
     runtime: &ServiceRuntime,
     active_backup: &mut Option<CancellationToken>,
     active_repository_operation: &mut Option<CancellationToken>,
+    active_restore_query: &mut Option<(u64, CancellationToken)>,
+    active_restore_job: &mut Option<(u64, CancellationToken)>,
 ) {
     let deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
-    while (active_backup.is_some() || active_repository_operation.is_some())
+    while (active_backup.is_some()
+        || active_repository_operation.is_some()
+        || active_restore_query.is_some()
+        || active_restore_job.is_some())
         && Instant::now() < deadline
     {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -627,6 +781,14 @@ fn drain_cancelled_operations(
             Ok(RuntimeEvent::RepositoryOperationFinished { operation, outcome }) => {
                 runtime.finish_repository_operation(operation, &outcome);
                 *active_repository_operation = None;
+            }
+            Ok(RuntimeEvent::RestoreQueryFinished { query_id, outcome }) => {
+                runtime.finish_restore_query(query_id, outcome);
+                *active_restore_query = None;
+            }
+            Ok(RuntimeEvent::RestoreFinished { job_id, status }) => {
+                runtime.finish_restore(job_id, status);
+                *active_restore_job = None;
             }
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
@@ -748,6 +910,99 @@ fn start_update_worker(
             let outcome = updater::install(&package, &program_data_root());
             let _ = events.send(RuntimeEvent::UpdateInstallFinished(outcome));
         })
+}
+
+fn start_restore_query_worker(
+    runtime: Arc<ServiceRuntime>,
+    executor: ResticExecutor,
+    query_id: u64,
+    request: RestoreQueryRequest,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<RuntimeEvent>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("resticpal-restore-query".to_owned())
+        .spawn(move || {
+            let config = runtime.config();
+            let outcome = match request {
+                RestoreQueryRequest::Snapshots => executor
+                    .list_snapshots(&config, &cancellation)
+                    .map(RestoreQueryOutcome::Snapshots),
+                RestoreQueryRequest::Directory { snapshot_id, path } => executor
+                    .list_directory(&config, &snapshot_id, &path, &cancellation)
+                    .map(RestoreQueryOutcome::Directory),
+            }
+            .unwrap_or_else(|error| {
+                if error.code == "restore_cancelled" {
+                    RestoreQueryOutcome::Cancelled
+                } else {
+                    RestoreQueryOutcome::Failed {
+                        code: error.code.to_owned(),
+                    }
+                }
+            });
+            let _ = events.send(RuntimeEvent::RestoreQueryFinished { query_id, outcome });
+        })
+}
+
+struct RestoreSelection {
+    snapshot_id: String,
+    path: String,
+    destination: PathBuf,
+}
+
+fn start_restore_worker(
+    runtime: Arc<ServiceRuntime>,
+    executor: ResticExecutor,
+    job_id: u64,
+    selection: RestoreSelection,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<RuntimeEvent>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("resticpal-restore".to_owned())
+        .spawn(move || {
+            let config = runtime.config();
+            let outcome = executor.restore(
+                &config,
+                &selection.snapshot_id,
+                &selection.path,
+                &selection.destination,
+                &cancellation,
+                |progress| runtime.update_restore_progress(job_id, progress),
+            );
+            let status = restore_outcome_status(job_id, outcome);
+            let _ = events.send(RuntimeEvent::RestoreFinished { job_id, status });
+        })
+}
+
+fn restore_outcome_status(job_id: u64, outcome: RestoreOutcome) -> RestoreStatusView {
+    let (state, message) = match &outcome.kind {
+        RestoreOutcomeKind::Succeeded => (
+            RestoreJobState::Succeeded,
+            "The selected files were restored and verified successfully.".to_owned(),
+        ),
+        RestoreOutcomeKind::Cancelled => (
+            RestoreJobState::Cancelled,
+            "File recovery was cancelled; any recovered files remain in the new folder.".to_owned(),
+        ),
+        RestoreOutcomeKind::Failed { code } => (
+            RestoreJobState::Failed,
+            runtime::restore_failure_message(code).to_owned(),
+        ),
+    };
+    RestoreStatusView {
+        job_id: Some(job_id),
+        state,
+        files_restored: Some(outcome.files_restored),
+        bytes_restored: Some(outcome.bytes_restored),
+        total_files: (state == RestoreJobState::Succeeded).then_some(outcome.files_restored),
+        total_bytes: (state == RestoreJobState::Succeeded).then_some(outcome.bytes_restored),
+        destination: outcome
+            .destination
+            .map(|destination| destination.display().to_string()),
+        message: Some(message),
+    }
 }
 
 fn config_path(arguments: &[OsString]) -> PathBuf {

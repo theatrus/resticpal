@@ -1198,6 +1198,16 @@ function Assert-UpdateQualificationEvidence {
         $baselineServiceProcessId -eq $upgradedServiceProcessId) {
         throw 'evidence.verification does not prove that the service restarted.'
     }
+    $upgradedServiceProtocolVersion = $null
+    if ([Version]$Version -ge [Version]'1.0.9') {
+        $upgradedServiceProtocolVersion = Get-RequiredQualificationUInt64 `
+            -InputObject $verification -Name upgraded_service_protocol_version `
+            -Path 'evidence.verification' -Maximum ([uint32]::MaxValue)
+        if ($upgradedServiceProtocolVersion -ne 5) {
+            throw ("evidence.verification.upgraded_service_protocol_version must be " +
+                   "5 for resticpal $Version.")
+        }
+    }
     $publishedTrayProcessId = Get-RequiredQualificationUInt64 `
         -InputObject $verification -Name published_tray_process_id `
         -Path 'evidence.verification' -Maximum ([uint32]::MaxValue)
@@ -1427,7 +1437,7 @@ function Assert-UpdateQualificationEvidence {
         }
     }
 
-    return [ordered]@{
+    $binding = [ordered]@{
         schema = [uint32]$schema
         result_file = $evidenceFileName
         result_length = $evidenceLength
@@ -1471,6 +1481,11 @@ function Assert-UpdateQualificationEvidence {
             mode = $modeVerification
         }
     }
+    if ($null -ne $upgradedServiceProtocolVersion) {
+        $binding.verification.upgraded_service_protocol_version =
+            [uint32]$upgradedServiceProtocolVersion
+    }
+    return $binding
 }
 
 function Assert-UpdateQualificationPair {

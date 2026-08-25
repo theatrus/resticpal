@@ -179,6 +179,13 @@ $interactiveSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
 $automaticMode = $InstallationMode -ieq 'Automatic'
 $bridgeMode = [bool]$BridgeTransition
 $publishedUsesV2Feed = ([Version]$ExpectedPublishedVersion -ge [Version]'1.0.7')
+$expectedCandidateProtocolVersion = if ([Version]$ExpectedCandidateVersion -ge [Version]'1.0.9') {
+    [uint32]5
+} elseif ([Version]$ExpectedCandidateVersion -ge [Version]'1.0.7') {
+    [uint32]4
+} else {
+    [uint32]3
+}
 $installationModeName = $InstallationMode.ToLowerInvariant()
 $status = 'failed'
 $exitCode = 1
@@ -430,6 +437,20 @@ function Resolve-ResticPalProtocolVersion {
                "$($matches -join ', ').")
     }
     return [uint32]$matches[0]
+}
+
+function Wait-ResticPalProtocolVersion([TimeSpan] $Timeout) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    $lastError = $null
+    do {
+        try {
+            return Resolve-ResticPalProtocolVersion
+        } catch {
+            $lastError = $_.Exception.Message
+            Start-Sleep -Milliseconds 250
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "The upgraded service did not expose one versioned pipe in time: $lastError"
 }
 
 function Invoke-ResticPalRequest([hashtable] $Command) {
@@ -1981,12 +2002,16 @@ try {
         throw ("The service process was not replaced during the upgrade " +
                "(published=$baselineServiceProcessId, upgraded=$upgradedServiceProcessId).")
     }
+    $script:protocolVersion = Wait-ResticPalProtocolVersion ([TimeSpan]::FromSeconds(30))
+    if ([uint32]$script:protocolVersion -ne $expectedCandidateProtocolVersion) {
+        throw ("The resticpal $ExpectedCandidateVersion service exposed protocol " +
+               "$script:protocolVersion instead of protocol $expectedCandidateProtocolVersion.")
+    }
+    $verification.upgraded_protocol_version = [uint32]$script:protocolVersion
+    $verification.upgraded_service_protocol_version = [uint32]$script:protocolVersion
     if ($automaticMode) {
-        $script:protocolVersion = $null
         $null = Wait-AutomaticUpdatesEnabled ([TimeSpan]::FromSeconds(30))
         $verification.automatic_install_persisted_after_upgrade = $true
-        $verification.upgraded_protocol_version = [uint32]$protocolVersion
-        $verification.upgraded_service_protocol_version = [uint32]$protocolVersion
     }
 
     Wait-ProcessExit $baselineTray ([TimeSpan]::FromSeconds(60))

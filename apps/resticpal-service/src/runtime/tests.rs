@@ -12,7 +12,9 @@ use resticpal_core::status::{
 use resticpal_protocol::{
     DiagnosticLevel, ManagementView, RepositoryOperationKind, RepositoryOperationStatus,
     RepositorySecretUpdate, RepositoryView, Request, RequestCommand, ResponsePayload,
-    RetentionView, ScheduleView, UpdatePackage, UpdateSettingsView,
+    RestoreEntryView, RestoreJobState, RestoreNodeType, RestoreQueryKind, RestoreQueryState,
+    RestoreSettingsView, RestoreSnapshotView, RestoreStatusView, RetentionView, ScheduleView,
+    UpdatePackage, UpdateSettingsView,
 };
 use resticpal_windows::credentials::DpapiSecretStore;
 use resticpal_windows::named_pipe::ClientIdentity;
@@ -91,6 +93,21 @@ fn available_conditions() -> SystemConditions {
         on_battery: false,
         metered_network: false,
     }
+}
+
+fn authorize_restore_item(
+    runtime: &ServiceRuntime,
+    snapshot_id: &str,
+    path: &str,
+    node_type: RestoreNodeType,
+) {
+    let mut state = runtime.state_guard();
+    let nodes = state
+        .authorized_restore_snapshots
+        .entry(snapshot_id.to_owned())
+        .or_default();
+    nodes.insert("/".to_owned(), RestoreNodeType::Directory);
+    nodes.insert(path.to_owned(), node_type);
 }
 
 #[test]
@@ -176,6 +193,775 @@ fn run_now_is_rejected_until_configuration_is_complete() {
         response.payload,
         ResponsePayload::Rejected { ref code, .. } if code == "not_configured"
     ));
+}
+
+#[test]
+fn recovery_work_blocks_manual_and_scheduled_backups_without_exposing_paths() {
+    let (runtime, events) = runtime(true);
+    runtime.state_guard().restore_operation_active = true;
+
+    let response = runtime.handle_request(Request::new(31, RequestCommand::RunBackupNow), USER);
+    assert!(matches!(
+        response.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "restore_running"
+    ));
+    assert_eq!(
+        runtime.evaluate_schedule(Utc::now(), available_conditions()),
+        ScheduleAction::None
+    );
+    assert_eq!(
+        runtime.next_evaluation_delay(Utc::now()),
+        StdDuration::from_secs(60)
+    );
+    assert!(events.try_recv().is_err());
+
+    let serialized = serde_json::to_string(&runtime.status()).expect("redacted backup status");
+    assert!(!serialized.contains("restore"));
+}
+
+#[test]
+fn every_recovery_operation_requires_an_elevated_administrator() {
+    let (runtime, _events) = runtime(true);
+    let snapshot_id = "a".repeat(64);
+    let requests = [
+        RequestCommand::GetRestoreSettings,
+        RequestCommand::UpdateRestoreSettings { enabled: false },
+        RequestCommand::BeginRestoreSnapshotQuery,
+        RequestCommand::BeginRestoreDirectoryQuery {
+            snapshot_id: snapshot_id.clone(),
+            path: "/".to_owned(),
+        },
+        RequestCommand::GetRestoreQuery {
+            query_id: 1,
+            offset: 0,
+            limit: 10,
+        },
+        RequestCommand::CancelRestoreQuery { query_id: 1 },
+        RequestCommand::StartRestore {
+            snapshot_id,
+            path: "/C/Users/Example/Documents/note.txt".to_owned(),
+            destination: PathBuf::from(r"C:\Recovery"),
+        },
+        RequestCommand::GetRestoreStatus,
+        RequestCommand::CancelRestore,
+    ];
+
+    for (index, command) in requests.into_iter().enumerate() {
+        let request_id = u64::try_from(index).expect("request index fits in u64") + 100;
+        let response = runtime.handle_request(Request::new(request_id, command), USER);
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+        ));
+    }
+}
+
+#[test]
+fn disabling_recovery_purges_sensitive_results_and_enforces_every_read() {
+    let (runtime, events) = runtime(true);
+    let response =
+        runtime.handle_request(Request::new(120, RequestCommand::GetRestoreSettings), ADMIN);
+    assert!(matches!(
+        response.payload,
+        ResponsePayload::RestoreSettings {
+            configuration: RestoreSettingsView {
+                enabled: true,
+                enabled_locked: false,
+                managed: false,
+            }
+        }
+    ));
+
+    let query_id = match runtime
+        .handle_request(
+            Request::new(121, RequestCommand::BeginRestoreSnapshotQuery),
+            ADMIN,
+        )
+        .payload
+    {
+        ResponsePayload::RestoreQueryStarted { query_id } => query_id,
+        payload => panic!("unexpected response: {payload:?}"),
+    };
+    assert!(matches!(
+        events.recv().expect("listing event"),
+        RuntimeEvent::RestoreQueryRequested { query_id: actual, .. } if actual == query_id
+    ));
+    runtime.finish_restore_query(
+        query_id,
+        RestoreQueryOutcome::Snapshots(vec![RestoreSnapshotView {
+            id: "a".repeat(64),
+            time: Utc::now(),
+            hostname: "PC".to_owned(),
+            paths: vec![r"C:\Users\Example\Private".to_owned()],
+        }]),
+    );
+
+    let response = runtime.handle_request(
+        Request::new(
+            122,
+            RequestCommand::UpdateRestoreSettings { enabled: false },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(response.payload, ResponsePayload::Accepted { .. }));
+    assert!(runtime.state_guard().restore_queries.is_empty());
+    assert_eq!(
+        runtime.state_guard().restore_status,
+        RestoreStatusView::default()
+    );
+    assert_eq!(
+        events.recv().expect("configuration change"),
+        RuntimeEvent::ConfigurationChanged
+    );
+
+    for command in [
+        RequestCommand::BeginRestoreSnapshotQuery,
+        RequestCommand::GetRestoreQuery {
+            query_id,
+            offset: 0,
+            limit: 10,
+        },
+        RequestCommand::GetRestoreStatus,
+        RequestCommand::CancelRestore,
+        RequestCommand::StartRestore {
+            snapshot_id: "a".repeat(64),
+            path: "/C/Private/note.txt".to_owned(),
+            destination: PathBuf::from(r"C:\Recovery"),
+        },
+    ] {
+        let response = runtime.handle_request(Request::new(123, command), ADMIN);
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "restore_disabled"
+        ));
+    }
+}
+
+#[test]
+fn managed_recovery_denial_is_reported_and_cannot_be_overridden_locally() {
+    let (runtime, _events) = runtime(true);
+    runtime.local_config_guard().management.mode = ManagementMode::PlainManifest;
+    runtime.config_write().restore.enabled = false;
+    runtime
+        .field_resolutions
+        .write()
+        .expect("policy field resolutions")
+        .insert(
+            PolicyField::RestoreEnabled,
+            FieldResolution {
+                source: resticpal_core::policy::ValueSource::ManagedLocked,
+                locked: true,
+            },
+        );
+
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(125, RequestCommand::GetRestoreSettings), ADMIN)
+            .payload,
+        ResponsePayload::RestoreSettings {
+            configuration: RestoreSettingsView {
+                enabled: false,
+                enabled_locked: true,
+                managed: true,
+            }
+        }
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(126, RequestCommand::UpdateRestoreSettings { enabled: true }),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "managed_field_locked"
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(127, RequestCommand::BeginRestoreSnapshotQuery), ADMIN)
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "restore_disabled"
+    ));
+}
+
+#[test]
+fn recovery_listing_is_asynchronous_bounded_and_paginated() {
+    let (runtime, events) = runtime(true);
+    let query_id = match runtime
+        .handle_request(
+            Request::new(130, RequestCommand::BeginRestoreSnapshotQuery),
+            ADMIN,
+        )
+        .payload
+    {
+        ResponsePayload::RestoreQueryStarted { query_id } => query_id,
+        payload => panic!("unexpected response: {payload:?}"),
+    };
+    assert!(runtime.state_guard().restore_operation_active);
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(
+                    131,
+                    RequestCommand::GetRestoreQuery {
+                        query_id,
+                        offset: 0,
+                        limit: 2,
+                    },
+                ),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::RestoreQuery { result }
+            if result.state == RestoreQueryState::Running
+                && result.kind == RestoreQueryKind::Snapshots
+                && result.snapshots.is_empty()
+    ));
+    let _ = events.recv().expect("listing event");
+    let snapshots = (0..5)
+        .map(|index| RestoreSnapshotView {
+            id: format!("{index:064x}"),
+            time: Utc::now(),
+            hostname: "PC".to_owned(),
+            paths: vec![r"C:\Users\Example\Documents".to_owned()],
+        })
+        .collect();
+    runtime.finish_restore_query(query_id, RestoreQueryOutcome::Snapshots(snapshots));
+    assert!(!runtime.state_guard().restore_operation_active);
+
+    let response = runtime.handle_request(
+        Request::new(
+            132,
+            RequestCommand::GetRestoreQuery {
+                query_id,
+                offset: 2,
+                limit: 2,
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(
+        response.payload,
+        ResponsePayload::RestoreQuery { result }
+            if result.state == RestoreQueryState::Succeeded
+                && result.total == 5
+                && result.snapshots.len() == 2
+                && result.snapshots[0].id == format!("{:064x}", 2)
+    ));
+
+    for limit in [0, 101] {
+        assert!(matches!(
+            runtime
+                .handle_request(
+                    Request::new(
+                        133,
+                        RequestCommand::GetRestoreQuery {
+                            query_id,
+                            offset: 0,
+                            limit,
+                        },
+                    ),
+                    ADMIN,
+                )
+                .payload,
+            ResponsePayload::Rejected { ref code, .. } if code == "invalid_restore_query_limit"
+        ));
+    }
+}
+
+#[test]
+fn oversized_snapshot_inventory_fails_without_retaining_any_recovery_grants() {
+    let (runtime, events) = runtime(true);
+    let query_id = match runtime
+        .handle_request(
+            Request::new(134, RequestCommand::BeginRestoreSnapshotQuery),
+            ADMIN,
+        )
+        .payload
+    {
+        ResponsePayload::RestoreQueryStarted { query_id } => query_id,
+        payload => panic!("unexpected response: {payload:?}"),
+    };
+    let _ = events.recv().expect("snapshot inventory event");
+    let snapshots = (0..513_usize)
+        .map(|snapshot_index| RestoreSnapshotView {
+            id: format!("{snapshot_index:064x}"),
+            time: Utc::now(),
+            hostname: "PC".to_owned(),
+            paths: (0..128_usize)
+                .map(|source_index| {
+                    format!(r"C:\Recovered\snapshot-{snapshot_index}\source-{source_index}")
+                })
+                .collect(),
+        })
+        .collect();
+
+    runtime.finish_restore_query(query_id, RestoreQueryOutcome::Snapshots(snapshots));
+
+    let state = runtime.state_guard();
+    let query = state
+        .restore_queries
+        .get(&query_id)
+        .expect("failed snapshot inventory remains available to its requester");
+    assert_eq!(query.state, RestoreQueryState::Failed);
+    assert_eq!(query.total, 0);
+    assert!(query.snapshots.is_empty());
+    assert!(query.message.is_some());
+    assert!(state.authorized_restore_snapshots.is_empty());
+    assert!(!state.restore_operation_active);
+}
+
+#[test]
+fn recovery_snapshot_and_destination_inputs_are_validated_before_queuing() {
+    let (runtime, events) = runtime(true);
+    for (snapshot_id, path, expected_code) in [
+        (
+            "latest".to_owned(),
+            "/".to_owned(),
+            "invalid_restore_snapshot",
+        ),
+        (
+            "a".repeat(64),
+            "../secret".to_owned(),
+            "invalid_restore_path",
+        ),
+        (
+            "a".repeat(64),
+            "/C/Users/../Windows".to_owned(),
+            "invalid_restore_path",
+        ),
+    ] {
+        let response = runtime.handle_request(
+            Request::new(
+                140,
+                RequestCommand::BeginRestoreDirectoryQuery { snapshot_id, path },
+            ),
+            ADMIN,
+        );
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Rejected { ref code, .. } if code == expected_code
+        ));
+    }
+
+    let response = runtime.handle_request(
+        Request::new(
+            141,
+            RequestCommand::StartRestore {
+                snapshot_id: "a".repeat(64),
+                path: "/C/Users/Example/note.txt".to_owned(),
+                destination: PathBuf::from(r"relative\destination"),
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(
+        response.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "invalid_restore_destination"
+    ));
+    let root = runtime.handle_request(
+        Request::new(
+            142,
+            RequestCommand::StartRestore {
+                snapshot_id: "a".repeat(64),
+                path: "/".to_owned(),
+                destination: PathBuf::from(r"C:\Recovery"),
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(
+        root.payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "invalid_restore_path"
+    ));
+    assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn recovery_job_runs_exclusively_and_retains_only_elevated_status() {
+    let (runtime, events) = runtime(true);
+    authorize_restore_item(
+        &runtime,
+        &"a".repeat(64),
+        "/C/Users/Example/note.txt",
+        RestoreNodeType::File,
+    );
+    let job_id = match runtime
+        .handle_request(
+            Request::new(
+                150,
+                RequestCommand::StartRestore {
+                    snapshot_id: "a".repeat(64),
+                    path: "/C/Users/Example/note.txt".to_owned(),
+                    destination: PathBuf::from(r"C:\Recovery"),
+                },
+            ),
+            ADMIN,
+        )
+        .payload
+    {
+        ResponsePayload::RestoreStarted { job_id } => job_id,
+        payload => panic!("unexpected response: {payload:?}"),
+    };
+    assert!(matches!(
+        events.recv().expect("restore event"),
+        RuntimeEvent::RestoreRequested { job_id: actual, .. } if actual == job_id
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(151, RequestCommand::GetRestoreStatus), ADMIN)
+            .payload,
+        ResponsePayload::RestoreStatus { status }
+            if status.job_id == Some(job_id) && status.state == RestoreJobState::Running
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(152, RequestCommand::BeginRestoreSnapshotQuery), ADMIN)
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "restore_running"
+    ));
+
+    runtime.update_restore_progress(
+        job_id,
+        crate::executor::RestoreProgress {
+            destination: Some(PathBuf::from(r"C:\Recovery\resticpal-unique")),
+            files_restored: Some(1),
+            bytes_restored: Some(12),
+            total_files: Some(2),
+            total_bytes: Some(24),
+        },
+    );
+    let ordinary_status = serde_json::to_string(&runtime.status()).expect("ordinary status JSON");
+    assert!(!ordinary_status.contains("resticpal-unique"));
+
+    let result = RestoreStatusView {
+        job_id: Some(job_id),
+        state: RestoreJobState::Succeeded,
+        files_restored: Some(2),
+        bytes_restored: Some(24),
+        total_files: Some(2),
+        total_bytes: Some(24),
+        destination: Some(r"C:\Recovery\resticpal-unique".to_owned()),
+        message: Some("Verified".to_owned()),
+    };
+    runtime.finish_restore(job_id, result.clone());
+    assert!(!runtime.state_guard().restore_operation_active);
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(153, RequestCommand::GetRestoreStatus), ADMIN)
+            .payload,
+        ResponsePayload::RestoreStatus { status } if status == result
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(154, RequestCommand::GetRestoreStatus), USER)
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "administrator_required"
+    ));
+}
+
+#[test]
+fn oversized_recovery_pages_are_shrunk_below_the_ipc_frame_limit() {
+    let (runtime, events) = runtime(true);
+    let snapshot_id = "a".repeat(64);
+    authorize_restore_item(&runtime, &snapshot_id, "/", RestoreNodeType::Directory);
+    let query_id = match runtime
+        .handle_request(
+            Request::new(
+                160,
+                RequestCommand::BeginRestoreDirectoryQuery {
+                    snapshot_id,
+                    path: "/".to_owned(),
+                },
+            ),
+            ADMIN,
+        )
+        .payload
+    {
+        ResponsePayload::RestoreQueryStarted { query_id } => query_id,
+        payload => panic!("unexpected response: {payload:?}"),
+    };
+    let _ = events.recv().expect("directory listing event");
+    let entries = (0..100)
+        .map(|index| RestoreEntryView {
+            name: format!("file-{index}"),
+            path: format!("/{}-{index}", "a".repeat(16 * 1024)),
+            node_type: RestoreNodeType::File,
+            size: Some(1),
+            modified_at: None,
+        })
+        .collect();
+    runtime.finish_restore_query(query_id, RestoreQueryOutcome::Directory(entries));
+    let response = runtime.handle_request(
+        Request::new(
+            161,
+            RequestCommand::GetRestoreQuery {
+                query_id,
+                offset: 0,
+                limit: 100,
+            },
+        ),
+        ADMIN,
+    );
+    let encoded = serde_json::to_vec(&response).expect("bounded IPC response");
+    assert!(encoded.len() < resticpal_protocol::MAX_FRAME_BYTES);
+    assert!(matches!(
+        response.payload,
+        ResponsePayload::RestoreQuery { result }
+            if result.total == 100 && !result.entries.is_empty() && result.entries.len() < 100
+    ));
+}
+
+#[test]
+fn recovery_browser_capability_limit_preserves_existing_authorizations() {
+    let (runtime, events) = runtime(true);
+    let snapshot_id = "a".repeat(64);
+    authorize_restore_item(&runtime, &snapshot_id, "/", RestoreNodeType::Directory);
+    {
+        let mut state = runtime.state_guard();
+        let nodes = state
+            .authorized_restore_snapshots
+            .get_mut(&snapshot_id)
+            .expect("snapshot authorization");
+        for index in 0..65_535 {
+            nodes.insert(format!("/existing-{index}"), RestoreNodeType::File);
+        }
+        assert_eq!(nodes.len(), 65_536);
+    }
+
+    let query_id = match runtime
+        .handle_request(
+            Request::new(
+                165,
+                RequestCommand::BeginRestoreDirectoryQuery {
+                    snapshot_id: snapshot_id.clone(),
+                    path: "/".to_owned(),
+                },
+            ),
+            ADMIN,
+        )
+        .payload
+    {
+        ResponsePayload::RestoreQueryStarted { query_id } => query_id,
+        payload => panic!("unexpected response: {payload:?}"),
+    };
+    let _ = events.recv().expect("directory listing event");
+    runtime.finish_restore_query(
+        query_id,
+        RestoreQueryOutcome::Directory(vec![RestoreEntryView {
+            name: "new-file.txt".to_owned(),
+            path: "/new-file.txt".to_owned(),
+            node_type: RestoreNodeType::File,
+            size: Some(1),
+            modified_at: None,
+        }]),
+    );
+
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(
+                    166,
+                    RequestCommand::GetRestoreQuery {
+                        query_id,
+                        offset: 0,
+                        limit: 1,
+                    },
+                ),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::RestoreQuery { result }
+            if result.state == RestoreQueryState::Failed
+                && result.message.is_some()
+    ));
+    let state = runtime.state_guard();
+    let nodes = state
+        .authorized_restore_snapshots
+        .get(&snapshot_id)
+        .expect("existing snapshot authorization");
+    assert_eq!(nodes.len(), 65_536);
+    assert!(nodes.contains_key("/existing-0"));
+    assert!(!nodes.contains_key("/new-file.txt"));
+}
+
+#[test]
+fn recovery_rejects_other_hosts_snapshots_and_unbrowsed_repository_paths() {
+    let (runtime, events) = runtime(true);
+    let local_snapshot = "a".repeat(64);
+    let foreign_snapshot = "b".repeat(64);
+    let query_id = match runtime
+        .handle_request(
+            Request::new(170, RequestCommand::BeginRestoreSnapshotQuery),
+            ADMIN,
+        )
+        .payload
+    {
+        ResponsePayload::RestoreQueryStarted { query_id } => query_id,
+        payload => panic!("unexpected response: {payload:?}"),
+    };
+    let _ = events.recv().expect("snapshot listing event");
+    runtime.finish_restore_query(
+        query_id,
+        RestoreQueryOutcome::Snapshots(vec![RestoreSnapshotView {
+            id: local_snapshot.clone(),
+            time: Utc::now(),
+            hostname: "THIS-PC".to_owned(),
+            paths: vec![
+                r"c:\Users\Example\Documents".to_owned(),
+                r"\\server\share\Private".to_owned(),
+                r"D:\Users\..\Windows".to_owned(),
+                r"E:\Users\\Private".to_owned(),
+            ],
+        }]),
+    );
+    {
+        let state = runtime.state_guard();
+        let nodes = state
+            .authorized_restore_snapshots
+            .get(&local_snapshot)
+            .expect("current-host snapshot authorization");
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.contains_key("/"));
+        assert!(nodes.contains_key("/c/Users/Example/Documents"));
+    }
+
+    for command in [
+        RequestCommand::BeginRestoreDirectoryQuery {
+            snapshot_id: foreign_snapshot.clone(),
+            path: "/".to_owned(),
+        },
+        RequestCommand::StartRestore {
+            snapshot_id: foreign_snapshot,
+            path: "/C/Users/Another/Secret.txt".to_owned(),
+            destination: PathBuf::from(r"C:\Recovery"),
+        },
+    ] {
+        assert!(matches!(
+            runtime.handle_request(Request::new(171, command), ADMIN).payload,
+            ResponsePayload::Rejected { ref code, .. }
+                if code == "restore_snapshot_not_authorized"
+        ));
+    }
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(
+                    172,
+                    RequestCommand::StartRestore {
+                        snapshot_id: local_snapshot.clone(),
+                        path: "/c/Users/Example/Documents/unbrowsed.txt".to_owned(),
+                        destination: PathBuf::from(r"C:\Recovery"),
+                    },
+                ),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "restore_path_not_authorized"
+    ));
+
+    // restic preserves Windows drive-letter case, so a differently cased
+    // source root must not gain an authorization capability.
+    assert!(matches!(
+        runtime
+            .handle_request(
+                Request::new(
+                    173,
+                    RequestCommand::BeginRestoreDirectoryQuery {
+                        snapshot_id: local_snapshot.clone(),
+                        path: "/C/Users/Example/Documents".to_owned(),
+                    },
+                ),
+                ADMIN,
+            )
+            .payload,
+        ResponsePayload::Rejected { ref code, .. } if code == "restore_path_not_authorized"
+    ));
+
+    // Current-host source roots retain their original case while allowing the
+    // WinUI browser to open a friendly root directly.
+    let response = runtime.handle_request(
+        Request::new(
+            174,
+            RequestCommand::BeginRestoreDirectoryQuery {
+                snapshot_id: local_snapshot,
+                path: "/c/Users/Example/Documents".to_owned(),
+            },
+        ),
+        ADMIN,
+    );
+    assert!(matches!(
+        response.payload,
+        ResponsePayload::RestoreQueryStarted { .. }
+    ));
+}
+
+#[test]
+fn policy_revocation_keeps_running_restore_cancellable_but_purges_completion() {
+    let (runtime, events) = runtime(true);
+    let snapshot_id = "a".repeat(64);
+    authorize_restore_item(
+        &runtime,
+        &snapshot_id,
+        "/C/Users/Example/note.txt",
+        RestoreNodeType::File,
+    );
+    let job_id = match runtime
+        .handle_request(
+            Request::new(
+                180,
+                RequestCommand::StartRestore {
+                    snapshot_id,
+                    path: "/C/Users/Example/note.txt".to_owned(),
+                    destination: PathBuf::from(r"C:\Recovery"),
+                },
+            ),
+            ADMIN,
+        )
+        .payload
+    {
+        ResponsePayload::RestoreStarted { job_id } => job_id,
+        payload => panic!("unexpected response: {payload:?}"),
+    };
+    let _ = events.recv().expect("restore event");
+    // Ordinary policy writers defer active jobs; exercise fail-safe behavior
+    // if revocation nevertheless becomes visible before worker completion.
+    runtime.config_write().restore.enabled = false;
+
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(181, RequestCommand::GetRestoreStatus), ADMIN)
+            .payload,
+        ResponsePayload::RestoreStatus { status }
+            if status.state == RestoreJobState::Running
+    ));
+    assert!(matches!(
+        runtime
+            .handle_request(Request::new(182, RequestCommand::CancelRestore), ADMIN)
+            .payload,
+        ResponsePayload::Accepted { .. }
+    ));
+    assert!(matches!(
+        events.recv().expect("restore cancellation"),
+        RuntimeEvent::RestoreCancelled { job_id: actual } if actual == job_id
+    ));
+
+    runtime.finish_restore(
+        job_id,
+        RestoreStatusView {
+            job_id: Some(job_id),
+            state: RestoreJobState::Cancelled,
+            files_restored: Some(0),
+            bytes_restored: Some(0),
+            total_files: None,
+            total_bytes: None,
+            destination: Some(r"C:\Recovery\sensitive".to_owned()),
+            message: None,
+        },
+    );
+    let state = runtime.state_guard();
+    assert_eq!(state.restore_status, RestoreStatusView::default());
+    assert!(state.authorized_restore_snapshots.is_empty());
+    assert!(state.restore_queries.is_empty());
 }
 
 #[test]

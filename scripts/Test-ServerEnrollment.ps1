@@ -10,7 +10,12 @@
 param(
     [Parameter(Mandatory = $true)]
     [string] $ServerRepoPath,
-    [int] $Port = 8787
+    [int] $Port = 8787,
+
+    # Keep schema v1 as the cross-repository CI default while independently
+    # deployed servers catch up; use v3 to qualify managed restore explicitly.
+    [ValidateRange(1, 3)]
+    [int] $ManagedPolicySchemaVersion = 1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -95,10 +100,26 @@ $server = $null
 $failed = $false
 
 try {
-    # The manifest payload is passed through verbatim and must satisfy the
-    # client's ManagedPolicy schema; the minimal object exercises the transport
-    # and signing without pinning any policy fields.
-    Set-Content -LiteralPath (Join-Path $stage 'policy.json') -Encoding ascii -Value '{"schema_version":1,"revision":"e2e-ci-1"}'
+    # Keep legacy transport coverage available while allowing the complete
+    # signed schema-v3 restore grant to cross the real server/client boundary.
+    $policyDocument = [ordered]@{
+        schema_version = $ManagedPolicySchemaVersion
+        revision = "e2e-ci-schema-$ManagedPolicySchemaVersion"
+    }
+    if ($ManagedPolicySchemaVersion -ge 2) {
+        $policyDocument.updates = @{
+            automatic_install = @{ value = $false; locked = $true }
+        }
+    }
+    if ($ManagedPolicySchemaVersion -ge 3) {
+        $policyDocument.restore = @{
+            enabled = @{ value = $true; locked = $true }
+        }
+    }
+    Set-Content `
+        -LiteralPath (Join-Path $stage 'policy.json') `
+        -Encoding ascii `
+        -Value ($policyDocument | ConvertTo-Json -Depth 6 -Compress)
     Set-Content -LiteralPath $configPath -Encoding ascii -Value @"
 listen = "127.0.0.1:$Port"
 public_base_url = "http://127.0.0.1:$Port/"
@@ -123,7 +144,7 @@ RESTIC_PASSWORD = "RESTICPAL_E2E_RESTIC_PASSWORD"
     Write-Host "Starting resticpal-server on 127.0.0.1:$Port..."
     $server = Start-Process -FilePath $serverExe -ArgumentList @('serve', $configPath) `
         -RedirectStandardOutput $serverLog -RedirectStandardError $serverErrLog `
-        -PassThru -NoNewWindow
+        -PassThru -WindowStyle Hidden
     $ready = $false
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
         if ($server.HasExited) { break }
@@ -140,8 +161,9 @@ RESTIC_PASSWORD = "RESTICPAL_E2E_RESTIC_PASSWORD"
         -Arguments @('bootstrap-url', $configPath, 'e2e-device-setup') `
         -StdinLine $bootstrapToken -Label 'bootstrap-url'
 
-    Write-Host 'Running the client enrollment end-to-end test...'
+    Write-Host "Running the client enrollment end-to-end test with managed-policy schema v$ManagedPolicySchemaVersion..."
     $env:RESTICPAL_TEST_BOOTSTRAP_URL = $bootstrapUrl
+    $env:RESTICPAL_TEST_POLICY_SCHEMA_VERSION = [string] $ManagedPolicySchemaVersion
     Push-Location $clientRepo
     try {
         cargo test -p resticpal-service --locked -- --ignored --exact `
@@ -150,7 +172,10 @@ RESTIC_PASSWORD = "RESTICPAL_E2E_RESTIC_PASSWORD"
     } finally {
         Pop-Location
     }
-    Write-Host 'OK: enrollment, manifest fetch, status report, and replay rejection all passed.'
+    Write-Host (
+        "OK: schema-v$ManagedPolicySchemaVersion enrollment, manifest fetch, " +
+        'managed permission verification, status report, and replay rejection all passed.'
+    )
 } catch {
     $failed = $true
     throw
@@ -167,7 +192,12 @@ RESTIC_PASSWORD = "RESTICPAL_E2E_RESTIC_PASSWORD"
             }
         }
     }
-    foreach ($name in @('RESTICPAL_TEST_BOOTSTRAP_URL', 'RESTICPAL_SERVER_SIGNING_KEY', 'RESTICPAL_E2E_RESTIC_PASSWORD')) {
+    foreach ($name in @(
+        'RESTICPAL_TEST_BOOTSTRAP_URL',
+        'RESTICPAL_TEST_POLICY_SCHEMA_VERSION',
+        'RESTICPAL_SERVER_SIGNING_KEY',
+        'RESTICPAL_E2E_RESTIC_PASSWORD'
+    )) {
         Remove-Item -LiteralPath "Env:\$name" -ErrorAction SilentlyContinue
     }
     if (Test-Path -LiteralPath $stage) {

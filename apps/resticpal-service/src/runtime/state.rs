@@ -15,6 +15,7 @@ use resticpal_core::schedule::completion_deadline;
 use resticpal_core::status::{BackupState, ServiceStatus, WaitingReason};
 use resticpal_protocol::{
     DiagnosticLevel, RepositoryOperationKind, RepositoryOperationStatus, ResponsePayload,
+    RestoreNodeType, RestoreQueryView, RestoreStatusView,
 };
 use resticpal_windows::credentials::DpapiSecretStore;
 use thiserror::Error;
@@ -36,6 +37,18 @@ pub(super) struct RuntimeState {
     pub(super) repository_operation: RepositoryOperationStatus,
     pub(super) service_state: ServiceStateSnapshot,
     pub(super) management_operation_active: bool,
+    /// Snapshot browsing and file recovery are exclusive repository work. The
+    /// detailed activity is intentionally kept out of `ServiceStatus`, because
+    /// managed status uploads must never contain snapshot paths or destinations.
+    pub(super) restore_operation_active: bool,
+    pub(super) active_restore_query: Option<u64>,
+    pub(super) restore_queries: BTreeMap<u64, RestoreQueryView>,
+    /// Exact snapshot IDs and explicitly browsed nodes from the current
+    /// machine's validated snapshot inventory; never accept raw client guesses.
+    pub(super) authorized_restore_snapshots: BTreeMap<String, BTreeMap<String, RestoreNodeType>>,
+    pub(super) restore_query_snapshot_ids: BTreeMap<u64, String>,
+    pub(super) restore_status: RestoreStatusView,
+    pub(super) next_restore_identifier: u64,
 }
 
 #[derive(Default)]
@@ -216,6 +229,13 @@ impl ServiceRuntime {
                 repository_operation,
                 service_state,
                 management_operation_active: false,
+                restore_operation_active: false,
+                active_restore_query: None,
+                restore_queries: BTreeMap::new(),
+                authorized_restore_snapshots: BTreeMap::new(),
+                restore_query_snapshot_ids: BTreeMap::new(),
+                restore_status: RestoreStatusView::default(),
+                next_restore_identifier: 1,
             }),
             state_store,
             history_store,
@@ -268,6 +288,13 @@ impl ServiceRuntime {
                 repository_operation: RepositoryOperationStatus::NotRun,
                 service_state: ServiceStateSnapshot::default(),
                 management_operation_active: false,
+                restore_operation_active: false,
+                active_restore_query: None,
+                restore_queries: BTreeMap::new(),
+                authorized_restore_snapshots: BTreeMap::new(),
+                restore_query_snapshot_ids: BTreeMap::new(),
+                restore_status: RestoreStatusView::default(),
+                next_restore_identifier: 1,
             }),
             state_store: Some(ScheduleStateStore::next_to_config(path)),
             history_store: Some(BackupHistoryStore::next_to_config(path)),
@@ -301,6 +328,9 @@ impl ServiceRuntime {
         config: &EffectiveConfig,
         now: DateTime<Utc>,
     ) {
+        if !config.restore.enabled {
+            super::restore::clear_sensitive_restore_state(state);
+        }
         state.status.repository_display_name = config.repository.display_name.clone();
         state.status.repository_mode = config.repository.mode;
         if config.is_configured() {

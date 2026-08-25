@@ -30,6 +30,7 @@ impl ServiceRuntime {
                     RepositoryOperationStatus::Running { .. }
                 )
                 || state.management_operation_active
+                || state.restore_operation_active
                 || state.update_install_active
                 || state
                     .update_hold_until
@@ -74,6 +75,7 @@ impl ServiceRuntime {
                     RepositoryOperationStatus::Running { .. }
                 )
                 || state.management_operation_active
+                || state.restore_operation_active
                 || state.update_install_active
                 || state
                     .update_hold_until
@@ -193,6 +195,9 @@ impl ServiceRuntime {
             let next_config = resolved.effective;
             let now = Utc::now();
             let mut state = self.state_guard();
+            // Enrollment/rotation establishes a new management trust source;
+            // snapshot capabilities from the previous source cannot survive.
+            super::restore::clear_sensitive_restore_state(&mut state);
             if state
                 .service_state
                 .repository_requires_validation(&next_config)
@@ -269,6 +274,7 @@ impl ServiceRuntime {
                     RepositoryOperationStatus::Running { .. }
                 )
                 || state.management_operation_active
+                || state.restore_operation_active
                 || state.update_install_active
                 || state
                     .update_hold_until
@@ -321,6 +327,7 @@ impl ServiceRuntime {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = resolved.fields;
         let mut state = self.state_guard();
+        super::restore::clear_sensitive_restore_state(&mut state);
         state.status.managed_revision = None;
         Self::apply_configuration_status(&mut state, &resolved.effective, Utc::now());
         drop(state);
@@ -372,6 +379,7 @@ impl ServiceRuntime {
                 state.repository_operation,
                 RepositoryOperationStatus::Running { .. }
             )
+            || state.restore_operation_active
             || state.update_install_active
             || state
                 .update_hold_until
@@ -384,6 +392,7 @@ impl ServiceRuntime {
             .service_state
             .repository_requires_validation(&next_config)
         {
+            super::restore::clear_sensitive_restore_state(&mut state);
             state.service_state.require_repository_validation();
             if let Some(store) = &self.state_store
                 && let Err(error) = store.save(&state.service_state)

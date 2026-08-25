@@ -454,6 +454,62 @@ function New-TestOrdinaryScenario {
     }
 }
 
+function New-TestRestoreProtocolScenario {
+    $scenario = New-TestOrdinaryScenario
+    $scenario.Manifest.version = '1.0.9'
+    $scenario.Manifest.tag = 'v1.0.9'
+    $scenario.Manifest.files.msi.name = 'resticpal-1.0.9-x64.msi'
+    $scenario.Manifest.candidate_v2_feed.version = '1.0.9'
+    $scenario.Manifest.frozen_legacy_feed.source_tag = 'v1.0.8'
+    $scenario.Manifest.frozen_legacy_feed.source_release_url =
+        'https://github.com/theatrus/resticpal/releases/tag/v1.0.8'
+    $scenario.Manifest.update_package.version = '1.0.9'
+    $scenario.Manifest.update_package.url =
+        'https://updates.resticpal.com/releases/v1.0.9/resticpal-1.0.9-x64.msi'
+
+    foreach ($evidence in @($scenario.PromptedEvidence, $scenario.AutomaticEvidence)) {
+        $automatic = $evidence.installation_mode -ceq 'automatic'
+        $evidence.published_version = '1.0.8'
+        $evidence.published_release.tag = 'v1.0.8'
+        $evidence.published_release.asset_name = 'resticpal-1.0.8-x64.msi'
+        $evidence.published_release.asset_url =
+            'https://github.com/theatrus/resticpal/releases/download/v1.0.8/resticpal-1.0.8-x64.msi'
+        $evidence.candidate_version = '1.0.9'
+        $evidence.enclosure_url =
+            'https://updates.resticpal.com/releases/v1.0.9/resticpal-1.0.9-x64.msi'
+        $evidence.staged_update.path = if ($automatic) {
+            'C:\ProgramData\ResticPal\Updates\resticpal-1.0.9-x64.msi'
+        } else {
+            'C:\Users\Test\AppData\Local\Temp\NetSparkle\resticpal-1.0.9-x64.msi'
+        }
+        $evidence.staged_update.file_name = 'resticpal-1.0.9-x64.msi'
+        $evidence.verification.installed_version = '1.0.9'
+        $evidence.verification.installed_ui_file_version = '1.0.9.0'
+        $evidence.verification.installed_service_file_version = '1.0.9.0'
+        $evidence.verification.installed_tray_file_version = '1.0.9.0'
+        $evidence.verification.candidate_installer_command_line = if ($automatic) {
+            'msiexec.exe /i "C:\ProgramData\ResticPal\Updates\resticpal-1.0.9-x64.msi" /qn /norestart'
+        } else {
+            'msiexec.exe /i "C:\Users\Test\AppData\Local\Temp\NetSparkle\resticpal-1.0.9-x64.msi"'
+        }
+        $evidence.verification | Add-Member `
+            -NotePropertyName upgraded_service_protocol_version `
+            -NotePropertyValue ([uint32]5)
+    }
+
+    $scenario.PublishedRelease.tagName = 'v1.0.8'
+    $scenario.PublishedRelease.assets[0].name = 'resticpal-1.0.8-x64.msi'
+    $scenario.PublishedRelease.assets[0].url =
+        'https://github.com/theatrus/resticpal/releases/download/v1.0.8/resticpal-1.0.8-x64.msi'
+    $scenario.PublishedRelease.assets[1].url =
+        'https://github.com/theatrus/resticpal/releases/download/v1.0.8/appcast.xml'
+    $scenario.PublishedRelease.assets[2].url =
+        'https://github.com/theatrus/resticpal/releases/download/v1.0.8/appcast.xml.signature'
+    $scenario.PublishedRelease.url =
+        'https://github.com/theatrus/resticpal/releases/tag/v1.0.8'
+    return $scenario
+}
+
 function Write-AndReadTestEvidence {
     param(
         [Parameter(Mandatory)] $Evidence,
@@ -534,6 +590,71 @@ try {
             $bindings.automatic.verification.mode.update_dispatcher `
             'published-client-tray' `
             'Future automatic qualification did not bind the published tray.'
+    }
+
+    Invoke-PassingTest 'accepts and binds protocol v5 for v1.0.9 prompted and automatic updates' {
+        $scenario = New-TestRestoreProtocolScenario
+        $promptedLoaded = Write-AndReadTestEvidence `
+            $scenario.PromptedEvidence 'restore-protocol-prompted.json'
+        $automaticLoaded = Write-AndReadTestEvidence `
+            $scenario.AutomaticEvidence 'restore-protocol-automatic.json'
+        $bindings = Assert-UpdateQualificationPair `
+            -PromptedEvidence $promptedLoaded `
+            -AutomaticEvidence $automaticLoaded `
+            -Manifest $scenario.Manifest `
+            -Version '1.0.9' `
+            -Tag 'v1.0.9' `
+            -PreviousVersion '1.0.8' `
+            -PublishedRelease $scenario.PublishedRelease
+        foreach ($mode in @('prompted', 'automatic')) {
+            Assert-TestEqual `
+                $bindings[$mode].verification.upgraded_service_protocol_version `
+                ([uint32]5) `
+                "The $mode protocol-v5 service proof was not bound."
+        }
+    }
+
+    foreach ($mode in @('prompted', 'automatic')) {
+        Invoke-FailingTest "rejects v1.0.9 $mode qualification without service protocol proof" {
+            $scenario = New-TestRestoreProtocolScenario
+            $evidence = if ($mode -ceq 'automatic') {
+                $scenario.AutomaticEvidence
+            } else {
+                $scenario.PromptedEvidence
+            }
+            $evidence.verification.PSObject.Properties.Remove(
+                'upgraded_service_protocol_version')
+            $loaded = Write-AndReadTestEvidence `
+                $evidence "missing-service-protocol-$mode.json"
+            Assert-UpdateQualificationEvidence `
+                -LoadedEvidence $loaded `
+                -Manifest $scenario.Manifest `
+                -ExpectedInstallationMode $mode `
+                -Version '1.0.9' `
+                -Tag 'v1.0.9' `
+                -PreviousVersion '1.0.8' `
+                -PublishedRelease $scenario.PublishedRelease | Out-Null
+        } '*upgraded_service_protocol_version is required*'
+
+        Invoke-FailingTest "rejects v1.0.9 $mode qualification with legacy protocol v4" {
+            $scenario = New-TestRestoreProtocolScenario
+            $evidence = if ($mode -ceq 'automatic') {
+                $scenario.AutomaticEvidence
+            } else {
+                $scenario.PromptedEvidence
+            }
+            $evidence.verification.upgraded_service_protocol_version = 4
+            $loaded = Write-AndReadTestEvidence `
+                $evidence "legacy-service-protocol-$mode.json"
+            Assert-UpdateQualificationEvidence `
+                -LoadedEvidence $loaded `
+                -Manifest $scenario.Manifest `
+                -ExpectedInstallationMode $mode `
+                -Version '1.0.9' `
+                -Tag 'v1.0.9' `
+                -PreviousVersion '1.0.8' `
+                -PublishedRelease $scenario.PublishedRelease | Out-Null
+        } '*upgraded_service_protocol_version must be 5*'
     }
 
     Invoke-FailingTest 'rejects the one-time service bridge on a future transition' {

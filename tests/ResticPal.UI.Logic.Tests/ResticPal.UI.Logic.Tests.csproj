@@ -26,6 +26,10 @@
              Link="Services\ManagedConfigurationSynchronization.cs" />
     <Compile Include="..\..\apps\ResticPal.UI\Services\ManualBackupStatusTransition.cs"
              Link="Services\ManualBackupStatusTransition.cs" />
+    <Compile Include="..\..\apps\ResticPal.UI\Services\RestorePresentation.cs"
+             Link="Services\RestorePresentation.cs" />
+    <Compile Include="..\..\apps\ResticPal.UI\Services\ServicePipeIdentity.cs"
+             Link="Services\ServicePipeIdentity.cs" />
     <Compile Include="..\..\apps\ResticPal.UI\Services\UpdateFeedSelection.cs"
              Link="Services\UpdateFeedSelection.cs" />
     <Compile Include="..\..\apps\ResticPal.UI\Services\UpdateInstallationDecision.cs"

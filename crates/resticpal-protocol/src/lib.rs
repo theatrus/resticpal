@@ -15,8 +15,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_RESTORE_QUERY_PAGE_SIZE: u16 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,6 +103,30 @@ pub enum RequestCommand {
     InstallUpdate {
         package: UpdatePackage,
     },
+    GetRestoreSettings,
+    UpdateRestoreSettings {
+        enabled: bool,
+    },
+    BeginRestoreSnapshotQuery,
+    BeginRestoreDirectoryQuery {
+        snapshot_id: String,
+        path: String,
+    },
+    GetRestoreQuery {
+        query_id: u64,
+        offset: u32,
+        limit: u16,
+    },
+    CancelRestoreQuery {
+        query_id: u64,
+    },
+    StartRestore {
+        snapshot_id: String,
+        path: String,
+        destination: PathBuf,
+    },
+    GetRestoreStatus,
+    CancelRestore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +197,21 @@ pub enum ResponsePayload {
     Diagnostics {
         entries: Vec<DiagnosticEntry>,
     },
+    RestoreSettings {
+        configuration: RestoreSettingsView,
+    },
+    RestoreQueryStarted {
+        query_id: u64,
+    },
+    RestoreQuery {
+        result: RestoreQueryView,
+    },
+    RestoreStarted {
+        job_id: u64,
+    },
+    RestoreStatus {
+        status: RestoreStatusView,
+    },
     Accepted {
         message: String,
     },
@@ -188,6 +228,108 @@ pub struct ManagementView {
     pub enrolled: bool,
     pub device_id: Option<String>,
     pub manifest_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreSettingsView {
+    pub enabled: bool,
+    pub enabled_locked: bool,
+    pub managed: bool,
+}
+
+/// Sensitive repository snapshot metadata, returned only to an administrator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreSnapshotView {
+    pub id: String,
+    pub time: DateTime<Utc>,
+    pub hostname: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreNodeType {
+    File,
+    Directory,
+}
+
+/// A single validated file or directory inside a repository snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreEntryView {
+    pub name: String,
+    pub path: String,
+    pub node_type: RestoreNodeType,
+    pub size: Option<u64>,
+    pub modified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreQueryKind {
+    Snapshots,
+    Directory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreQueryState {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreQueryView {
+    pub query_id: u64,
+    pub kind: RestoreQueryKind,
+    pub state: RestoreQueryState,
+    pub snapshots: Vec<RestoreSnapshotView>,
+    pub entries: Vec<RestoreEntryView>,
+    pub total: u64,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreJobState {
+    Idle,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreStatusView {
+    pub job_id: Option<u64>,
+    pub state: RestoreJobState,
+    pub files_restored: Option<u64>,
+    pub bytes_restored: Option<u64>,
+    pub total_files: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub destination: Option<String>,
+    pub message: Option<String>,
+}
+
+impl Default for RestoreStatusView {
+    fn default() -> Self {
+        Self {
+            job_id: None,
+            state: RestoreJobState::Idle,
+            files_restored: None,
+            bytes_restored: None,
+            total_files: None,
+            total_bytes: None,
+            destination: None,
+            message: None,
+        }
+    }
 }
 
 /// Bounded, sensitive source paths for one local backup run. The service only
@@ -785,6 +927,130 @@ mod tests {
         let decoded: Request = read_frame(Cursor::new(bytes)).expect("request should deserialize");
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn typed_restore_requests_round_trip_without_arbitrary_arguments() {
+        let snapshot_id = "a".repeat(64);
+        let requests = [
+            RequestCommand::GetRestoreSettings,
+            RequestCommand::UpdateRestoreSettings { enabled: true },
+            RequestCommand::BeginRestoreSnapshotQuery,
+            RequestCommand::BeginRestoreDirectoryQuery {
+                snapshot_id: snapshot_id.clone(),
+                path: "/C/Users/Example".to_owned(),
+            },
+            RequestCommand::GetRestoreQuery {
+                query_id: 42,
+                offset: 100,
+                limit: MAX_RESTORE_QUERY_PAGE_SIZE,
+            },
+            RequestCommand::CancelRestoreQuery { query_id: 42 },
+            RequestCommand::StartRestore {
+                snapshot_id,
+                path: "/C/Users/Example/report [2025].txt".to_owned(),
+                destination: PathBuf::from(r"C:\Users\Example\Recovered"),
+            },
+            RequestCommand::GetRestoreStatus,
+            RequestCommand::CancelRestore,
+        ];
+        for (index, command) in requests.into_iter().enumerate() {
+            let request = Request::new(u64::try_from(index).expect("bounded index"), command);
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &request).expect("typed restore request");
+            assert_eq!(
+                read_frame::<Request>(Cursor::new(bytes)).expect("decode restore request"),
+                request
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_restore_snapshot_and_directory_pages_fit_the_protocol_frame() {
+        let snapshots = (0..MAX_RESTORE_QUERY_PAGE_SIZE)
+            .map(|index| RestoreSnapshotView {
+                id: format!("{index:064x}"),
+                time: Utc::now(),
+                hostname: "workstation".to_owned(),
+                paths: vec![r"C:\Users\Example\Documents".to_owned()],
+            })
+            .collect();
+        let response = Response::new(
+            301,
+            ResponsePayload::RestoreQuery {
+                result: RestoreQueryView {
+                    query_id: 1,
+                    kind: RestoreQueryKind::Snapshots,
+                    state: RestoreQueryState::Succeeded,
+                    snapshots,
+                    entries: Vec::new(),
+                    total: u64::from(MAX_RESTORE_QUERY_PAGE_SIZE),
+                    message: None,
+                },
+            },
+        );
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).expect("bounded snapshot page");
+        assert_eq!(
+            read_frame::<Response>(Cursor::new(bytes)).unwrap(),
+            response
+        );
+
+        let entries = (0..MAX_RESTORE_QUERY_PAGE_SIZE)
+            .map(|index| RestoreEntryView {
+                name: format!("report-{index}.txt"),
+                path: format!("/C/Users/Example/{}-report-{index}.txt", "a".repeat(4_000)),
+                node_type: RestoreNodeType::File,
+                size: Some(1_024),
+                modified_at: Some(Utc::now()),
+            })
+            .collect();
+        let response = Response::new(
+            302,
+            ResponsePayload::RestoreQuery {
+                result: RestoreQueryView {
+                    query_id: 2,
+                    kind: RestoreQueryKind::Directory,
+                    state: RestoreQueryState::Succeeded,
+                    snapshots: Vec::new(),
+                    entries,
+                    total: u64::from(MAX_RESTORE_QUERY_PAGE_SIZE),
+                    message: None,
+                },
+            },
+        );
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).expect("bounded directory page");
+        assert!(bytes.len() < MAX_FRAME_BYTES);
+        assert_eq!(
+            read_frame::<Response>(Cursor::new(bytes)).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn restore_status_round_trips_with_unique_destination_and_progress() {
+        let response = Response::new(
+            303,
+            ResponsePayload::RestoreStatus {
+                status: RestoreStatusView {
+                    job_id: Some(7),
+                    state: RestoreJobState::Running,
+                    files_restored: Some(3),
+                    bytes_restored: Some(512),
+                    total_files: Some(5),
+                    total_bytes: Some(1_024),
+                    destination: Some(r"C:\Recovered\ResticPal Restore - 2026-08-24".to_owned()),
+                    message: None,
+                },
+            },
+        );
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).expect("restore status");
+        assert_eq!(
+            read_frame::<Response>(Cursor::new(bytes)).unwrap(),
+            response
+        );
     }
 
     #[test]

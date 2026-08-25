@@ -6,22 +6,27 @@ use thiserror::Error;
 
 use crate::config::{
     BackupConfig, CONFIG_SCHEMA_VERSION, ConfigValidationError, EffectiveConfig, LocalConfig,
-    RepositoryConfig, RepositoryMode, RetentionConfig, ScheduleConfig, SecretEnvironmentVariable,
-    UpdateConfig,
+    ManagementMode, RepositoryConfig, RepositoryMode, RestoreConfig, RetentionConfig,
+    ScheduleConfig, SecretEnvironmentVariable, UpdateConfig,
 };
 
 pub const MAX_POLICY_REVISION_CHARACTERS: usize = 256;
-pub const MANAGED_POLICY_SCHEMA_VERSION: u32 = 2;
+pub const MANAGED_POLICY_SCHEMA_VERSION: u32 = 3;
+const UPDATE_MANAGED_POLICY_SCHEMA_VERSION: u32 = 2;
 const LEGACY_MANAGED_POLICY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedPolicy {
     pub schema_version: u32,
     pub revision: String,
+    #[serde(default)]
     pub backup: ManagedBackupPolicy,
+    #[serde(default)]
     pub repository: ManagedRepositoryPolicy,
+    #[serde(default)]
     pub schedule: ManagedSchedulePolicy,
+    #[serde(default)]
     pub retention: ManagedRetentionPolicy,
     #[serde(
         default,
@@ -29,6 +34,12 @@ pub struct ManagedPolicy {
         deserialize_with = "deserialize_managed_update_policy"
     )]
     pub updates: Option<ManagedUpdatePolicy>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_managed_restore_policy"
+    )]
+    pub restore: Option<ManagedRestorePolicy>,
 }
 
 impl Default for ManagedPolicy {
@@ -41,6 +52,7 @@ impl Default for ManagedPolicy {
             schedule: ManagedSchedulePolicy::default(),
             retention: ManagedRetentionPolicy::default(),
             updates: None,
+            restore: None,
         }
     }
 }
@@ -88,6 +100,26 @@ pub struct ManagedUpdatePolicy {
     pub automatic_install: Option<Managed<bool>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManagedRestorePolicy {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_managed_restore_enabled"
+    )]
+    pub enabled: Option<Managed<bool>>,
+}
+
+fn deserialize_managed_restore_enabled<'de, D>(
+    deserializer: D,
+) -> Result<Option<Managed<bool>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Managed::<bool>::deserialize(deserializer).map(Some)
+}
+
 fn deserialize_managed_update_policy<'de, D>(
     deserializer: D,
 ) -> Result<Option<ManagedUpdatePolicy>, D::Error>
@@ -98,6 +130,17 @@ where
     // explicit null. That keeps every serialized `updates` member
     // presence-aware so schema v1 cannot disguise the v2 field as null.
     ManagedUpdatePolicy::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_managed_restore_policy<'de, D>(
+    deserializer: D,
+) -> Result<Option<ManagedRestorePolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Preserve member presence: an explicit null cannot smuggle the schema-v3
+    // field through the frozen schema-v1 or schema-v2 compatibility checks.
+    ManagedRestorePolicy::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +172,7 @@ pub enum PolicyField {
     RetentionYearly,
     RetentionPruneIntervalDays,
     UpdateAutomaticInstall,
+    RestoreEnabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,7 +219,9 @@ pub fn resolve_config(
     if let Some(policy) = managed
         && !matches!(
             policy.schema_version,
-            LEGACY_MANAGED_POLICY_SCHEMA_VERSION | MANAGED_POLICY_SCHEMA_VERSION
+            LEGACY_MANAGED_POLICY_SCHEMA_VERSION
+                | UPDATE_MANAGED_POLICY_SCHEMA_VERSION
+                | MANAGED_POLICY_SCHEMA_VERSION
         )
     {
         return Err(PolicyError::UnsupportedManagedSchema(policy.schema_version));
@@ -185,6 +231,12 @@ pub fn resolve_config(
         && policy.updates.is_some()
     {
         return Err(PolicyError::UpdatesRequireManagedSchemaV2);
+    }
+    if let Some(policy) = managed
+        && policy.schema_version < MANAGED_POLICY_SCHEMA_VERSION
+        && policy.restore.is_some()
+    {
+        return Err(PolicyError::RestoreRequiresManagedSchemaV3);
     }
     if let Some(policy) = managed
         && (policy.revision.trim().is_empty()
@@ -207,6 +259,21 @@ pub fn resolve_config(
     let managed_updates = managed
         .and_then(|policy| policy.updates.as_ref())
         .unwrap_or(&no_updates);
+    let deny_ungranted_managed_restore = Managed {
+        value: false,
+        locked: true,
+    };
+    let managed_restore = if managed.is_some() || local.management.mode != ManagementMode::Disabled
+    {
+        Some(
+            managed
+                .and_then(|policy| policy.restore.as_ref())
+                .and_then(|restore| restore.enabled.as_ref())
+                .unwrap_or(&deny_ungranted_managed_restore),
+        )
+    } else {
+        None
+    };
     let local_repository_display_name = local.repository.display_name.clone().map(Some);
     let local_repository_url = local.repository.url.clone().map(Some);
 
@@ -347,6 +414,15 @@ pub fn resolve_config(
                 &mut fields,
             ),
         },
+        restore: RestoreConfig {
+            enabled: choose(
+                PolicyField::RestoreEnabled,
+                &defaults.restore.enabled,
+                local.restore.enabled.as_ref(),
+                managed_restore,
+                &mut fields,
+            ),
+        },
     };
 
     effective.validate()?;
@@ -389,8 +465,10 @@ pub enum PolicyError {
     UnsupportedLocalSchema(u32),
     #[error("unsupported managed policy schema {0}")]
     UnsupportedManagedSchema(u32),
-    #[error("managed update policy requires schema {MANAGED_POLICY_SCHEMA_VERSION}")]
+    #[error("managed update policy requires schema {UPDATE_MANAGED_POLICY_SCHEMA_VERSION}")]
     UpdatesRequireManagedSchemaV2,
+    #[error("managed restore policy requires schema {MANAGED_POLICY_SCHEMA_VERSION}")]
+    RestoreRequiresManagedSchemaV3,
     #[error("managed policy revision must be a non-empty single-line value within the size limit")]
     InvalidManagedRevision,
     #[error(transparent)]
@@ -400,7 +478,10 @@ pub enum PolicyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LocalRepositoryConfig, LocalScheduleConfig, LocalUpdateConfig};
+    use crate::config::{
+        LocalManagementConfig, LocalRepositoryConfig, LocalRestoreConfig, LocalScheduleConfig,
+        LocalUpdateConfig,
+    };
 
     fn managed<T>(value: T, locked: bool) -> Option<Managed<T>> {
         Some(Managed { value, locked })
@@ -605,6 +686,12 @@ mod tests {
         .expect("legacy policy should resolve");
         assert!(!resolved.effective.schedule.allow_on_battery);
         assert!(!resolved.effective.updates.automatic_install);
+        assert!(!resolved.effective.restore.enabled);
+        assert!(
+            resolved
+                .locked_fields()
+                .contains(&PolicyField::RestoreEnabled)
+        );
 
         let invalid_legacy = ManagedPolicy {
             revision: "legacy-with-updates".to_owned(),
@@ -650,6 +737,244 @@ mod tests {
             )
             .is_err(),
             "an explicit updates member cannot deserialize as absence"
+        );
+    }
+
+    #[test]
+    fn managed_schema_and_revision_are_mandatory() {
+        for policy in [
+            r#"{"revision":"missing-schema"}"#,
+            r#"{"schema_version":3}"#,
+        ] {
+            assert!(serde_json::from_str::<ManagedPolicy>(policy).is_err());
+        }
+    }
+
+    #[test]
+    fn standalone_restore_defaults_on_and_accepts_local_override() {
+        let standalone = resolve_config(&EffectiveConfig::default(), &LocalConfig::default(), None)
+            .expect("standalone configuration should resolve");
+        assert!(standalone.effective.restore.enabled);
+        assert_eq!(
+            standalone.fields[&PolicyField::RestoreEnabled].source,
+            ValueSource::ProductDefault
+        );
+
+        let local = LocalConfig {
+            restore: LocalRestoreConfig {
+                enabled: Some(false),
+            },
+            ..LocalConfig::default()
+        };
+        let disabled = resolve_config(&EffectiveConfig::default(), &local, None)
+            .expect("standalone local restore override should resolve");
+        assert!(!disabled.effective.restore.enabled);
+        assert_eq!(
+            disabled.fields[&PolicyField::RestoreEnabled].source,
+            ValueSource::LocalAdministrator
+        );
+    }
+
+    #[test]
+    fn managed_restore_fails_closed_without_an_explicit_v3_grant() {
+        let local = LocalConfig {
+            restore: LocalRestoreConfig {
+                enabled: Some(true),
+            },
+            ..LocalConfig::default()
+        };
+
+        for schema_version in [1, 2, 3] {
+            for restore in [None, Some(ManagedRestorePolicy::default())] {
+                if schema_version < 3 && restore.is_some() {
+                    continue;
+                }
+                let policy = ManagedPolicy {
+                    schema_version,
+                    revision: format!("deny-ungranted-{schema_version}"),
+                    restore,
+                    ..ManagedPolicy::default()
+                };
+                let resolved = resolve_config(&EffectiveConfig::default(), &local, Some(&policy))
+                    .expect("ungranted managed restore should resolve as denied");
+                assert!(!resolved.effective.restore.enabled);
+                assert_eq!(
+                    resolved.fields[&PolicyField::RestoreEnabled],
+                    FieldResolution {
+                        source: ValueSource::ManagedLocked,
+                        locked: true,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_management_fails_closed_before_its_first_policy_refresh() {
+        for mode in [
+            ManagementMode::PlainManifest,
+            ManagementMode::SignedManifest,
+        ] {
+            let local = LocalConfig {
+                management: LocalManagementConfig {
+                    mode,
+                    ..LocalManagementConfig::default()
+                },
+                restore: LocalRestoreConfig {
+                    enabled: Some(true),
+                },
+                ..LocalConfig::default()
+            };
+            let resolved = resolve_config(&EffectiveConfig::default(), &local, None)
+                .expect("unrefreshed management should resolve as restore-denied");
+            assert!(!resolved.effective.restore.enabled);
+            assert!(
+                resolved
+                    .locked_fields()
+                    .contains(&PolicyField::RestoreEnabled)
+            );
+        }
+    }
+
+    #[test]
+    fn managed_restore_grants_honor_locked_and_recommended_precedence() {
+        let policy = ManagedPolicy {
+            revision: "restore-recommended".to_owned(),
+            restore: Some(ManagedRestorePolicy {
+                enabled: managed(true, false),
+            }),
+            ..ManagedPolicy::default()
+        };
+        let granted = resolve_config(
+            &EffectiveConfig::default(),
+            &LocalConfig::default(),
+            Some(&policy),
+        )
+        .expect("recommended restore grant should resolve");
+        assert!(granted.effective.restore.enabled);
+        assert_eq!(
+            granted.fields[&PolicyField::RestoreEnabled].source,
+            ValueSource::ManagedRecommendation
+        );
+
+        let locally_disabled = LocalConfig {
+            restore: LocalRestoreConfig {
+                enabled: Some(false),
+            },
+            ..LocalConfig::default()
+        };
+        let local_override = resolve_config(
+            &EffectiveConfig::default(),
+            &locally_disabled,
+            Some(&policy),
+        )
+        .expect("local override should beat an unlocked recommendation");
+        assert!(!local_override.effective.restore.enabled);
+
+        let locked_policy = ManagedPolicy {
+            revision: "restore-locked".to_owned(),
+            restore: Some(ManagedRestorePolicy {
+                enabled: managed(true, true),
+            }),
+            ..ManagedPolicy::default()
+        };
+        let locked = resolve_config(
+            &EffectiveConfig::default(),
+            &locally_disabled,
+            Some(&locked_policy),
+        )
+        .expect("locked restore grant should beat the local override");
+        assert!(locked.effective.restore.enabled);
+        assert!(
+            locked
+                .locked_fields()
+                .contains(&PolicyField::RestoreEnabled)
+        );
+    }
+
+    #[test]
+    fn locked_managed_restore_denial_cannot_be_overridden_locally() {
+        let locally_enabled = LocalConfig {
+            restore: LocalRestoreConfig {
+                enabled: Some(true),
+            },
+            ..LocalConfig::default()
+        };
+        let policy = ManagedPolicy {
+            revision: "restore-disabled-by-organization".to_owned(),
+            restore: Some(ManagedRestorePolicy {
+                enabled: managed(false, true),
+            }),
+            ..ManagedPolicy::default()
+        };
+
+        let resolved = resolve_config(&EffectiveConfig::default(), &locally_enabled, Some(&policy))
+            .expect("locked restore denial should resolve");
+
+        assert!(!resolved.effective.restore.enabled);
+        assert_eq!(
+            resolved.fields[&PolicyField::RestoreEnabled],
+            FieldResolution {
+                source: ValueSource::ManagedLocked,
+                locked: true,
+            }
+        );
+    }
+
+    #[test]
+    fn frozen_schemas_cannot_smuggle_restore_fields() {
+        for schema_version in [1, 2] {
+            for restore in [r#"{}"#, r#"{"enabled":{"value":true}}"#] {
+                let json = format!(
+                    r#"{{"schema_version":{schema_version},"revision":"frozen","restore":{restore}}}"#
+                );
+                let policy: ManagedPolicy = serde_json::from_str(&json)
+                    .expect("restore field remains visible before version validation");
+                assert_eq!(
+                    resolve_config(
+                        &EffectiveConfig::default(),
+                        &LocalConfig::default(),
+                        Some(&policy),
+                    ),
+                    Err(PolicyError::RestoreRequiresManagedSchemaV3)
+                );
+            }
+            let json = format!(
+                r#"{{"schema_version":{schema_version},"revision":"frozen","restore":null}}"#
+            );
+            assert!(serde_json::from_str::<ManagedPolicy>(&json).is_err());
+        }
+    }
+
+    #[test]
+    fn restore_policy_rejects_null_or_malformed_enabled_values() {
+        for restore in [
+            r#"null"#,
+            r#"{"enabled":null}"#,
+            r#"{"enabled":{"value":"yes"}}"#,
+            r#"{"enabled":{"value":true,"unexpected":true}}"#,
+            r#"{"unexpected":{"value":true}}"#,
+        ] {
+            let json = format!(
+                r#"{{"schema_version":3,"revision":"invalid-restore","restore":{restore}}}"#
+            );
+            assert!(serde_json::from_str::<ManagedPolicy>(&json).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_restore_policy_round_trips_without_an_explicit_null() {
+        let policy = ManagedPolicy {
+            revision: "empty-restore".to_owned(),
+            restore: Some(ManagedRestorePolicy::default()),
+            ..ManagedPolicy::default()
+        };
+        let serialized = serde_json::to_value(&policy).expect("policy should serialize");
+        assert_eq!(serialized["restore"], serde_json::json!({}));
+        assert_eq!(
+            serde_json::from_value::<ManagedPolicy>(serialized)
+                .expect("empty restore policy should round-trip"),
+            policy
         );
     }
 }

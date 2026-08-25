@@ -18,6 +18,7 @@ It is built for personal PCs, small fleets, and managed deployments that want mo
 - **Made for sleeping laptops.** Backups catch up after wake, observe a grace period, and hold a bounded Windows wake lock while work is in progress.
 - **Protection without an open app.** The machine-wide service continues working when the settings window is closed or no user is signed in.
 - **A calm Windows experience.** First-run WinUI setup with bootstrap enrollment or local configuration, a low-resource Win32 tray process, useful status, cancellation, and bounded backup history.
+- **Recovery that makes sense.** Browse backups by date, select one file or folder, and restore a verified copy into a fresh local folder without overwriting existing files.
 - **Your repository, your choice.** Local disks, network shares, S3-compatible storage, REST servers, and the other repositories supported by restic.
 - **Ransomware-conscious operation.** Append-only clients can back up but cannot run retention, prune, rewrite, migration, destructive repair, or key removal.
 - **Ready to grow from one PC to a fleet.** Local configuration, plain manifest distribution, and signed server enrollment are distinct operating modes rather than an all-or-nothing cloud dependency.
@@ -59,6 +60,7 @@ All three policy transport paths now have an end-to-end implementation. A one-ti
 - Native Rust/Win32 tray status with single-click settings, a right-click action menu, run-now and cancellation actions, launched immediately after install and at logon for every user
 - First-run and Start Menu WinUI 3 setup for bootstrap enrollment, sources, repository, schedule, retention, status, backup history with local unreadable-file detail, and redacted diagnostics
 - Typed, per-field managed policy resolution and UI lock enforcement, including server-managed silent signed updates
+- Administrator-only snapshot browsing and verified file or folder restoration, enabled by default on standalone PCs and explicitly controlled by managed policy
 - Plain HTTP/HTTPS manifests, signed Ed25519 manifests, rollback/freshness checks, and offline last-known-good policy
 - Authenticated, bounded device status reporting that cannot make a backup fail
 - Local, S3-compatible, REST, and advanced restic repository configuration
@@ -84,7 +86,7 @@ Retention for such repositories belongs on a separate, better-protected host. Th
 
 ## Project status
 
-resticpal is early alpha software. The core backup path, native UI, tray-driven prompted or automatic signed updates, protected configuration, local history, append-only restrictions, one-time managed enrollment and secret bootstrap, policy/status transport, companion maintenance server, signed MSI authoring, and real-restic test harnesses are in place. Production qualification across the supported Windows 10/11 matrix, upgrade/rollback recovery, and graceful-first cancellation remain in progress.
+resticpal is early alpha software. The core backup path, native snapshot browser and verified file recovery, tray-driven prompted or automatic signed updates, protected configuration, local history, append-only restrictions, one-time managed enrollment and secret bootstrap, centrally managed restore permissions, policy/status transport, companion maintenance server, signed MSI authoring, and real-restic test harnesses are in place. Production qualification across the supported Windows 10/11 matrix, upgrade/rollback recovery, and graceful-first cancellation remain in progress.
 
 The source of truth for requirements, trust boundaries, implementation status, and open decisions is [DESIGN.md](DESIGN.md).
 
@@ -105,6 +107,11 @@ Exercise a disposable real local repository without VSS elevation:
 
 ```powershell
 .\scripts\Test-LocalRestic.ps1
+
+# Exercise real signed schema-v3 enrollment and its managed restore grant.
+.\scripts\Test-ServerEnrollment.ps1 `
+    -ServerRepoPath ..\resticpal-server `
+    -ManagedPolicySchemaVersion 3
 ```
 
 Use `-UseVss` from an elevated shell to test the exact production snapshot path. Build and inspect the development installer with:
@@ -114,7 +121,7 @@ Use `-UseVss` from an elevated shell to test the exact production snapshot path.
 .\scripts\Test-InstallerPackage.ps1
 ```
 
-The elevated `.\scripts\Test-InstalledResticPal.ps1` harness installs the MSI only when it can prove there is no pre-existing resticpal installation or data directory. It verifies current-session tray startup, the all-users logon registration and Start Menu shortcut, first-run bootstrap/local setup, the production service and local repository lifecycle, and data-preserving uninstall before removing only its own synthetic state.
+The elevated `.\scripts\Test-InstalledResticPal.ps1` harness installs the MSI only when it can prove there is no pre-existing resticpal installation or data directory. It verifies current-session tray startup, the all-users logon registration and Start Menu shortcut, first-run bootstrap/local setup, the real snapshot-browser UI, protected append-only file/folder recovery, the production service and local repository lifecycle, and data-preserving uninstall before removing only its own synthetic state.
 
 For safer clean-machine testing, run that lifecycle in a disposable local Windows VM:
 
@@ -131,7 +138,7 @@ The Sandbox launcher waits for a machine-readable result and returns the guest t
 
 GitHub Actions runs the same Rust and WinUI validation, then builds, validates, administratively extracts, and smoke-tests an x64 MSI. Ordinary `main` pushes, pull requests, and forks build unsigned; only version-tag pushes and intentional manual runs use Azure Trusted Signing for the executable payload and MSI. The neutral `resticpal-windows-x64` artifact includes SHA-256 checksums. The installed-service Windows Sandbox lifecycle remains a local test because GitHub-hosted runners do not expose the nested Sandbox environment used by the harness.
 
-Product releases start at `1.0.0`; the current source version is `1.0.8`. `Set-Version.ps1` moves the Rust, WinUI, manifest, MSI input, and appcast version together. NetSparkle release metadata is signed locally with the private key backed up outside GitHub, then published beside the signed MSI. See [the signed release guide](docs/releasing.md) for the key boundary and exact commands.
+Product releases start at `1.0.0`; the current source version is `1.0.9`. `Set-Version.ps1` moves the Rust, WinUI, manifest, MSI input, and appcast version together. NetSparkle release metadata is signed locally with the private key backed up outside GitHub, then published beside the signed MSI. See [the signed release guide](docs/releasing.md) for the key boundary and exact commands.
 
 ## For contributors
 

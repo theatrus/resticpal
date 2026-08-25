@@ -17,6 +17,26 @@ public sealed partial class MainWindow
         await LoadHistoryAsync();
     }
 
+    private async void BrowseBackupSnapshotButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button
+            || button.Tag is not BackupRunListItem run
+            || string.IsNullOrWhiteSpace(run.SnapshotId))
+        {
+            return;
+        }
+
+        _restoreRequestedSnapshotId = run.SnapshotId;
+        if (ReferenceEquals(NavigationRoot.SelectedItem, RestoreItem))
+        {
+            await LoadRestorePageAsync(refreshSnapshots: true);
+        }
+        else
+        {
+            NavigationRoot.SelectedItem = RestoreItem;
+        }
+    }
+
     private async void ShowRunFailureDetailsButton_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not Button button || button.Tag is not BackupRunListItem run)

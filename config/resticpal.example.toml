@@ -48,6 +48,12 @@ prune_interval_days = 7
 [updates]
 automatic_install = false
 
+# Standalone administrators may browse snapshots and restore files by default.
+# Managed installations require an explicit schema-v3 restore.enabled grant;
+# an unlocked grant can be overridden by this local setting.
+[restore]
+enabled = true
+
 [management]
 mode = "disabled"
 

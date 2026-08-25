@@ -551,10 +551,19 @@ mod tests {
 
         let pending = client.enroll(&bootstrap_url).expect("enrollment succeeds");
         let material = &pending.material;
+        let expected_policy_schema = std::env::var("RESTICPAL_TEST_POLICY_SCHEMA_VERSION")
+            .ok()
+            .map(|value| value.parse::<u32>().expect("numeric managed-policy schema"));
         assert!(
             material.initial_manifest.signed,
             "initial manifest arrives signed"
         );
+        if let Some(expected_policy_schema) = expected_policy_schema {
+            assert_eq!(
+                material.initial_manifest.payload.policy.schema_version, expected_policy_schema,
+                "the signed initial manifest preserves the requested managed-policy schema"
+            );
+        }
         assert!(
             !material.status_token.is_empty(),
             "a status token is issued"
@@ -593,6 +602,37 @@ mod tests {
             loaded.sequence >= initial_sequence,
             "the served manifest never rolls back past enrollment"
         );
+        if let Some(expected_policy_schema) = expected_policy_schema {
+            assert_eq!(loaded.policy.schema_version, expected_policy_schema);
+            if expected_policy_schema >= 3 {
+                let restore_grant = loaded
+                    .policy
+                    .restore
+                    .as_ref()
+                    .and_then(|restore| restore.enabled.as_ref())
+                    .expect("schema-v3 policy carries its signed restore grant");
+                assert!(
+                    restore_grant.value,
+                    "managed restoration is explicitly granted"
+                );
+                assert!(
+                    restore_grant.locked,
+                    "the managed restoration grant is locked"
+                );
+                let resolved = resolve_config(
+                    &EffectiveConfig::default(),
+                    &LocalConfig::default(),
+                    Some(&loaded.policy),
+                )
+                .expect("the signed schema-v3 policy resolves on the Windows client");
+                assert!(resolved.effective.restore.enabled);
+                assert!(
+                    resolved
+                        .locked_fields()
+                        .contains(&resticpal_core::policy::PolicyField::RestoreEnabled)
+                );
+            }
+        }
 
         client
             .report_status(

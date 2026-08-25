@@ -1,4 +1,4 @@
-use super::events::RuntimeEvent;
+use super::events::{RestoreQueryRequest, RuntimeEvent};
 use super::helpers::*;
 use super::state::ServiceRuntime;
 
@@ -242,6 +242,11 @@ impl ServiceRuntime {
                     let mut state = self.state_guard();
                     if matches!(state.status.state, BackupState::Running { .. }) {
                         rejected("already_running", "A backup is already running.")
+                    } else if state.restore_operation_active {
+                        rejected(
+                            "restore_running",
+                            "Wait for the current recovery operation to finish before starting a backup.",
+                        )
                     } else if state.update_install_active
                         || state
                             .update_hold_until
@@ -322,6 +327,33 @@ impl ServiceRuntime {
             RequestCommand::InstallUpdate { package } => {
                 self.begin_update_install(package, identity)
             }
+            RequestCommand::GetRestoreSettings => self.restore_settings(identity),
+            RequestCommand::UpdateRestoreSettings { enabled } => {
+                self.update_restore_settings(enabled, identity)
+            }
+            RequestCommand::BeginRestoreSnapshotQuery => {
+                self.begin_restore_query(RestoreQueryRequest::Snapshots, identity)
+            }
+            RequestCommand::BeginRestoreDirectoryQuery { snapshot_id, path } => self
+                .begin_restore_query(
+                    RestoreQueryRequest::Directory { snapshot_id, path },
+                    identity,
+                ),
+            RequestCommand::GetRestoreQuery {
+                query_id,
+                offset,
+                limit,
+            } => self.restore_query(query_id, offset, limit, identity),
+            RequestCommand::CancelRestoreQuery { query_id } => {
+                self.cancel_restore_query(query_id, identity)
+            }
+            RequestCommand::StartRestore {
+                snapshot_id,
+                path,
+                destination,
+            } => self.begin_restore(snapshot_id, path, destination, identity),
+            RequestCommand::GetRestoreStatus => self.restore_status(identity),
+            RequestCommand::CancelRestore => self.cancel_restore(identity),
         };
 
         Response::new(request_id, payload)
@@ -408,6 +440,12 @@ impl ServiceRuntime {
             return rejected(
                 "backup_running",
                 "Wait for the active backup to finish before testing its repository.",
+            );
+        }
+        if state.restore_operation_active {
+            return rejected(
+                "restore_running",
+                "Wait for the current recovery operation to finish before testing its repository.",
             );
         }
         if matches!(
@@ -520,6 +558,7 @@ impl ServiceRuntime {
             state.repository_operation,
             RepositoryOperationStatus::Running { .. }
         ) || state.management_operation_active
+            || state.restore_operation_active
         {
             return rejected(
                 "operation_running",
@@ -570,6 +609,10 @@ impl ServiceRuntime {
                 .is_some_and(|deadline| deadline > Utc::now())
     }
 
+    fn restore_blocks_configuration_mutation(&self) -> bool {
+        self.state_guard().restore_operation_active
+    }
+
     fn update_update_settings(
         &self,
         automatic_install: bool,
@@ -590,6 +633,12 @@ impl ServiceRuntime {
         }
         {
             let state = self.state_guard();
+            if state.restore_operation_active {
+                return rejected(
+                    "restore_running",
+                    "Wait for the current recovery operation to finish before changing update settings.",
+                );
+            }
             if state.update_install_active
                 || state
                     .update_hold_until
@@ -677,6 +726,7 @@ impl ServiceRuntime {
             state.repository_operation,
             RepositoryOperationStatus::Running { .. }
         ) || state.management_operation_active
+            || state.restore_operation_active
         {
             return rejected(
                 "operation_running",
@@ -799,6 +849,12 @@ impl ServiceRuntime {
                 "Wait for the resticpal update to finish before changing configuration.",
             );
         }
+        if self.restore_blocks_configuration_mutation() {
+            return rejected(
+                "restore_running",
+                "Wait for the current recovery operation to finish before changing configuration.",
+            );
+        }
         if self.config_read().repository.mode == RepositoryMode::AppendOnly {
             return rejected(
                 "retention_managed_by_server",
@@ -908,6 +964,12 @@ impl ServiceRuntime {
             return rejected(
                 "update_pending",
                 "Wait for the resticpal update to finish before changing configuration.",
+            );
+        }
+        if self.restore_blocks_configuration_mutation() {
+            return rejected(
+                "restore_running",
+                "Wait for the current recovery operation to finish before changing configuration.",
             );
         }
         if interval_hours.is_none()
@@ -1020,6 +1082,12 @@ impl ServiceRuntime {
                 "Wait for the resticpal update to finish before changing configuration.",
             );
         }
+        if self.restore_blocks_configuration_mutation() {
+            return rejected(
+                "restore_running",
+                "Wait for the current recovery operation to finish before changing configuration.",
+            );
+        }
         if paths.is_none() && exclusions.is_none() {
             return rejected(
                 "no_configuration_changes",
@@ -1122,6 +1190,12 @@ impl ServiceRuntime {
             return rejected(
                 "update_pending",
                 "Wait for the resticpal update to finish before changing configuration.",
+            );
+        }
+        if self.restore_blocks_configuration_mutation() {
+            return rejected(
+                "restore_running",
+                "Wait for the current recovery operation to finish before changing configuration.",
             );
         }
         if display_name.is_none()
@@ -1305,6 +1379,7 @@ impl ServiceRuntime {
         *self.local_config_guard() = candidate;
         *self.config_write() = effective.clone();
         if connection_changed {
+            super::restore::clear_sensitive_restore_state(&mut runtime_state);
             runtime_state.repository_operation = RepositoryOperationStatus::ValidationRequired;
             runtime_state.service_state = next_service_state;
         }

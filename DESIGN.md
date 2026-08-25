@@ -6,16 +6,16 @@ This document records the product requirements, architecture decisions, and curr
 
 ## Implementation status
 
-The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The active automated baseline is 216 passing client Rust tests, 58 passing WinUI-independent .NET logic tests, plus 19 passing tests in the adjacent `resticpal-server` repository and warning-free .NET builds. The MSI is build/ICE/admin-image validated, and its current-session tray launch, single-instance first-run setup, all-users Start Menu/logon integration, control-level Settings and `--updates` checks, installed LocalSystem service, VSS backup path, UI-triggered backup acknowledgement, 200%-scaled Per-Monitor-v2 tray/menu behavior, and v1.0.6-to-v1.0.7 major-upgrade path pass in a disposable Windows 11 Sandbox; the wider Windows 10/11 matrix is not yet production-qualified.
+The repository now contains a buildable x64 Windows vertical slice using Rust 1.97 and .NET 10, plus a WiX 6 development MSI. The active automated baseline includes 263 passing client Rust tests, 132 passing WinUI-independent .NET logic tests, 25 passing tests in the adjacent `resticpal-server` repository, 70 update-release qualification regressions, and warning-free Rust/.NET builds. The MSI is build/ICE/admin-image validated. A clean v1.0.9 installation passes the complete disposable Windows 11 Sandbox lifecycle: current-session tray launch, single-instance first-run setup, all-users Start Menu/logon integration, control-level Settings and `--updates` checks, installed LocalSystem/VSS backup, actual graphical snapshot and directory browsing, verified append-only file and directory restoration, inherited ACLs checked under a real same-user non-administrator token, policy-disablement enforcement, asynchronous snapshot pagination, 200%-scaled Per-Monitor-v2 tray/menu behavior, manual backup acknowledgement, standard retention, secure service restart, persistent cache reuse, and uninstall. The previous v1.0.6-to-v1.0.7 major-upgrade path also passes; the wider Windows 10/11 matrix is not yet production-qualified.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, standard-mode retention/prune cadence, append-only command authorization, managed-policy v1/v2 compatibility, versioned manifest and enrollment payloads, strict Ed25519 envelopes, X25519/HKDF/ChaCha20-Poly1305 secret bootstrap, freshness, and replay checks | Future schema evolution and graceful-first maintenance cancellation |
-| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository and enrollment credentials, recoverable atomic UI-driven configuration, repository create/validate, scheduler/retention checkpoint, bounded SQLite history with per-item partial-backup detail, bounded redacted diagnostic logs, bounded shutdown outcome draining, plain/signed manifest fetching, last-known-good cache, runtime policy application, bounded status delivery, one-time enrollment/rotation, unenrollment, prompt-free pinned-signature MSI download/install, and Sandbox-qualified LocalSystem/VSS execution | Windows 10/11 matrix ACL/VSS/update qualification, direct-file watching, diagnostic export/audit, and graceful cancellation before escalation |
-| Local IPC | Protocol v4, 1 MiB bounded frames, bounded per-connection I/O, protected named pipe, client-token authorization, ordinary-user status/sanitized-history/run/cancel/defer, administrator-only source-failure detail and configuration/enrollment operations, effective automatic-update settings with lock state, signed package handoff, and bounded update preparation that refuses active work | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v4 |
+| Core model | Typed local/managed configuration layers, per-field resolution and locks, validation bounds, deadline scheduling, standard-mode retention/prune cadence, append-only command authorization including safe listing/restoration, managed-policy v1/v2/v3 compatibility with fail-closed managed restore access, versioned manifest and enrollment payloads, strict Ed25519 envelopes, X25519/HKDF/ChaCha20-Poly1305 secret bootstrap, freshness, and replay checks | Future schema evolution and graceful-first maintenance cancellation |
+| Windows service | SCM control handling, startup/resume catch-up, power/network gates, retry backoff, restic process containment, cancellation, timed wake lock, DPAPI repository and enrollment credentials, recoverable atomic UI-driven configuration, repository create/validate, host-bound snapshot browsing, verified non-overwriting administrator-only file/folder recovery, unsupported-node preflight, scheduler/retention checkpoint, bounded SQLite history with per-item partial-backup detail, bounded redacted diagnostic logs, bounded shutdown outcome draining, plain/signed manifest fetching, last-known-good cache, runtime policy application, bounded status delivery, one-time enrollment/rotation, unenrollment, prompt-free pinned-signature MSI download/install, and Sandbox-qualified LocalSystem/VSS execution | Windows 10/11 matrix ACL/VSS/update/restore qualification, direct-file watching, diagnostic export/audit, and graceful cancellation before escalation |
+| Local IPC | Protocol v5, 1 MiB bounded frames, bounded per-connection I/O, protected named pipe, client-token authorization, ordinary-user status/sanitized-history/run/cancel/defer, administrator-only source-failure detail, configuration/enrollment, bounded asynchronous snapshot/directory queries, capability-bound restore jobs and progress, effective automatic-update/restore settings with lock state, signed package handoff, and bounded update preparation that refuses active work | Long-lived status/progress subscriptions and compatibility/evolution policy beyond v5 |
 | Tray | Per-Monitor-v2 native Win32 notification icon and action menu, DPI-metric icon selection, single instance per session, current status tooltip, run/cancel action, elevated UI launch, immediate post-install startup, all-users logon registration, bounded first-run setup retry, and native six-hour detached-Ed25519-signed update checks with either daily-bounded notifications or prompt-free service installation | Push-driven live backup icon updates, deferral UI, richer health icons, and multi-session qualification |
-| WinUI application | First-run bootstrap/local setup, Overview, backup sources, repository, schedule/power/network, standard/server-managed retention, bounded backup history with on-demand unreadable-file detail, redacted diagnostics, managed enrollment/rotation/unenrollment, lock-aware automatic-update control, silent service handoff, and strict signed prompted-update controls opened directly from tray notifications, with installed control-level regression coverage for Settings and `--updates` | Broader accessibility and Windows 10 qualification |
-| Remote management | Plain HTTP/HTTPS manifest mode without reporting; signed HTTPS manifest mode with pinned Ed25519 key, atomic cache, replay/freshness checks, authenticated status delivery; one-time signed enrollment with encrypted credentials; adjacent server with signed manifests, bounded SQLite status, and admin-only maintenance jobs | Conditional requests, enrollment audit/rate limits, and production deployment hardening |
+| WinUI application | First-run bootstrap/local setup, Overview, backup sources, repository, schedule/power/network, standard/server-managed retention, bounded backup history with on-demand unreadable-file detail, administrator-only date/time snapshot browser with friendly source roots, lazy folders, safe destination selection, verified file/folder restore, reconnectable progress and cancellation, redacted diagnostics, managed enrollment/rotation/unenrollment, lock-aware automatic-update/restore controls, silent service handoff, and strict signed prompted-update controls opened directly from tray notifications | Broader accessibility and Windows 10 qualification |
+| Remote management | Plain HTTP/HTTPS manifest mode without reporting; signed HTTPS manifest mode with pinned Ed25519 key, atomic cache, replay/freshness checks, authenticated status delivery; one-time signed enrollment with encrypted credentials; strict managed-policy v1/v2/v3 contracts and pre-consumption client-version gates; adjacent server with signed manifests, bounded SQLite status, restore permission policy, and admin-only maintenance jobs | Conditional requests, enrollment audit/rate limits, and production deployment hardening |
 | Distribution | Published release line with synchronized product metadata, per-machine x64 WiX MSI, pinned restic 0.19.1, statically linked/versioned Rust payload, self-contained/versioned WinUI payload, LocalSystem service/recovery authoring, ProgramData and bootstrap registry ACL authoring, optional hidden bootstrap property, immediate tray launch, reentrancy-safe single-instance first-run setup, all-users tray logon and Start Menu integration, data-preserving uninstall, v1.0.6-to-v1.0.7 major-upgrade qualification, notices, disposable Sandbox E2E harness, release-tag/manual Azure Authenticode signing, strict Ed25519 NetSparkle client, locally held release key, package-first release tooling with an immutable v1.0.7 legacy feed and advancing v2 feed, direct MSI mirror, and GitHub CI package artifacts with checksums | Windows 10/11 installer/VSS/update matrix, optional interactive installer bootstrap dialog, complete license generation, rollback recovery, and wider upgrade/repair matrix |
 
 Current durable state consists of atomic `config.toml`, DPAPI-protected credential files, `state.json` for scheduler/retention/repository-verification state, lazy `state.db` backup history, and rotating structured service logs. The history retains the newest 200 attempts and exposes at most 100 sanitized summaries per IPC request; the WinUI page requests 50. A warning run retains at most 100 unique, safe source-item paths of at most 4 KiB each plus an omitted count. Those paths are returned only by an explicit elevated local detail request. Diagnostics rotate at 1 MiB with three archives and expose at most 200 entries per elevated IPC request; the WinUI page requests 100.
@@ -24,7 +24,9 @@ Current durable state consists of atomic `config.toml`, DPAPI-protected credenti
 
 resticpal provides reliable, low-maintenance, file-level backups of user data on Windows 10 and Windows 11. A system service performs backups even when no user is signed in. A lightweight tray process reports protection status, and an on-demand modern Windows UI provides setup and administration.
 
-The first release is Windows x64. A macOS implementation and a restore UI may come later.
+The first release is Windows x64. Client-side, administrator-controlled file
+restore is part of the current Windows implementation; a macOS implementation
+may come later.
 
 ## Goals
 
@@ -39,10 +41,11 @@ The first release is Windows x64. A macOS implementation and a restore UI may co
 - Allow local administrator configuration and optional enrollment into a remotely managed policy.
 - Secure repository and enrollment credentials with Windows facilities.
 - Support prompted and administrator-enabled unattended updates with cryptographically signed metadata and packages.
+- Allow an administrator to browse dated repository snapshots and safely
+  restore a selected file or directory when local or managed policy permits it.
 
 ## Non-goals for the first release
 
-- A restore browser or restore workflow.
 - Bare-metal recovery, Windows installation imaging, or guaranteed application-consistent database backup.
 - A large multi-tenant backup SaaS. The optional companion server remains small, self-hostable, and separable from standalone/plain-file operation.
 - macOS support.
@@ -105,6 +108,7 @@ The C# WinUI 3 application provides the modern settings and status experience. I
 - Schedule, power, and network policy
 - Retention
 - Backup history
+- Restore files: dated snapshots, friendly source folders, browser, destination, and recovery progress
 - Diagnostics and local logs
 - Enrollment and managed-policy state
 - Updates and application settings
@@ -129,13 +133,25 @@ DPAPI data is intentionally bound to the service identity. The LocalSystem decis
 
 ## IPC and authorization
 
-Service-to-client communication uses a versioned protocol over Windows named pipes. The implemented protocol is v4 over `\\.\pipe\ResticPal.v4` with one bounded request and response per connection.
+Service-to-client communication uses a versioned protocol over Windows named
+pipes. Restore-capable clients use protocol v5 over
+`\\.\pipe\ResticPal.v5` with one bounded request and response per connection.
 
 - The pipe security descriptor permits interactive users to read status.
+- The service keeps at least one protected pipe instance alive continuously,
+  refuses pre-existing first-instance squatters, and both Rust and WinUI
+  clients authenticate the connected pipe server against the actual running
+  `ResticPal` Windows service process before sending any request bytes.
 - The service inspects the connecting process token rather than trusting identity fields supplied in a message.
 - Administrative mutations require an elevated administrator token.
 - Ordinary users may request `run now`, defer one run, or cancel one run unless the applicable action is locked by managed policy.
 - The protocol exposes typed operations, not arbitrary executable paths, environment variables, or restic arguments.
+- Snapshot contents, restore destinations, and restore progress are available
+  only to an elevated local administrator; ordinary-user status and remote
+  reporting never include restored filenames or paths.
+- Potentially slow snapshot and directory queries return immediately with a
+  bounded asynchronous query identifier. Restore itself runs as an independent,
+  reconnectable service-owned job.
 - Progress is currently returned in status snapshots. A future subscription channel will push rate-limited status/progress changes without continuous polling.
 - Messages have explicit protocol versions, reject unknown fields within a version, and have bounded sizes and per-connection I/O time.
 
@@ -168,6 +184,68 @@ The backup invocation always requests restic's Windows filesystem snapshot suppo
 Restic 0.19.1 does not emit a machine-readable success event for every source and silently reads live data below an unsupported nested mounted volume. The current client therefore cannot prove complete VSS coverage for that edge case. A strict guarantee requires wrapper-owned VSS path mapping or an upstream/pinned restic `--require-fs-snapshot` behavior; this remains an explicit gap. The LocalSystem VSS path passes the installed Windows 11 Sandbox lifecycle, while the wider Windows 10/11 matrix and metadata restoration remain to be qualified.
 
 Every restic operation explicitly uses the protected persistent repository-metadata cache at `%ProgramData%\ResticPal\Cache`. Restic keeps repository-specific indexes and metadata there, so scans do not have to redownload all reusable repository metadata after each service restart. Each backup also enables restic's local `--cleanup-cache` lifecycle so repository namespaces that have remained unused for more than restic's age threshold do not accumulate indefinitely; this is local-only and remains safe for append-only repositories. This cache is distinct from VSS: VSS supplies the point-in-time source-filesystem view, while the restic cache accelerates repository access. VSS improves consistency but does not turn the product into an application-aware or bare-metal backup system.
+
+### Snapshot browsing and safe file restoration
+
+The elevated WinUI application provides a **Restore files** page with a date
+picker, exact snapshot-time selection, friendly configured source folders, lazy
+directory browsing, a backup-history shortcut, and selection of one file or
+directory per job. Snapshot discovery reads the repository rather than relying
+on bounded local backup history, so older retained snapshots remain available.
+Only snapshots belonging to the machine's physical DNS hostname are returned;
+this deliberately matches the Windows hostname API used by restic's Go runtime,
+rather than the potentially truncated NetBIOS `COMPUTERNAME` environment value.
+Every later browse or restore request is additionally bound to an exact snapshot ID
+from that verified inventory and to a source root or directory entry already
+authorized by the service. Guessing another device's snapshot ID or an unseen
+repository path never bypasses that boundary. Repository credentials and
+restic invocation always stay inside the LocalSystem service. Windows source
+drive-letter case is preserved exactly because restic preserves that case in
+its snapshot metadata and repository tree. Both snapshot inventories and their
+initial source-root capabilities obey the same global authorization bound as
+subsequently browsed entries.
+
+The administrator chooses an existing local destination directory. The service
+creates a fresh, unique restore subdirectory and restores only the selected
+entry from its exact snapshot. Restore always verifies recovered data and never
+overwrites existing files. Shell-free snapshot-subtree selection preserves the
+chosen leaf without recreating the entire original drive path, including
+literal restic pattern characters in ordinary Windows filenames. Network/device
+paths, filesystem aliases or junctions, protected application state, traversal,
+ambiguous snapshot IDs, and unsupported node types are rejected. A bounded
+recursive preflight rejects symbolic links, devices, and other unsupported
+descendants before creating any destination. Windows no-follow directory
+handles deny rename and deletion of both the validated destination parent and
+the newly created recovery folder throughout extraction. Recovery folders are
+created atomically with a protected LocalSystem/Administrators-only inherited
+ACL, preventing unprivileged nested junction races. The locked directory handle
+must independently prove exact SYSTEM ownership and the expected protected ACL,
+so a parent-owner replacement between creation and opening fails closed. Only
+after extraction and verification finish do the recovered files receive the
+parent's normally inheritable permissions; parent-only access rules are not
+copied into recovered data. Restores take their normal repository read lock
+and are explicitly allowed in append-only mode; they never run unlock, prune,
+forget, rewrite, or repository deletion.
+
+A running restore holds the configured bounded wake lock, shares one timeout
+across recursive preflight and extraction, exposes typed local
+progress and cancellation, and excludes concurrent backup, retention,
+repository-setup, enrollment, or installer work. Closing the UI does not cancel
+the job. Cancellation leaves any already-restored files in the unique
+destination and reports their partial state. Snapshot listings and restore
+paths are sensitive local data: they are bounded in memory, never written to
+ordinary diagnostic logs, and never included in remote status reporting.
+If Windows cannot confirm termination of a privileged restore subprocess, the
+worker remains quarantined with both protected-directory locks held; competing
+backups and updates stay excluded until termination is positively confirmed,
+and the affected recovery folder is never handed off to an ordinary user.
+
+Standalone systems enable restore by default and may override it locally through
+`[restore] enabled` or the application. Managed systems fail closed, including
+before their first policy fetch, until an inner schema-v3 policy explicitly grants
+`restore.enabled`; locked grants or denials are enforced by every relevant
+service operation, not merely by hiding controls. Older managed-policy schemas
+continue to govern backups normally while leaving restore disabled.
 
 ## Scheduling, wake, power, and network
 
@@ -241,7 +319,7 @@ Retention counts and prune cadence are bounded, resolved per field, and honor ma
 
 In append-only mode, the backup client is intentionally not a repository administrator.
 
-- resticpal may create backups, remove restic-classified stale lock records, and perform explicitly approved read-only inspection.
+- resticpal may create backups, remove restic-classified stale lock records, and perform explicitly approved read-only snapshot inspection and verified file restoration.
 - The append-only storage credential must be able to list and delete objects in the repository's lock namespace. This narrow exception prevents abandoned client processes from permanently blocking protection; it must not grant deletion or rewriting of snapshots, indexes, packs, keys, or repository configuration.
 - Lock cleanup invokes plain `restic unlock` before each backup and never `--remove-all`, so locks restic considers active are not force-removed.
 - resticpal must never invoke local retention or destructive/rewriting maintenance, including `forget`, `prune`, `rewrite`, repository migration, destructive repair, key removal, or equivalent future commands.
@@ -253,7 +331,7 @@ In append-only mode, the backup client is intentionally not a repository adminis
 
 The client-side command restriction is defense in depth, not proof of append-only storage. Real protection must also be enforced by the repository service, proxy, S3 IAM/bucket policy, object immutability/versioning controls, or another storage-side mechanism. resticpal must label the mode as configured; it must not claim to have verified backend immutability unless a future backend-specific verification exists.
 
-The append-only authorization matrix is implemented in the core command builder. It explicitly permits only backup, narrow stale-lock cleanup, connection probing, snapshots, and check, while tests continue to reject initialization, forget, prune, rewrite, migration, destructive repair, and key removal. The repository UI labels append-only retention as server-managed, and the service rejects initialization in this mode.
+The append-only authorization matrix is implemented in the core command builder. It explicitly permits only backup, narrow stale-lock cleanup, connection probing, snapshots, bounded directory listing, verified restoration, and check, while tests continue to reject initialization, forget, prune, rewrite, migration, destructive repair, and key removal. Restores acquire restic's ordinary shared repository lock and never invoke `unlock` as part of recovery. The repository UI labels append-only retention as server-managed, and the service rejects initialization in this mode.
 
 When a server maintains a repository that receives append-only client backups, its retention design should follow restic's append-only guidance, including careful use of time-window retention to avoid an untrusted client manipulating which snapshots appear newest.
 
@@ -266,13 +344,13 @@ Machine state lives under `%ProgramData%\ResticPal` with service/admin-only ACLs
 | Item | Location | Current status |
 | --- | --- | --- |
 | Local configuration | `config.toml` | Implemented; typed TOML with no secrets, loaded at startup and replaced atomically for accepted UI/service changes |
-| Managed policy cache | `managed-policy.json` | Planned; signed, versioned, last-known-good |
+| Managed policy cache | `managed-policy.json` | Implemented; authenticated/versioned last-known-good manifest with atomic replacement and offline startup |
 | Credential store | implementation-private `Credentials\` | Implemented for repository secrets with service-identity DPAPI, opaque references, restricted ACLs, and atomic replacement |
 | Restic repository cache | `Cache\` | Implemented; explicit persistent cache for every restic operation, protected for service/admin access and reused across service restarts |
 | Scheduler checkpoint | `state.json` | Implemented; last success plus repository-validation identity/time for restart-safe scheduling |
 | Run history | `state.db` | Implemented lazily; SQLite, newest 200 attempts, sanitized summaries, plus administrator-only bounded source-item detail for partial backups; non-blocking |
-| Logs | `Logs\` | Planned; structured, rotated, sanitized |
-| Bundled tools | under installation directory | Implemented in the development MSI with checksum-verified restic 0.19.1; signing and upgrade replacement remain |
+| Logs | `Logs\` | Implemented; bounded, rotated, sanitized operational diagnostics |
+| Bundled tools | under installation directory | Implemented with checksum-verified restic 0.19.1, release-tag Authenticode signing, and MSI upgrade replacement |
 
 The UI writes configuration through elevated typed service operations, not directly. Those writes validate a candidate effective configuration before atomically replacing `config.toml` and immediately reevaluating the scheduler. A directly edited file is validated at service startup, but live file watching and last-known-good recovery for invalid edits are not implemented yet.
 
@@ -285,7 +363,7 @@ Effective configuration is calculated from:
 3. the last valid signed managed policy;
 4. transient one-run choices such as an allowed deferral.
 
-Managed policy marks individual fields as locked. A managed value overrides local configuration only for that field. The UI explains the source of each managed value and disables editing only where locked. Inner managed-policy schema v1 remains accepted for existing backup/repository/schedule/retention fields; schema v2 adds `updates.automatic_install`. A v1 policy containing that member is rejected, and a v2 policy must not be deployed to older clients until reported application versions show that they support it. The adjacent server refuses a v2 initial enrollment from clients through 1.0.6 with HTTP 426 before consuming their one-time token. Unknown fields are rejected according to schema-version rules; they never become raw restic arguments.
+Managed policy marks individual fields as locked. A managed value overrides local configuration only for that field. The UI explains the source of each managed value and disables editing only where locked. Inner managed-policy schema v1 remains accepted for existing backup/repository/schedule/retention fields; schema v2 adds `updates.automatic_install`; schema v3 adds `restore.enabled`. Both earlier schemas remain frozen and reject later fields, including explicit `null` values. A managed v1/v2 policy, a v3 policy omitting an explicit restore value, or configured management before its first successful fetch fail closed with restore disabled and locked. An explicit v3 value follows the normal per-field recommendation/lock precedence. The adjacent server refuses v2 initial enrollment from clients through 1.0.6 and v3 initial enrollment from clients through 1.0.8 with HTTP 426 before consuming their one-time token. Static plain-file deployments must keep compatible version-specific policy URLs while mixed client versions exist. Unknown fields are rejected according to schema-version rules; they never become raw restic arguments.
 
 Loss of server connectivity does not stop backups. The service continues with its last valid policy and reports that management connectivity is stale. Only a signed explicit disable policy may stop managed backups.
 
@@ -331,7 +409,7 @@ The first-run application offers a bootstrap URL field and an explicit local-con
 6. The service verifies the response signature, request nonce, freshness, URLs, and initial signed manifest; decrypts the secret bundle; commits DPAPI references, cache, and configuration; then erases the one-time bootstrap material.
 7. Future policy fetches use conditional requests such as ETag/version and retain the last-known-good policy when offline.
 
-The adjacent `resticpal-server` repository implements the initial conventional API and carries v1 JSON Schemas and a plain-manifest fixture. A normal static HTTP server remains a supported metadata-only integration and never gains status reporting. OpenAPI generation and signature test-vector publication remain.
+The adjacent `resticpal-server` repository implements the initial conventional API and carries frozen v1/v2 and restore-capable v3 managed-policy JSON Schemas plus a plain-manifest fixture. Its initial-enrollment version gates preserve one-time tokens when an older client cannot parse the proposed policy. A normal static HTTP server remains a supported metadata-only integration and never gains status reporting. OpenAPI generation and signature test-vector publication remain.
 
 ## Backup state and local status
 
@@ -415,7 +493,7 @@ Current behavior is:
 - update metadata and packages require Ed25519 verification;
 - NetSparkle downloads are assigned an explicit `.msi` filename before transfer; prompted installs remain user-selected, while automatic LocalSystem installs use quiet, no-restart MSI arguments;
 - automatic application runs only through the protected LocalSystem service and its pinned release-asset allowlist;
-- before launching the MSI, the service rejects an update while a backup, repository operation, or management operation is active;
+- before launching the MSI, the service rejects an update while a backup, snapshot query, restore job, repository operation, or management operation is active;
 - an accepted preparation holds new backup/repository work for a bounded period while the MSI starts, and automatically expires if installation is cancelled;
 - WiX major-upgrade behavior stops the service, replaces the signed application and bundled restic payload, and restarts the service;
 - rollback, interrupted-upgrade recovery, and repair behavior remain to be qualified before automatic installation is considered.
@@ -437,7 +515,7 @@ The MSI currently:
 - embeds the pinned restic binary and development license/notice inventory;
 - supports standard MSI reinstall, repair, upgrade, and uninstall mechanics, though the upgrade/repair matrix is not yet qualified.
 
-An elevated PowerShell E2E harness refuses to touch a pre-existing installation or data directory, installs the MSI, verifies identity/payload/registration, current-session tray launch, first-run setup, all-users logon startup and the Start Menu shortcut, configures a disposable local repository and DPAPI password through protected IPC, initializes then switches it to append-only mode, runs a VSS backup, checks restart-persistent history, uninstalls, proves process/shortcut/registration cleanup and data preservation, and removes only its synthetic state. The same lifecycle runs in a disposable Windows Sandbox through the Windows 11 Sandbox CLI, with a `.wsb` fallback on older hosts.
+An elevated PowerShell E2E harness refuses to touch a pre-existing installation or data directory, installs the MSI, verifies identity/payload/registration, current-session tray launch, first-run setup, all-users logon startup, Start Menu and Restore navigation, configures a disposable local repository and DPAPI password through protected IPC, initializes then switches it to append-only mode, runs a VSS backup, exercises bounded host-filtered snapshot/directory paging, capability rejection for guessed snapshots and paths, fail-closed restore disablement, verified append-only file and folder restores into separate non-overwriting destinations, metadata-cache reuse, restart-persistent history/settings/recovered files, uninstalls, proves process/shortcut/registration cleanup and data preservation, and removes only its synthetic state. The same lifecycle runs in a disposable Windows Sandbox through the Windows 11 Sandbox CLI, with a `.wsb` fallback on older hosts.
 
 The following packaging work remains:
 
@@ -466,6 +544,8 @@ The service-only execution boundary, shell-free command construction, typed opti
 - Remote and local configuration are mapped to typed allowlisted arguments/options.
 - No shell command construction is used.
 - All paths, URLs, options, environment names, sizes, and message lengths are validated.
+- Snapshot inventories, browsed-node capabilities, restore destinations, and restore progress are administrator-only, host-bound, bounded, and excluded from remote status, ordinary-user IPC, and diagnostic text.
+- Recursive restore preflight denies symbolic links, reparse-like nodes, devices, and other unsupported repository entries before the LocalSystem service writes recovered files.
 - Managed repository configuration is powerful: an enrolled server can direct readable files to a repository it controls. Enrollment therefore represents an explicit administrator trust decision and must be clearly presented.
 - Append-only mode is enforced both by resticpal command policy and, for meaningful ransomware resistance, by the storage system.
 - Update signatures and policy signatures use distinct keys and trust purposes.
@@ -505,9 +585,16 @@ The service-only execution boundary, shell-free command construction, typed opti
 
    The x64 MSI, service/tray registration and immediate launch, all-users Start Menu entry, first-run bootstrap/local setup, bundled restic, synchronized version resources, data-preserving uninstall authoring, validation, Sandbox E2E harness, Azure-signed GitHub CI artifact, strict NetSparkle client, separate backed-up update key, package-first frozen-legacy/advancing-v2 appcast tooling, extension-preserving download, service-side silent install, and backup-safe update preparation exist. Windows-version/VSS/update and upgrade/repair/rollback qualification plus optional interactive MSI UX remain.
 
+6. **Policy-controlled file recovery — functional Windows slice**
+   - Current-host snapshot inventory, dates, exact snapshot times, friendly source-root browsing, and lazy bounded directory pages.
+   - Administrator-only, policy-locked restoration of one exact file or directory into a new local destination with verification, cancellation, progress, and append-only compatibility.
+   - Cross-host and unbrowsed-node capability enforcement, unsupported-descendant preflight, protected-destination rejection, and no path leakage to ordinary status or server reporting.
+
+   The Rust core/service/protocol, WinUI browser, companion-server v3 policy/enrollment gate, real-restic fixture, and installed-service E2E workflow are implemented. Broader recovery ACLs, alternative Windows profiles, larger repositories, and the Windows 10/11 matrix remain to be qualified.
+
 ## Required test themes
 
-The automated Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, policy precedence and locks, standard retention/prune construction and state, append-only authorization, configuration bounds, mandatory internal-data exclusion, explicit restic cache use and stale-namespace cleanup, bounded/redacted diagnostics, signed-manifest tampering/expiry/replay, plain-HTTP fetch and offline cache recovery, named-pipe framing/ACL/token checks, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, bounded partial-source and VSS-warning parsing, SQLite history retention/migration/detail authorization/redaction/restart behavior, and tray first-run gating and launch reentrancy. Pure .NET tests cover ordered update-feed arbitration, the minimum manual-backup acknowledgement dwell, source-failure and consistency-warning copy, and managed-revision synchronization across initial observation, forced enrollment refresh, per-page completion, busy/failing reloads, baseline-gated editing, unsaved edits, explicit discard, field-level payload omission, retry, and overlapping revisions. The server baseline covers constant-time token authentication, API manifest/status round trips, bounded SQLite state, configuration allowlists, and maintenance environment isolation. Four ignored, opt-in tests cover two disposable real-restic repository paths, live signed update feeds, and live server enrollment; the non-VSS real-restic path also executes real `forget` and `prune`. The MSI is release-build, ICE, administrative-image, payload-hash, restic-version, and packaged-service console validated. The elevated installed-service lifecycle passed in a disposable Windows 11 Sandbox on build 26100 for both a clean v1.0.7 installation and a direct-MSI v1.0.6-to-v1.0.7 major upgrade, including compatible bundled-runtime preservation, single-instance onboarding, current-session tray launch, Start Menu launch, control-level Settings and `--updates` verification, real append-only and standard local backups, restart persistence, retention/prune, and uninstall cleanup. The WinUI project is build-validated, and its installed automation protects the setup/update navigation and single-instance contracts while asserting repository-waiting, manually requested, running, and completed overview-card states; broader page interaction and accessibility coverage remain.
+The automated Rust baseline covers scheduling/deadlines/resume/power/network decisions, retry/cancellation state, managed-policy v1/v2/v3 precedence, startup fail-closed restore behavior and locks, standard retention/prune construction and state, append-only listing/restoration authorization, exact snapshot/path validation, literal glob-character escaping, restic-compatible physical-DNS-hostname filtering despite truncated NetBIOS names, recursive unsupported-node rejection, safe unique recovery destinations, administrator-only bounded query/job IPC, cross-host/unbrowsed capability rejection, policy revocation and sensitive-state clearing, service-operation exclusion, configuration bounds, mandatory internal-data exclusion, explicit restic cache use and stale-namespace cleanup, bounded/redacted diagnostics, signed-manifest tampering/expiry/replay, plain-HTTP fetch and offline cache recovery, named-pipe framing/ACL/token checks, continuous first-instance ownership, pre-write client verification of the actual SCM service process, DPAPI persistence/rotation/redaction, repository validation/restart behavior, executor JSON/progress/timeouts, bounded partial-source and VSS-warning parsing, SQLite history retention/migration/detail authorization/redaction/restart behavior, and tray first-run gating and launch reentrancy. Pure .NET tests cover friendly Windows-source/root conversion, malicious-root rejection, source breadcrumbs, snapshot-date grouping, lock-aware restore controls, bounded variable-size page accumulation, recovery progress formatting, ordered update-feed arbitration, manual-backup acknowledgement dwell, source-failure and consistency-warning copy, actual named-pipe service identity, and managed-revision synchronization including Restore. The server baseline covers strict frozen policy schemas, v3 recommendation/lock validation, pre-consumption version-gated enrollment, constant-time token authentication, API manifest/status round trips, bounded SQLite state, configuration allowlists, and maintenance environment isolation. Four ignored, opt-in tests cover two disposable real-restic repository paths, live signed update feeds, and live server enrollment; the real-restic lifecycle now also verifies append-only host-filtered browsing, literal-bracket filenames, nested Unicode directory restoration, unique non-overwriting destinations, and protected-root rejection. The MSI is release-build, ICE, administrative-image, payload-hash, restic-version, and packaged-service console validated. The elevated installed-service harness additionally exercises the real WinUI snapshot/date/file browser, policy revocation and re-enablement, bounded single-item pagination, verified LocalSystem file/directory restore, normally inherited destination ACLs, and recovered-file SHA-256 under an impersonated same-user, medium-integrity, non-administrator Windows token. Broader accessibility, alternative user profiles, large repositories, and the Windows-version matrix remain.
 
 The following themes remain required as their corresponding product areas land:
 
@@ -523,7 +610,7 @@ The following themes remain required as their corresponding product areas land:
 ## Open implementation decisions
 
 - Remote schema shapes, signature envelopes, and API/metadata serialization.
-- Local IPC subscription framing and compatibility policy beyond protocol v3.
+- Local IPC subscription framing and compatibility policy beyond protocol v5.
 - Concrete idle memory/CPU targets after the feasibility prototype.
 - Default prune cadence in standard/client-maintained mode.
 - Notification thresholds.

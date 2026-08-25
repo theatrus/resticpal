@@ -13,13 +13,110 @@ Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @'
 using System;
+using System.ComponentModel;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 
 public static class ResticPalNativeTest
 {
     private delegate bool EnumThreadWindowsCallback(IntPtr window, IntPtr parameter);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SidAndAttributes
+    {
+        public IntPtr sid;
+        public uint attributes;
+    }
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(
+        IntPtr process,
+        uint desiredAccess,
+        out IntPtr token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetTokenInformation(
+        IntPtr token,
+        int informationClass,
+        out int information,
+        int informationLength,
+        out int returnLength);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateTokenEx(
+        IntPtr existingToken,
+        uint desiredAccess,
+        IntPtr attributes,
+        int impersonationLevel,
+        int tokenType,
+        out IntPtr duplicateToken);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateRestrictedToken(
+        IntPtr existingToken,
+        uint flags,
+        uint disabledSidCount,
+        ref SidAndAttributes disabledSids,
+        uint deletedPrivilegeCount,
+        IntPtr deletedPrivileges,
+        uint restrictedSidCount,
+        IntPtr restrictedSids,
+        out IntPtr restrictedToken);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetTokenInformation(
+        IntPtr token,
+        int informationClass,
+        IntPtr information,
+        uint informationLength);
+
+    [DllImport("advapi32.dll", EntryPoint = "GetTokenInformation", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetTokenInformationBuffer(
+        IntPtr token,
+        int informationClass,
+        IntPtr information,
+        int informationLength,
+        out int returnLength);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ImpersonateLoggedOnUser(IntPtr token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RevertToSelf();
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateNamedPipeW(
+        string name,
+        uint openMode,
+        uint pipeMode,
+        uint maximumInstances,
+        uint outputBufferSize,
+        uint inputBufferSize,
+        uint defaultTimeout,
+        IntPtr securityAttributes);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetComputerNameExW(
+        int nameType,
+        StringBuilder computerName,
+        ref uint bufferLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -87,6 +184,250 @@ public static class ResticPalNativeTest
         }
         return IntPtr.Zero;
     }
+
+    public static int ProbeFirstNamedPipeInstance(string pipeName)
+    {
+        IntPtr handle = CreateNamedPipeW(
+            pipeName,
+            0x00080003,
+            0,
+            255,
+            4096,
+            4096,
+            0,
+            IntPtr.Zero);
+        if (handle != new IntPtr(-1))
+        {
+            CloseHandle(handle);
+            throw new InvalidOperationException(
+                "An outside process unexpectedly became the first service pipe instance.");
+        }
+        return Marshal.GetLastWin32Error();
+    }
+
+    public static string PhysicalDnsHostName()
+    {
+        uint capacity = 64;
+        while (capacity <= 1024)
+        {
+            uint length = capacity;
+            var name = new StringBuilder((int)capacity);
+            if (GetComputerNameExW(5, name, ref length))
+            {
+                string result = name.ToString();
+                if (result.Length == 0)
+                {
+                    throw new InvalidOperationException(
+                        "Windows returned an empty physical DNS hostname.");
+                }
+                return result;
+            }
+
+            int error = Marshal.GetLastWin32Error();
+            if (error != 234 || length <= capacity)
+            {
+                throw new Win32Exception(error,
+                    "Could not determine restic's physical DNS host identity.");
+            }
+            capacity = length;
+        }
+        throw new InvalidOperationException(
+            "The physical DNS hostname exceeded the safe Windows host-name limit.");
+    }
+
+    public static void VerifyReadWithNonElevatedExplorerToken(
+        int explorerProcessId,
+        string expectedUserSid,
+        string restoredPath,
+        string expectedSha256)
+    {
+        IntPtr explorerToken = IntPtr.Zero;
+        IntPtr callerToken = IntPtr.Zero;
+        IntPtr interactiveToken = IntPtr.Zero;
+        IntPtr administratorsSid = IntPtr.Zero;
+        IntPtr mediumIntegritySid = IntPtr.Zero;
+        IntPtr integrityLabel = IntPtr.Zero;
+        try
+        {
+            using (Process explorer = Process.GetProcessById(explorerProcessId))
+            {
+                if (!OpenProcessToken(explorer.Handle, 0x008B, out explorerToken))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Could not inspect the interactive Explorer token.");
+                }
+            }
+
+            int elevated;
+            int returnedLength;
+            if (!GetTokenInformation(explorerToken, 20, out elevated, sizeof(int),
+                    out returnedLength))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "Could not determine whether the interactive Explorer token is elevated.");
+            }
+            if (elevated != 0)
+            {
+                using (Process currentProcess = Process.GetCurrentProcess())
+                {
+                    if (!OpenProcessToken(currentProcess.Handle, 0x008B,
+                            out callerToken))
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(),
+                            "Could not inspect the caller's primary token.");
+                    }
+                }
+
+                SecurityIdentifier administratorIdentity = new SecurityIdentifier(
+                    WellKnownSidType.BuiltinAdministratorsSid, null);
+                byte[] administratorBytes = new byte[administratorIdentity.BinaryLength];
+                administratorIdentity.GetBinaryForm(administratorBytes, 0);
+                administratorsSid = Marshal.AllocHGlobal(administratorBytes.Length);
+                Marshal.Copy(administratorBytes, 0, administratorsSid,
+                    administratorBytes.Length);
+                SidAndAttributes denyAdministrators = new SidAndAttributes();
+                denyAdministrators.sid = administratorsSid;
+                denyAdministrators.attributes = 0;
+                // Restrict the calling process's own primary token. Same-user
+                // impersonation works even when Application Guard does not
+                // grant its administrator SeImpersonatePrivilege.
+                if (!CreateRestrictedToken(callerToken, 0x00000001, 1,
+                        ref denyAdministrators, 0, IntPtr.Zero, 0, IntPtr.Zero,
+                        out interactiveToken))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Could not derive a same-user non-administrator caller token.");
+                }
+
+                SecurityIdentifier mediumIdentity =
+                    new SecurityIdentifier("S-1-16-8192");
+                byte[] mediumBytes = new byte[mediumIdentity.BinaryLength];
+                mediumIdentity.GetBinaryForm(mediumBytes, 0);
+                mediumIntegritySid = Marshal.AllocHGlobal(mediumBytes.Length);
+                Marshal.Copy(mediumBytes, 0, mediumIntegritySid, mediumBytes.Length);
+                SidAndAttributes mediumLabel = new SidAndAttributes();
+                mediumLabel.sid = mediumIntegritySid;
+                mediumLabel.attributes = 0x00000020;
+                int labelLength = Marshal.SizeOf(typeof(SidAndAttributes)) +
+                    mediumBytes.Length;
+                integrityLabel = Marshal.AllocHGlobal(labelLength);
+                Marshal.StructureToPtr(mediumLabel, integrityLabel, false);
+                if (!SetTokenInformation(interactiveToken, 25, integrityLabel,
+                        (uint)labelLength))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Could not lower the restricted Explorer token to medium integrity.");
+                }
+            }
+            else if (!DuplicateTokenEx(explorerToken, 0x02000000, IntPtr.Zero, 2, 1,
+                    out interactiveToken))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "Could not duplicate the interactive user's standard token.");
+            }
+
+            AssertMediumIntegrity(interactiveToken);
+            if (!ImpersonateLoggedOnUser(interactiveToken))
+            {
+                int impersonationError = Marshal.GetLastWin32Error();
+                throw new Win32Exception(impersonationError,
+                    "Could not impersonate the same-user non-administrator token " +
+                    "(Win32 " + impersonationError + ": " +
+                    new Win32Exception(impersonationError).Message + ").");
+            }
+            try
+            {
+                using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+                {
+                    if (identity.User == null ||
+                        !String.Equals(identity.User.Value, expectedUserSid,
+                            StringComparison.Ordinal))
+                    {
+                        throw new InvalidOperationException(
+                            "The restored-file probe impersonated the wrong user.");
+                    }
+                    if (new WindowsPrincipal(identity).IsInRole(
+                            WindowsBuiltInRole.Administrator))
+                    {
+                        throw new InvalidOperationException(
+                            "The restored-file probe retained administrator access.");
+                    }
+                    AssertMediumIntegrity(identity.Token);
+
+                    // Open the handle only AFTER impersonation: NTFS therefore
+                    // evaluates this real read against the standard-user token.
+                    using (FileStream restored = new FileStream(restoredPath,
+                        FileMode.Open, FileAccess.Read, FileShare.Read))
+                    using (SHA256 sha256 = SHA256.Create())
+                    {
+                        string observed = BitConverter.ToString(
+                            sha256.ComputeHash(restored)).Replace("-", String.Empty);
+                        if (!String.Equals(observed, expectedSha256,
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            throw new InvalidOperationException(
+                                "The non-administrator restored-file SHA-256 differs.");
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                if (!RevertToSelf())
+                {
+                    int revertError = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(revertError,
+                        "Could not revert the restored-file probe impersonation " +
+                        "(Win32 " + revertError + ": " +
+                        new Win32Exception(revertError).Message + ").");
+                }
+            }
+        }
+        finally
+        {
+            if (interactiveToken != IntPtr.Zero) CloseHandle(interactiveToken);
+            if (callerToken != IntPtr.Zero) CloseHandle(callerToken);
+            if (explorerToken != IntPtr.Zero) CloseHandle(explorerToken);
+            if (integrityLabel != IntPtr.Zero) Marshal.FreeHGlobal(integrityLabel);
+            if (mediumIntegritySid != IntPtr.Zero) Marshal.FreeHGlobal(mediumIntegritySid);
+            if (administratorsSid != IntPtr.Zero) Marshal.FreeHGlobal(administratorsSid);
+        }
+    }
+
+    private static void AssertMediumIntegrity(IntPtr token)
+    {
+        int integrityLength;
+        GetTokenInformationBuffer(token, 25, IntPtr.Zero, 0, out integrityLength);
+        if (integrityLength <= 0)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "Could not determine the standard-token integrity buffer length.");
+        }
+        IntPtr observedIntegrity = Marshal.AllocHGlobal(integrityLength);
+        try
+        {
+            if (!GetTokenInformationBuffer(token, 25, observedIntegrity,
+                    integrityLength, out integrityLength))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "Could not inspect the effective standard-token integrity level.");
+            }
+            SidAndAttributes observedLabel = (SidAndAttributes)
+                Marshal.PtrToStructure(observedIntegrity, typeof(SidAndAttributes));
+            string integritySid = new SecurityIdentifier(observedLabel.sid).Value;
+            int integrityRid = int.Parse(integritySid.Substring(
+                integritySid.LastIndexOf('-') + 1));
+            if (integrityRid > 8192)
+            {
+                throw new InvalidOperationException(
+                    "The restored-file probe retained elevated integrity " + integritySid + ".");
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(observedIntegrity);
+        }
+    }
 }
 '@
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -116,10 +457,16 @@ $cacheRoot = Join-Path $dataRoot 'Cache'
 $startMenuShortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\resticpal.lnk'
 $onboardingMarker = Join-Path $env:LOCALAPPDATA 'resticpal\onboarding-shown-v1'
 $interactiveSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+$resticHostName = [ResticPalNativeTest]::PhysicalDnsHostName()
+Write-Host (
+    "Restic snapshot identity uses physical DNS hostname '$resticHostName'; " +
+    "the NetBIOS COMPUTERNAME is '$env:COMPUTERNAME'."
+)
 $e2eRoot = Join-Path $env:SystemDrive (
     'ResticPal-Installed-E2E-' + [Guid]::NewGuid().ToString('N'))
 $sourceRoot = Join-Path $e2eRoot 'Source'
 $backupRoot = Join-Path $e2eRoot 'Repository'
+$restoreRoot = Join-Path $e2eRoot 'Restores'
 if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
     $ArtifactRoot = Join-Path $repositoryRoot 'artifacts\installer\e2e'
 }
@@ -129,13 +476,15 @@ $installLog = Join-Path $artifactRoot "install-$timestamp.log"
 $baselineInstallLog = Join-Path $artifactRoot "baseline-install-$timestamp.log"
 $uninstallLog = Join-Path $artifactRoot "uninstall-$timestamp.log"
 $script:requestId = 0L
-$protocolVersion = 4
+$protocolVersion = 5
 $installedByTest = $false
 $installedPackagePath = $null
 $onboardingMarkerCreatedByTest = $false
 $testReachedPersistenceCheck = $false
 $candidateFileVersion = $null
 $cacheStateAfterFirstBackup = $null
+$appendOnlyFileRestoreDestination = $null
+$appendOnlyFolderRestoreDestination = $null
 
 function Invoke-Installer([string] $Arguments, [string] $Action) {
     $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" `
@@ -272,6 +621,43 @@ function Wait-AutomationElementEnabled(
     throw "Timed out waiting for enabled UI element $AutomationId."
 }
 
+function Wait-AutomationListRow(
+    [Diagnostics.Process] $Process,
+    [string] $ListAutomationId,
+    [string] $ExpectedName,
+    [TimeSpan] $Timeout
+) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    $rowCondition = [Windows.Automation.PropertyCondition]::new(
+        [Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [Windows.Automation.ControlType]::ListItem
+    )
+    do {
+        try {
+            $list = Wait-AutomationElement $Process $ListAutomationId ([TimeSpan]::FromSeconds(2))
+            $rows = $list.FindAll([Windows.Automation.TreeScope]::Descendants, $rowCondition)
+            foreach ($row in $rows) {
+                $names = @(
+                    $row.Current.Name
+                    $row.FindAll(
+                        [Windows.Automation.TreeScope]::Descendants,
+                        [Windows.Automation.Condition]::TrueCondition
+                    ) | ForEach-Object { $_.Current.Name }
+                )
+                if (@($names | Where-Object {
+                    [string]::Equals($_, $ExpectedName, [StringComparison]::OrdinalIgnoreCase)
+                }).Count -gt 0) {
+                    return $row
+                }
+            }
+        } catch {
+            # Retry if a WinUI list refresh replaces an automation element.
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for '$ExpectedName' in UI list $ListAutomationId."
+}
+
 function Wait-AutomationElementByName([string] $Name, [TimeSpan] $Timeout) {
     $deadline = [DateTime]::UtcNow + $Timeout
     $condition = [Windows.Automation.PropertyCondition]::new(
@@ -386,13 +772,63 @@ function Wait-NativeWindowForProcess(
     throw "Timed out waiting for $($Process.ProcessName) native window $ClassName."
 }
 
-function Read-Exact([IO.Stream] $Stream, [int] $Count) {
+function Get-ResticPalIpcTimeoutDiagnostics {
+    $serviceDescription = try {
+        $service = Get-Service -Name 'ResticPal' -ErrorAction Stop
+        "ResticPal service=$($service.Status)"
+    } catch {
+        "ResticPal service unavailable=$($_.Exception.Message)"
+    }
+
+    $processDescriptions = @(
+        Get-Process -Name 'resticpal-service', 'restic', 'resticpal-ui' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                "$($_.ProcessName)(pid=$($_.Id),cpu=$($_.CPU),threads=$($_.Threads.Count))"
+            }
+    )
+    $processDescription = if ($processDescriptions.Count -eq 0) {
+        '(none)'
+    } else {
+        $processDescriptions -join ', '
+    }
+
+    return "$serviceDescription; relevant processes=$processDescription"
+}
+
+function Read-Exact(
+    [IO.Stream] $Stream,
+    [int] $Count,
+    [string] $CommandName,
+    [string] $Stage,
+    [TimeSpan] $Timeout
+) {
     $buffer = [byte[]]::new($Count)
     $offset = 0
+    $deadline = [DateTime]::UtcNow + $Timeout
     while ($offset -lt $Count) {
-        $read = $Stream.Read($buffer, $offset, $Count - $offset)
+        $remaining = $deadline - [DateTime]::UtcNow
+        $remainingMilliseconds = [Math]::Max(
+            1,
+            [Math]::Min([int]::MaxValue, [int] [Math]::Ceiling($remaining.TotalMilliseconds))
+        )
+        $readTask = $Stream.ReadAsync($buffer, $offset, $Count - $offset)
+        if ($remaining.TotalMilliseconds -le 0 -or -not $readTask.Wait($remainingMilliseconds)) {
+            # Closing the asynchronous handle cancels its outstanding read and
+            # prevents a stalled service from keeping the test alive forever.
+            $Stream.Dispose()
+            $diagnostics = Get-ResticPalIpcTimeoutDiagnostics
+            throw [TimeoutException]::new(
+                "Timed out after $([int] $Timeout.TotalSeconds)s waiting for " +
+                "resticpal IPC command '$CommandName' at '$Stage' " +
+                "($offset of $Count bytes received). $diagnostics"
+            )
+        }
+        $read = $readTask.GetAwaiter().GetResult()
         if ($read -eq 0) {
-            throw 'The resticpal service closed the named pipe before completing a frame.'
+            throw (
+                "The resticpal service closed its named pipe during command " +
+                "'$CommandName' at '$Stage' before completing its response."
+            )
         }
         $offset += $read
     }
@@ -415,9 +851,9 @@ function Invoke-ResticPalRequest([hashtable] $Command) {
 
     $client = [IO.Pipes.NamedPipeClientStream]::new(
         '.',
-        'ResticPal.v4',
+        "ResticPal.v$protocolVersion",
         [IO.Pipes.PipeDirection]::InOut,
-        [IO.Pipes.PipeOptions]::None
+        [IO.Pipes.PipeOptions]::Asynchronous
     )
     try {
         $client.Connect(5000)
@@ -429,7 +865,12 @@ function Invoke-ResticPalRequest([hashtable] $Command) {
         $client.Write($payload, 0, $payload.Length)
         $client.Flush()
 
-        $responseLengthBytes = Read-Exact $client 4
+        $responseLengthBytes = Read-Exact `
+            $client `
+            4 `
+            ([string] $Command.type) `
+            'response header' `
+            ([TimeSpan]::FromSeconds(15))
         if (-not [BitConverter]::IsLittleEndian) {
             [Array]::Reverse($responseLengthBytes)
         }
@@ -437,7 +878,12 @@ function Invoke-ResticPalRequest([hashtable] $Command) {
         if ($responseLength -eq 0 -or $responseLength -gt 1024 * 1024) {
             throw "Invalid incoming IPC frame length: $responseLength"
         }
-        $responseBytes = Read-Exact $client ([int]$responseLength)
+        $responseBytes = Read-Exact `
+            $client `
+            ([int] $responseLength) `
+            ([string] $Command.type) `
+            'response body' `
+            ([TimeSpan]::FromSeconds(15))
         $response = $utf8.GetString($responseBytes) | ConvertFrom-Json
     } finally {
         $client.Dispose()
@@ -447,6 +893,24 @@ function Invoke-ResticPalRequest([hashtable] $Command) {
         throw 'The service returned a mismatched IPC response.'
     }
     return $response.payload
+}
+
+function Assert-ServicePipeContinuouslyOwned([string] $Phase) {
+    $pipeName = "\\.\pipe\ResticPal.v$protocolVersion"
+    for ($attempt = 0; $attempt -lt 8; $attempt++) {
+        $errorCode = [ResticPalNativeTest]::ProbeFirstNamedPipeInstance($pipeName)
+        if ($errorCode -ne 5) {
+            throw ("The $Phase LocalSystem service pipe was not continuously protected " +
+                   "by its first instance (Win32 error $errorCode).")
+        }
+        if ($attempt -lt 7) {
+            $status = Invoke-ResticPalRequest @{ type = 'get_status' }
+            if ($status.type -ne 'status') {
+                throw "The $Phase pipe continuity probe interrupted productive service IPC."
+            }
+        }
+    }
+    Write-Host "The $Phase LocalSystem service continuously owned its protocol-v$protocolVersion pipe."
 }
 
 function Assert-Accepted([hashtable] $Command) {
@@ -499,6 +963,309 @@ function Wait-Backup([TimeSpan] $Timeout, [string] $PreviousSnapshotId = '') {
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'Timed out waiting for the installed-service backup.'
+}
+
+function Wait-RestoreQueryPage(
+    [UInt64] $QueryId,
+    [string] $ExpectedKind,
+    [UInt32] $Offset,
+    [UInt16] $Limit,
+    [TimeSpan] $Timeout
+) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    do {
+        $payload = Invoke-ResticPalRequest @{
+            type = 'get_restore_query'
+            query_id = $QueryId
+            offset = $Offset
+            limit = $Limit
+        }
+        if ($payload.type -ne 'restore_query') {
+            throw (
+                "Restore $ExpectedKind query $QueryId was rejected: " +
+                "$($payload.code) $($payload.message)"
+            )
+        }
+        $result = $payload.result
+        if ([UInt64] $result.query_id -ne $QueryId -or $result.kind -ne $ExpectedKind) {
+            throw "The service returned the wrong restore query or query kind for $QueryId."
+        }
+        switch ($result.state) {
+            'running' {
+                Start-Sleep -Milliseconds 100
+                continue
+            }
+            'succeeded' {
+                [object[]] $items = if ($ExpectedKind -eq 'snapshots') {
+                    @($result.snapshots | Where-Object { $null -ne $_ })
+                } else {
+                    @($result.entries | Where-Object { $null -ne $_ })
+                }
+                if ($items.Count -gt $Limit `
+                    -or [UInt64] $Offset + [UInt64] $items.Count -gt [UInt64] $result.total) {
+                    throw "Restore query $QueryId exceeded its requested page bounds."
+                }
+                return $result
+            }
+            'failed' {
+                throw "Restore $ExpectedKind query $QueryId failed: $($result.message)"
+            }
+            'cancelled' {
+                throw "Restore $ExpectedKind query $QueryId was unexpectedly cancelled."
+            }
+            default {
+                throw "Restore query $QueryId returned an unknown state: $($result.state)"
+            }
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for restore $ExpectedKind query $QueryId."
+}
+
+function Get-RestoreQueryItems(
+    [UInt64] $QueryId,
+    [string] $ExpectedKind,
+    [UInt16] $PageSize = 1
+) {
+    $offset = [UInt32] 0
+    $expectedTotal = $null
+    do {
+        $page = Wait-RestoreQueryPage `
+            $QueryId `
+            $ExpectedKind `
+            $offset `
+            $PageSize `
+            ([TimeSpan]::FromMinutes(2))
+        if ($null -eq $expectedTotal) {
+            $expectedTotal = [UInt64] $page.total
+            if ($expectedTotal -gt 1024) {
+                throw "Disposable restore $ExpectedKind query returned too many results."
+            }
+        } elseif ([UInt64] $page.total -ne $expectedTotal) {
+            throw "Restore query $QueryId changed its result total between pages."
+        }
+        [object[]] $items = if ($ExpectedKind -eq 'snapshots') {
+            @($page.snapshots | Where-Object { $null -ne $_ })
+        } else {
+            @($page.entries | Where-Object { $null -ne $_ })
+        }
+        if ($items.Count -eq 0 -and [UInt64] $offset -lt $expectedTotal) {
+            throw "Restore query $QueryId returned an empty page before its result total."
+        }
+        foreach ($item in $items) {
+            $item
+        }
+        $previousOffset = $offset
+        $offset += [UInt32] $items.Count
+        if ([UInt64] $previousOffset -lt $expectedTotal -and $offset -le $previousOffset) {
+            throw "Restore query $QueryId did not advance its pagination offset."
+        }
+    } while ([UInt64] $offset -lt $expectedTotal)
+}
+
+function Get-RestoreSnapshots {
+    $started = Invoke-ResticPalRequest @{ type = 'begin_restore_snapshot_query' }
+    if ($started.type -ne 'restore_query_started' -or [UInt64] $started.query_id -eq 0) {
+        throw "Snapshot browsing did not start: $($started.code) $($started.message)"
+    }
+    return [pscustomobject]@{
+        query_id = [UInt64] $started.query_id
+        snapshots = @(Get-RestoreQueryItems ([UInt64] $started.query_id) 'snapshots')
+    }
+}
+
+function Get-RestoreDirectory([string] $SnapshotId, [string] $Path) {
+    $started = Invoke-ResticPalRequest @{
+        type = 'begin_restore_directory_query'
+        snapshot_id = $SnapshotId
+        path = $Path
+    }
+    if ($started.type -ne 'restore_query_started' -or [UInt64] $started.query_id -eq 0) {
+        throw "Browsing snapshot directory $Path did not start: $($started.code) $($started.message)"
+    }
+    return @(Get-RestoreQueryItems ([UInt64] $started.query_id) 'directory')
+}
+
+function Find-RestoreSourceFile([string] $SnapshotId, [string] $FileName) {
+    $pending = [Collections.Generic.Queue[object]]::new()
+    $visited = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    $pending.Enqueue([pscustomobject]@{ path = '/'; directory_entry = $null })
+
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Dequeue()
+        if (-not $visited.Add([string] $directory.path)) {
+            continue
+        }
+        if ($visited.Count -gt 32) {
+            throw 'The disposable snapshot exceeded the bounded lazy-directory traversal.'
+        }
+        $entries = @(Get-RestoreDirectory $SnapshotId ([string] $directory.path))
+        foreach ($entry in $entries) {
+            if ($entry.node_type -eq 'file' `
+                -and [string] $entry.name -ceq $FileName) {
+                return [pscustomobject]@{
+                    file_entry = $entry
+                    directory_entry = $directory.directory_entry
+                    visited_directories = $visited.Count
+                }
+            }
+            if ($entry.node_type -eq 'directory') {
+                if ([string]::IsNullOrWhiteSpace([string] $entry.path) `
+                    -or -not ([string] $entry.path).StartsWith('/')) {
+                    throw 'The restore browser returned an invalid absolute snapshot path.'
+                }
+                $pending.Enqueue([pscustomobject]@{
+                    path = [string] $entry.path
+                    directory_entry = $entry
+                })
+            }
+        }
+    }
+    throw "Lazy repository browsing could not find the known snapshot file $FileName."
+}
+
+function Wait-RestoreCompletion([UInt64] $JobId, [TimeSpan] $Timeout) {
+    $deadline = [DateTime]::UtcNow + $Timeout
+    do {
+        $payload = Invoke-ResticPalRequest @{ type = 'get_restore_status' }
+        if ($payload.type -ne 'restore_status') {
+            throw "Restore status was rejected: $($payload.code) $($payload.message)"
+        }
+        $status = $payload.status
+        if ($null -eq $status.job_id -or [UInt64] $status.job_id -ne $JobId) {
+            throw "The service returned a different restore job than the requested job $JobId."
+        }
+        switch ($status.state) {
+            'running' {
+                Start-Sleep -Milliseconds 100
+                continue
+            }
+            'succeeded' {
+                if ([string]::IsNullOrWhiteSpace([string] $status.destination)) {
+                    throw "Restore job $JobId succeeded without returning its destination."
+                }
+                return $status
+            }
+            'failed' {
+                throw "Restore job $JobId failed: $($status.message)"
+            }
+            'cancelled' {
+                throw "Restore job $JobId was unexpectedly cancelled."
+            }
+            default {
+                throw "Restore job $JobId returned an unknown state: $($status.state)"
+            }
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for LocalSystem restore job $JobId."
+}
+
+function Get-InheritedRestoreAclRules([Security.AccessControl.FileSystemSecurity] $Acl) {
+    return @(
+        $Acl.GetAccessRules(
+            $false,
+            $true,
+            [Security.Principal.SecurityIdentifier]
+        ) |
+            ForEach-Object {
+                '{0}|{1}|{2}|{3}|{4}' -f `
+                    $_.IdentityReference.Value, `
+                    [int] $_.AccessControlType, `
+                    [int64] $_.FileSystemRights, `
+                    [int] $_.InheritanceFlags, `
+                    [int] $_.PropagationFlags
+            } |
+            Sort-Object
+    )
+}
+
+function Assert-NormalRestoreInheritance([string] $RestoredRoot) {
+    $probeRoot = Join-Path $restoreRoot (
+        'ResticPal-Acl-Probe-' + [Guid]::NewGuid().ToString('N'))
+    $probeCreated = $false
+    try {
+        New-Item -ItemType Directory -Path $probeRoot -ErrorAction Stop | Out-Null
+        $probeCreated = $true
+        $restoredAcl = Get-Acl -LiteralPath $RestoredRoot
+        if ($restoredAcl.AreAccessRulesProtected) {
+            throw "The completed restore root still blocks normal inherited access: $RestoredRoot"
+        }
+        $expectedInherited = @(Get-InheritedRestoreAclRules (
+            Get-Acl -LiteralPath $probeRoot))
+        $actualInherited = @(Get-InheritedRestoreAclRules $restoredAcl)
+        if ($expectedInherited.Count -ne $actualInherited.Count `
+            -or -not [string]::Equals(
+                [string]::Join("`n", $expectedInherited),
+                [string]::Join("`n", $actualInherited),
+                [StringComparison]::Ordinal)) {
+            throw ('The completed restore root inherited different access rules from ' +
+                   "an ordinary destination sibling: $RestoredRoot")
+        }
+    } finally {
+        if ($probeCreated) {
+            Remove-Item -LiteralPath $probeRoot -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $probeRoot) {
+                throw "The exact empty restore ACL sibling was not removed: $probeRoot"
+            }
+        }
+    }
+}
+
+function Assert-NonElevatedRestoreRead([string] $RestoredFile, [string] $ExpectedHash) {
+    $explorers = @(Get-Process -Name explorer -ErrorAction Stop |
+        Where-Object SessionId -eq $interactiveSessionId)
+    if ($explorers.Count -ne 1) {
+        throw ('Expected exactly one interactive Explorer for non-elevated restore ' +
+               "verification; found $($explorers.Count).")
+    }
+    $expectedUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    [ResticPalNativeTest]::VerifyReadWithNonElevatedExplorerToken(
+        [int] $explorers[0].Id,
+        $expectedUserSid,
+        $RestoredFile,
+        $ExpectedHash)
+}
+
+function Invoke-VerifiedRestore(
+    [string] $SnapshotId,
+    [string] $SnapshotPath,
+    [string] $ExpectedRelativePath,
+    [string] $OriginalFile
+) {
+    $started = Invoke-ResticPalRequest @{
+        type = 'start_restore'
+        snapshot_id = $SnapshotId
+        path = $SnapshotPath
+        destination = $restoreRoot
+    }
+    if ($started.type -ne 'restore_started' -or [UInt64] $started.job_id -eq 0) {
+        throw "LocalSystem restore did not start: $($started.code) $($started.message)"
+    }
+    $completed = Wait-RestoreCompletion ([UInt64] $started.job_id) ([TimeSpan]::FromMinutes(2))
+    $destination = [IO.Path]::GetFullPath([string] $completed.destination)
+    $expectedParent = [IO.Path]::GetFullPath($restoreRoot).TrimEnd('\')
+    $actualParent = [IO.Path]::GetDirectoryName($destination).TrimEnd('\')
+    if (-not $actualParent.Equals($expectedParent, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The service restored outside a unique direct destination child: $destination"
+    }
+    if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+        throw "The reported restore destination was not created: $destination"
+    }
+    $restoredFile = Join-Path $destination $ExpectedRelativePath
+    if (-not (Test-Path -LiteralPath $restoredFile -PathType Leaf)) {
+        throw "The requested restored file is missing: $restoredFile"
+    }
+    $originalInfo = Get-Item -LiteralPath $OriginalFile
+    $restoredInfo = Get-Item -LiteralPath $restoredFile
+    $originalHash = (Get-FileHash -LiteralPath $OriginalFile -Algorithm SHA256).Hash
+    $restoredHash = (Get-FileHash -LiteralPath $restoredFile -Algorithm SHA256).Hash
+    if ($originalInfo.Length -ne $restoredInfo.Length -or $originalHash -cne $restoredHash) {
+        throw "The LocalSystem restored bytes differ from the original file: $restoredFile"
+    }
+    Assert-NormalRestoreInheritance $destination
+    Assert-NonElevatedRestoreRead $restoredFile $originalHash
+    return $destination
 }
 
 function Write-RandomTestFile([string] $Path, [int] $SizeInMiB) {
@@ -790,6 +1557,15 @@ if (Test-Path -LiteralPath $onboardingMarker -PathType Leaf) {
 }
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 
+# Validate restricted-token impersonation before paying for MSI installation or
+# creating restore fixtures. The actual restored bytes are checked again later.
+$tokenLaunchProbe = Join-Path $env:SystemRoot `
+    'System32\WindowsPowerShell\v1.0\powershell.exe'
+Assert-NonElevatedRestoreRead `
+    $tokenLaunchProbe `
+    ((Get-FileHash -LiteralPath $tokenLaunchProbe -Algorithm SHA256).Hash)
+Write-Host 'The same-user non-administrator restored-file impersonation verifier is working.'
+
 try {
     if ($null -ne $resolvedUpgradeFromMsiPath) {
         Write-Host "Installing upgrade baseline $resolvedUpgradeFromMsiPath"
@@ -882,6 +1658,7 @@ try {
     if ($status.type -ne 'status' -or $status.status.state.state -ne 'unconfigured') {
         throw 'A fresh installed service did not report the expected unconfigured state.'
     }
+    Assert-ServicePipeContinuouslyOwned 'freshly installed'
     $setupUiLaunchedAfterUpgrade = $false
     $existingUiProcess = Get-Process -Name 'resticpal-ui' -ErrorAction SilentlyContinue |
         Where-Object SessionId -eq $interactiveSessionId |
@@ -1025,7 +1802,8 @@ try {
     Wait-AutomationElement $startMenuUiProcess 'ManagementStatusTitle' ([TimeSpan]::FromSeconds(10)) | Out-Null
     Wait-AutomationElement $startMenuUiProcess 'CheckForUpdatesButton' ([TimeSpan]::FromSeconds(10)) | Out-Null
     Wait-AutomationElement $startMenuUiProcess 'AutomaticUpdatesToggle' ([TimeSpan]::FromSeconds(10)) | Out-Null
-    Write-Host 'The WinUI Settings page exposes enrollment and signed-update controls.'
+    Wait-AutomationElement $startMenuUiProcess 'RestoreItem' ([TimeSpan]::FromSeconds(10)) | Out-Null
+    Write-Host 'The WinUI Settings page exposes restore, enrollment, and signed-update controls.'
 
     $sourcesItem = Wait-AutomationElement $startMenuUiProcess 'SourcesItem' ([TimeSpan]::FromSeconds(10))
     $sourcesSelection = $sourcesItem.GetCurrentPattern(
@@ -1208,6 +1986,309 @@ try {
         "The protected LocalSystem cache contains repository " +
         "$($cacheStateAfterFirstBackup.repository_name) and the first VSS-backed snapshot."
     )
+
+    $preUiSnapshotQuery = Get-RestoreSnapshots
+    $preUiMatchingSnapshots = @(
+        $preUiSnapshotQuery.snapshots |
+            Where-Object { $_.id -ceq $automaticRun.snapshot_id }
+    )
+    if ($preUiMatchingSnapshots.Count -ne 1) {
+        $returnedSnapshots = @($preUiSnapshotQuery.snapshots | ForEach-Object {
+            "$($_.id) (host=$($_.hostname))"
+        }) -join ', '
+        throw (
+            "The LocalSystem restore listing omitted completed snapshot " +
+            "$($automaticRun.snapshot_id); physical DNS hostname='$resticHostName', " +
+            "NetBIOS COMPUTERNAME='$env:COMPUTERNAME', returned snapshots=" +
+            $(if ($returnedSnapshots.Length -eq 0) { '(none)' } else { $returnedSnapshots })
+        )
+    }
+    if (-not ([string] $preUiMatchingSnapshots[0].hostname).Equals(
+            $resticHostName,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw (
+            "The service exposed snapshot host '$($preUiMatchingSnapshots[0].hostname)' " +
+            "instead of the local physical DNS hostname '$resticHostName'."
+        )
+    }
+    Write-Host (
+        "The service identified completed snapshot $($automaticRun.snapshot_id) " +
+        "under restic-compatible physical DNS hostname '$resticHostName'."
+    )
+
+    $restoreNavigation = Wait-AutomationElement `
+        $updatesUiProcess `
+        'RestoreItem' `
+        ([TimeSpan]::FromSeconds(10))
+    $restoreNavigation.GetCurrentPattern(
+        [Windows.Automation.SelectionItemPattern]::Pattern
+    ).Select()
+    $restoreToggle = Wait-AutomationElementEnabled `
+        $updatesUiProcess `
+        'RestoreEnabledToggle' `
+        ([TimeSpan]::FromSeconds(30))
+    $restoreToggleState = $restoreToggle.GetCurrentPattern(
+        [Windows.Automation.TogglePattern]::Pattern
+    ).Current.ToggleState
+    if ($restoreToggleState -ne [Windows.Automation.ToggleState]::On) {
+        throw 'The installed recovery page did not show standalone restore as enabled.'
+    }
+    Wait-AutomationTextContains `
+        $updatesUiProcess `
+        'RestoreSnapshotSummary' `
+        'available backup' `
+        ([TimeSpan]::FromSeconds(30)) | Out-Null
+    Wait-AutomationElementEnabled `
+        $updatesUiProcess `
+        'RestoreDatePicker' `
+        ([TimeSpan]::FromSeconds(30)) | Out-Null
+    Wait-AutomationElementEnabled `
+        $updatesUiProcess `
+        'RestoreSnapshotPicker' `
+        ([TimeSpan]::FromSeconds(10)) | Out-Null
+    Wait-AutomationElementEnabled `
+        $updatesUiProcess `
+        'RefreshRestoreButton' `
+        ([TimeSpan]::FromSeconds(30)) | Out-Null
+    $restoreSourceRow = Wait-AutomationListRow `
+        $updatesUiProcess `
+        'RestoreEntriesList' `
+        ([IO.Path]::GetFileName($sourceRoot)) `
+        ([TimeSpan]::FromSeconds(15))
+    $openSourceCondition = [Windows.Automation.AndCondition]::new(
+        [Windows.Automation.PropertyCondition]::new(
+            [Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [Windows.Automation.ControlType]::Button
+        ),
+        [Windows.Automation.PropertyCondition]::new(
+            [Windows.Automation.AutomationElement]::NameProperty,
+            'Open'
+        )
+    )
+    $openSource = $restoreSourceRow.FindFirst(
+        [Windows.Automation.TreeScope]::Descendants,
+        $openSourceCondition
+    )
+    if ($null -eq $openSource) {
+        throw 'The recovery browser did not expose an Open action for the backup source.'
+    }
+    $openSource.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Wait-AutomationListRow `
+        $updatesUiProcess `
+        'RestoreEntriesList' `
+        'document.txt' `
+        ([TimeSpan]::FromSeconds(30)) | Out-Null
+    Wait-AutomationElementEnabled `
+        $updatesUiProcess `
+        'RefreshRestoreButton' `
+        ([TimeSpan]::FromSeconds(30)) | Out-Null
+    Write-Host (
+        'The installed WinUI recovery page populated its date and snapshot pickers, ' +
+        'opened the real backup source, and displayed document.txt.'
+    )
+
+    $restoreSettings = Invoke-ResticPalRequest @{ type = 'get_restore_settings' }
+    if ($restoreSettings.type -ne 'restore_settings' `
+        -or -not $restoreSettings.configuration.enabled `
+        -or $restoreSettings.configuration.enabled_locked `
+        -or $restoreSettings.configuration.managed) {
+        throw 'Standalone installed-service restore was not enabled and administrator-editable by default.'
+    }
+    $snapshotQuery = Get-RestoreSnapshots
+    $matchingSnapshots = @(
+        $snapshotQuery.snapshots |
+            Where-Object { $_.id -ceq $automaticRun.snapshot_id }
+    )
+    if ($matchingSnapshots.Count -ne 1) {
+        throw 'Snapshot browsing did not return the exact completed append-only backup.'
+    }
+    foreach ($snapshot in $snapshotQuery.snapshots) {
+        if ([string] $snapshot.id -notmatch '^[0-9a-f]{64}$' `
+            -or -not ([string] $snapshot.hostname).Equals(
+                $resticHostName,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Snapshot browsing exposed an ambiguous identifier or another computer's backup."
+        }
+    }
+    $oversizedPage = Invoke-ResticPalRequest @{
+        type = 'get_restore_query'
+        query_id = [UInt64] $snapshotQuery.query_id
+        offset = 0
+        limit = 101
+    }
+    if ($oversizedPage.type -ne 'rejected' `
+        -or $oversizedPage.code -ne 'invalid_restore_query_limit') {
+        throw 'The installed restore browser accepted an IPC page larger than 100 entries.'
+    }
+    $outOfRangePage = Invoke-ResticPalRequest @{
+        type = 'get_restore_query'
+        query_id = [UInt64] $snapshotQuery.query_id
+        offset = [UInt32] ($snapshotQuery.snapshots.Count + 1)
+        limit = 1
+    }
+    if ($outOfRangePage.type -ne 'rejected' `
+        -or $outOfRangePage.code -ne 'invalid_restore_query_offset') {
+        throw 'The installed restore browser accepted a result offset beyond its snapshot inventory.'
+    }
+    $restoreSource = Find-RestoreSourceFile $automaticRun.snapshot_id 'document.txt'
+    if ($null -eq $restoreSource.directory_entry `
+        -or $restoreSource.directory_entry.node_type -ne 'directory') {
+        throw 'Lazy snapshot browsing did not identify the source directory around document.txt.'
+    }
+    New-Item -ItemType Directory -Path $restoreRoot -Force | Out-Null
+    $restoreParentSentinel = Join-Path $restoreRoot 'preserve-parent.txt'
+    $restoreParentSentinelContent = 'Existing destination-parent content must never be overwritten.'
+    Set-Content `
+        -LiteralPath $restoreParentSentinel `
+        -Value $restoreParentSentinelContent `
+        -NoNewline
+
+    Assert-Accepted @{ type = 'update_restore_settings'; enabled = $false }
+    $disabledRestore = Invoke-ResticPalRequest @{ type = 'get_restore_settings' }
+    if ($disabledRestore.type -ne 'restore_settings' `
+        -or $disabledRestore.configuration.enabled `
+        -or $disabledRestore.configuration.enabled_locked) {
+        throw 'The standalone administrator could not disable restore.'
+    }
+    $disabledCommands = @(
+        @{ type = 'begin_restore_snapshot_query' },
+        @{
+            type = 'begin_restore_directory_query'
+            snapshot_id = $automaticRun.snapshot_id
+            path = '/'
+        },
+        @{
+            type = 'get_restore_query'
+            query_id = [UInt64] $snapshotQuery.query_id
+            offset = 0
+            limit = 1
+        },
+        @{
+            type = 'cancel_restore_query'
+            query_id = [UInt64] $snapshotQuery.query_id
+        },
+        @{
+            type = 'start_restore'
+            snapshot_id = $automaticRun.snapshot_id
+            path = [string] $restoreSource.file_entry.path
+            destination = $restoreRoot
+        },
+        @{ type = 'get_restore_status' },
+        @{ type = 'cancel_restore' }
+    )
+    foreach ($command in $disabledCommands) {
+        $denied = Invoke-ResticPalRequest $command
+        if ($denied.type -ne 'rejected' -or $denied.code -ne 'restore_disabled') {
+            throw "Disabled restore did not reject '$($command.type)' with restore_disabled."
+        }
+    }
+    if (@(Get-ChildItem -LiteralPath $restoreRoot -Directory -Force).Count -ne 0 `
+        -or (Get-Content -LiteralPath $restoreParentSentinel -Raw) -cne $restoreParentSentinelContent) {
+        throw 'A disabled restore operation created output or changed the destination parent.'
+    }
+    Assert-Accepted @{ type = 'update_restore_settings'; enabled = $true }
+    $reenabledRestore = Invoke-ResticPalRequest @{ type = 'get_restore_settings' }
+    if (-not $reenabledRestore.configuration.enabled `
+        -or $reenabledRestore.configuration.enabled_locked) {
+        throw 'The standalone administrator could not re-enable restore.'
+    }
+    $oldQuery = Invoke-ResticPalRequest @{
+        type = 'get_restore_query'
+        query_id = [UInt64] $snapshotQuery.query_id
+        offset = 0
+        limit = 1
+    }
+    if ($oldQuery.type -ne 'rejected' -or $oldQuery.code -ne 'restore_query_not_found') {
+        throw 'Disabling restore did not clear an existing sensitive snapshot query.'
+    }
+    $staleSnapshotGrant = Invoke-ResticPalRequest @{
+        type = 'begin_restore_directory_query'
+        snapshot_id = $automaticRun.snapshot_id
+        path = '/'
+    }
+    if ($staleSnapshotGrant.type -ne 'rejected' `
+        -or $staleSnapshotGrant.code -ne 'restore_snapshot_not_authorized') {
+        throw 'Disabling restore did not clear authorization for a previously browsed snapshot.'
+    }
+
+    $refreshedSnapshots = Get-RestoreSnapshots
+    if (@($refreshedSnapshots.snapshots |
+            Where-Object { $_.id -ceq $automaticRun.snapshot_id }).Count -ne 1) {
+        throw 'The re-enabled restore browser could not reauthorize its own append-only snapshot.'
+    }
+    $foreignSnapshotId = if ($automaticRun.snapshot_id -ceq ('f' * 64)) {
+        'e' * 64
+    } else {
+        'f' * 64
+    }
+    $foreignSnapshot = Invoke-ResticPalRequest @{
+        type = 'begin_restore_directory_query'
+        snapshot_id = $foreignSnapshotId
+        path = '/'
+    }
+    if ($foreignSnapshot.type -ne 'rejected' `
+        -or $foreignSnapshot.code -ne 'restore_snapshot_not_authorized') {
+        throw 'The restore browser accepted a snapshot outside its hostname-filtered inventory.'
+    }
+    $unlistedDirectory = Invoke-ResticPalRequest @{
+        type = 'begin_restore_directory_query'
+        snapshot_id = $automaticRun.snapshot_id
+        path = '/resticpal-unlisted-directory'
+    }
+    if ($unlistedDirectory.type -ne 'rejected' `
+        -or $unlistedDirectory.code -ne 'restore_path_not_authorized') {
+        throw 'The restore browser accepted a directory not learned from a parent listing.'
+    }
+    $unlistedRestore = Invoke-ResticPalRequest @{
+        type = 'start_restore'
+        snapshot_id = $automaticRun.snapshot_id
+        path = '/resticpal-unlisted-file.txt'
+        destination = $restoreRoot
+    }
+    if ($unlistedRestore.type -ne 'rejected' `
+        -or $unlistedRestore.code -ne 'restore_path_not_authorized' `
+        -or @(Get-ChildItem -LiteralPath $restoreRoot -Directory -Force).Count -ne 0) {
+        throw 'The restore engine accepted or created output for an unbrowsed snapshot path.'
+    }
+    $restoreSource = Find-RestoreSourceFile $automaticRun.snapshot_id 'document.txt'
+    if ($null -eq $restoreSource.directory_entry) {
+        throw 'Re-enabling restore did not rebuild the authorized source-directory inventory.'
+    }
+
+    $originalDocument = Join-Path $sourceRoot 'document.txt'
+    $appendOnlyFileRestoreDestination = Invoke-VerifiedRestore `
+        $automaticRun.snapshot_id `
+        ([string] $restoreSource.file_entry.path) `
+        'document.txt' `
+        $originalDocument
+    $restoredSourceFolderName = [string] $restoreSource.directory_entry.name
+    $appendOnlyFolderRestoreDestination = Invoke-VerifiedRestore `
+        $automaticRun.snapshot_id `
+        ([string] $restoreSource.directory_entry.path) `
+        (Join-Path $restoredSourceFolderName 'document.txt') `
+        $originalDocument
+    if ($appendOnlyFileRestoreDestination.Equals(
+            $appendOnlyFolderRestoreDestination,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Sequential restores reused their destination child instead of creating unique output.'
+    }
+    $restoredLockedFile = Join-Path `
+        (Join-Path $appendOnlyFolderRestoreDestination $restoredSourceFolderName) `
+        'vss-exclusive-open.txt'
+    if (-not (Test-Path -LiteralPath $restoredLockedFile -PathType Leaf)) {
+        throw 'A directory restore omitted the file captured through the filesystem snapshot.'
+    }
+    if (@(Get-ChildItem -LiteralPath $restoreRoot -Directory -Force).Count -ne 2 `
+        -or (Get-Content -LiteralPath $restoreParentSentinel -Raw) -cne $restoreParentSentinelContent) {
+        throw 'Restore overwrote or deleted content outside its unique destination child.'
+    }
+    Assert-ResticCacheReused $cacheStateAfterFirstBackup 'for append-only snapshot browsing and verified restores'
+    Write-Host (
+        "Append-only snapshot $($automaticRun.snapshot_id) restored one exact file and its " +
+        "directory into separate verified destinations after $($restoreSource.visited_directories) lazy directory queries."
+    )
+    Assert-ServicePipeContinuouslyOwned 'post-repository-browsing'
+
     # Give the manual run enough real work that the one-second active-backup
     # refresh cadence must render its running state before completion.
     Write-RandomTestFile (Join-Path $sourceRoot 'manual-status-transition.bin') 256
@@ -1227,6 +2308,14 @@ try {
     Assert-SnapshotCached $cacheStateAfterFirstBackup $run.snapshot_id
     Assert-InternalDataExcluded $run.snapshot_id $internalExclusionSentinelName
     Write-Host "Run backup now rendered its acknowledgement, running, and completed states for append-only snapshot $($run.snapshot_id)."
+
+    $pagedSnapshots = Get-RestoreSnapshots
+    foreach ($expectedSnapshot in @($automaticRun.snapshot_id, $run.snapshot_id)) {
+        if (@($pagedSnapshots.snapshots | Where-Object { $_.id -ceq $expectedSnapshot }).Count -ne 1) {
+            throw "One-item snapshot pagination omitted append-only snapshot $expectedSnapshot."
+        }
+    }
+    Write-Host 'Asynchronous repository snapshot browsing returned both append-only backups across one-item pages.'
 
     $appendOnlyRetention = Invoke-ResticPalRequest @{ type = 'get_retention' }
     if ($appendOnlyRetention.type -ne 'retention' -or $appendOnlyRetention.configuration.repository_mode -ne 'append_only') {
@@ -1294,6 +2383,21 @@ try {
         -or $updatesAfterRestart.configuration.automatic_install_locked) {
         throw 'The automatic-update setting did not survive the installed service restart.'
     }
+    $restoreAfterRestart = Invoke-ResticPalRequest @{ type = 'get_restore_settings' }
+    if ($restoreAfterRestart.type -ne 'restore_settings' `
+        -or -not $restoreAfterRestart.configuration.enabled `
+        -or $restoreAfterRestart.configuration.enabled_locked) {
+        throw 'The administrator-enabled restore setting did not survive the installed service restart.'
+    }
+    Assert-ServicePipeContinuouslyOwned 'restarted'
+    foreach ($restoredDestination in @(
+        $appendOnlyFileRestoreDestination,
+        $appendOnlyFolderRestoreDestination
+    )) {
+        if (-not (Test-Path -LiteralPath $restoredDestination -PathType Container)) {
+            throw "Restart removed successful restore output: $restoredDestination"
+        }
+    }
     Assert-ResticCacheReused $cacheStateAfterFirstBackup 'after the service restart'
     Assert-SnapshotCached $cacheStateAfterFirstBackup $standardRun.snapshot_id
     $testReachedPersistenceCheck = $true
@@ -1351,7 +2455,15 @@ try {
         if ($testReachedPersistenceCheck) {
             Assert-ResticCacheReused $cacheStateAfterFirstBackup 'after uninstall'
             Assert-SnapshotCached $cacheStateAfterFirstBackup $standardRun.snapshot_id
-            Write-Host 'Install, backup, restart, persistence, and uninstall checks passed.'
+            foreach ($restoredDestination in @(
+                $appendOnlyFileRestoreDestination,
+                $appendOnlyFolderRestoreDestination
+            )) {
+                if (-not (Test-Path -LiteralPath $restoredDestination -PathType Container)) {
+                    throw "Uninstall removed user-requested restore output: $restoredDestination"
+                }
+            }
+            Write-Host 'Install, backup, verified restore, restart, persistence, and uninstall checks passed.'
         }
         if ($onboardingMarkerCreatedByTest) {
             Remove-Item -LiteralPath $onboardingMarker -Force
@@ -1369,6 +2481,9 @@ try {
                 throw "Refusing to remove an unsafe installed-test directory: $resolvedE2eRoot"
             }
             Remove-Item -LiteralPath $resolvedE2eRoot -Recurse -Force
+            if (Test-Path -LiteralPath $resolvedE2eRoot) {
+                throw "The disposable backup and restore test directory was not removed: $resolvedE2eRoot"
+            }
         }
     }
 }
